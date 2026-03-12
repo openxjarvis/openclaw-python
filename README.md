@@ -1,26 +1,12 @@
 # OpenClaw Python
 
+> 🔔 **Project Migration Notice** — This project has moved! Please visit **[openclaw-python](https://github.com/openxjarvis/openclaw-python)** for the latest version with all new features and updates. This repository (clawdbot-python) is no longer actively maintained.
+>
+> 🔔 **项目迁移通知** — 本项目已迁移！请访问 **[openclaw-python](https://github.com/openxjarvis/openclaw-python)** 获取最新版本和所有新功能。此仓库（clawdbot-python）不再积极维护。
+
+---
+
 > Python implementation of [OpenClaw](https://github.com/badlogic/pi-mono) — a self-hosted personal AI assistant gateway.
-
----
-
-# ⚠️ REPOSITORY UPDATE NOTICE
-
-## 📢 This repository (openclawion) is no longer actively maintained
-
-### → Please visit the main repository: **[openclaw-python](https://github.com/openxjarvis/openclaw-python)**
-
-All new features, bug fixes, and updates are now being developed in the **openclaw-python** repository. This repository exists for historical reference only.
-
----
-
-## 📢 本仓库（openclawion）不再经常更新
-
-### → 请访问主仓库：**[openclaw-python](https://github.com/openxjarvis/openclaw-python)**
-
-所有新功能、Bug 修复和更新现在都在 **openclaw-python** 仓库中进行。本仓库仅供历史参考。
-
----
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
