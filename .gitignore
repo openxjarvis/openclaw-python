@@ -50,5 +50,6 @@ docs/archive/
 tests/
 test_*.py
 fix_*.py
+create_test*.py
 IMPLEMENTATION_*.py
 *_COMPLETE.py
