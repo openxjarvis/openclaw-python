@@ -38,6 +38,7 @@ temp/
 tmp/
 
 # Archives (don't push to remote)
+docs/
 docs/archive/
 .archive_*/
 
