@@ -106,10 +106,11 @@ class MessageTool(AgentTool):
     ):
         super().__init__()
         self.name = "message"
-        self.description = (
-            "Send messages and channel actions across Discord/Google Chat/Slack/Telegram/WhatsApp/Signal/"
-            "iMessage/MS Teams. Supports rich formatting, buttons, cards, polls, reactions, threads, "
-            "roles, channels, voice, events, and moderation."
+        # Build dynamic description based on configuration (matches TS message-tool.ts:550-602)
+        self.description = self._build_message_tool_description(
+            config=config,
+            current_channel=current_channel_provider,
+            current_channel_id=current_channel_id,
         )
         self.channel_registry = channel_registry
         self.agent_account_id = agent_account_id
@@ -121,6 +122,46 @@ class MessageTool(AgentTool):
         self.reply_to_mode = reply_to_mode
         self.sandbox_root = sandbox_root
         self.require_explicit_target = require_explicit_target
+
+    def _build_message_tool_description(
+        self,
+        config: dict[str, Any] | None = None,
+        current_channel: str | None = None,
+        current_channel_id: str | None = None,
+    ) -> str:
+        """
+        Build message tool description dynamically based on configuration.
+        Mirrors TS message-tool.ts buildMessageToolDescription() lines 550-602.
+        """
+        base_description = "Send, delete, and manage messages via channel plugins."
+
+        # If we have a current channel, show its actions and list other configured channels
+        if current_channel:
+            # Get supported actions for current channel
+            # (In full implementation, this would call list_channel_supported_actions)
+            # For now, use a comprehensive list
+            current_actions = ["send", "react", "delete", "edit", "poll", "pin", "unpin", "thread-create"]
+            action_list = ", ".join(sorted(current_actions))
+            desc = f"{base_description} Current channel ({current_channel}) supports: {action_list}."
+
+            # List other configured channels (simplified - in full impl would enumerate config)
+            other_channels_hints = []
+            if config:
+                channels_cfg = config.get("channels", {})
+                for ch_name in ["telegram", "discord", "slack", "whatsapp", "signal"]:
+                    if ch_name != current_channel and channels_cfg.get(ch_name, {}).get("enabled"):
+                        other_channels_hints.append(ch_name)
+
+            if other_channels_hints:
+                desc += f" Other configured channels: {', '.join(other_channels_hints)}."
+
+            return desc
+
+        # Fallback to generic description
+        return (
+            f"{base_description} Supports actions: send, delete, react, poll, pin, threads, and more. "
+            "Configure channels (telegram, discord, slack, whatsapp, signal) to enable cross-platform messaging."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """Get tool schema with all message action parameters."""

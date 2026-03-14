@@ -99,7 +99,7 @@ async def run_gateway_update_check(
     """Run gateway update check — writes update-check.json when stale.
 
     Args:
-        cfg: OpenClaw config (dict or ClawdbotConfig Pydantic model).
+        cfg: OpenClaw config (dict or OpenClawConfig Pydantic model).
         allow_in_tests: Override test-env skip (for testing this function).
     """
     if not allow_in_tests and _should_skip(cfg):

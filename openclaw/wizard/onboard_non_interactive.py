@@ -6,7 +6,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Optional
 
-from openclaw.config.schema import ClawdbotConfig, GatewayConfig, AgentConfig, ModelsConfig
+from openclaw.config.schema import OpenClawConfig, GatewayConfig, AgentConfig, ModelsConfig
 from openclaw.config.loader import save_config
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ async def run_non_interactive_onboarding(
     print("=" * 60)
 
     # Create config
-    config = ClawdbotConfig()
+    config = OpenClawConfig()
 
     # Configure agent model
     if provider == "anthropic":

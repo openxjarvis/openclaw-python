@@ -593,11 +593,17 @@ class HeartbeatManager:
 def resolve_heartbeat_config(
     agent_cfg: dict[str, Any],
     defaults_cfg: dict[str, Any] | None = None,
+    workspace_dir: str | Path | None = None,
 ) -> HeartbeatConfig | None:
     """Build a HeartbeatConfig from agent config dict.
 
     Merges agents.defaults.heartbeat on top and then agent-specific heartbeat
     on top of that, mirroring TS config merging.
+
+    Args:
+        agent_cfg: Agent-specific configuration dict
+        defaults_cfg: Defaults configuration dict (agents.defaults)
+        workspace_dir: Workspace directory for HEARTBEAT.md empty check
 
     Returns None if heartbeat is not configured or interval is 0.
     """
@@ -645,6 +651,7 @@ def resolve_heartbeat_config(
         ),
         active_hours=active_hours,
         visibility=visibility,
+        workspace_dir=str(workspace_dir) if workspace_dir else None,
     )
 
 

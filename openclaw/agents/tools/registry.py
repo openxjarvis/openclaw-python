@@ -28,7 +28,7 @@ from .channel_actions import (
     WhatsAppActionsTool,
 )
 from .cron import CronTool
-from .document_gen import PPTGeneratorTool, PDFGeneratorTool
+# document_gen removed - use pptx skill for PPT, other tools for PDF
 from .image import ImageTool
 from .memory import MemoryGetTool, MemorySearchTool
 from .nodes import NodesTool
@@ -120,8 +120,8 @@ class ToolRegistry:
 
         _advanced += [
             CronTool(channel_registry=self._channel_registry, session_manager=self._session_manager),
-            PPTGeneratorTool(),
-            PDFGeneratorTool(),
+            # PPTGeneratorTool(),  # Removed: Use pptx skill for presentations
+            # PDFGeneratorTool(),  # Removed: Use write tool + system PDF converters
             TTSTool(),
             ProcessTool(),
         ]

@@ -145,7 +145,7 @@ try:
     from openclaw.config.loader import load_config
 except ImportError:
     try:
-        from openclaw.config.config import load_config  # type: ignore[no-redef]
+        from openclaw.config.loader import load_config  # type: ignore[no-redef]
     except ImportError:
         load_config = None  # type: ignore[assignment]
 

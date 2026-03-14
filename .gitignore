@@ -39,6 +39,7 @@ tmp/
 
 # Archives (don't push to remote)
 docs/archive/
+.archive_*/
 
 # Tests (don't push to remote)
 tests/

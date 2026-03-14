@@ -4,13 +4,31 @@ from __future__ import annotations
 import builtins
 
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 
 class ModelConfig(BaseModel):
     """Model configuration"""
     primary: str = Field(default="anthropic/claude-opus-4-5-20250514")
     fallbacks: list[str] = Field(default_factory=list)
+
+
+class AgentModelEntryConfig(BaseModel):
+    """Agent model entry configuration - mirrors TS AgentModelEntryConfig
+    
+    Represents a model configuration entry in agents.defaults.models dictionary.
+    Used for model aliases and provider-specific parameters.
+    """
+    alias: str | None = Field(default=None)
+    """Model alias/identifier"""
+    
+    params: dict[str, Any] | None = Field(default=None)
+    """Provider-specific parameters (e.g., cacheRetention for Anthropic)"""
+    
+    streaming: bool | None = Field(default=None)
+    """Whether this model supports streaming"""
+    
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class AgentConfig(BaseModel):
@@ -86,6 +104,65 @@ class GatewayControlUiConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class GatewayTlsConfig(BaseModel):
+    """TLS configuration for gateway - mirrors TS TlsConfig"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    enabled: bool | None = Field(default=None)
+    """Whether TLS/SSL is enabled"""
+    
+    cert: str | None = Field(default=None)
+    """Path to TLS certificate file"""
+    
+    key: str | None = Field(default=None)
+    """Path to TLS private key file"""
+    
+    ca: str | None = Field(default=None)
+    """Path to CA certificate for client verification"""
+
+
+class GatewayReloadConfig(BaseModel):
+    """Config reload settings - mirrors TS ReloadConfig"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    enabled: bool | None = Field(default=None)
+    """Whether config hot-reloading is enabled"""
+    
+    watch_paths: list[str] | None = Field(default=None, alias="watchPaths")
+    """Additional paths to watch for changes"""
+    
+    debounce_ms: int | None = Field(default=None, alias="debounceMs")
+    """Debounce delay in milliseconds before reloading"""
+
+
+class GatewayHttpConfig(BaseModel):
+    """HTTP service configuration - mirrors TS HttpConfig"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    enabled: bool | None = Field(default=None)
+    """Whether HTTP endpoints are enabled"""
+    
+    timeout_ms: int | None = Field(default=None, alias="timeoutMs")
+    """HTTP request timeout in milliseconds"""
+    
+    max_body_size: str | int | None = Field(default=None, alias="maxBodySize")
+    """Maximum request body size. Supports "10mb" format or integer bytes"""
+
+
+class GatewayRemoteConfig(BaseModel):
+    """Remote access configuration - mirrors TS RemoteConfig"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    enabled: bool | None = Field(default=None)
+    """Whether remote access is enabled"""
+    
+    allow_origins: list[str] | None = Field(default=None, alias="allowOrigins")
+    """CORS allowed origins for remote access"""
+    
+    api_keys: list[str] | None = Field(default=None, alias="apiKeys")
+    """API keys for remote authentication"""
+
+
 class GatewayConfig(BaseModel):
     """Gateway server configuration (aligned with TypeScript)"""
     port: int = Field(default=18789)
@@ -96,6 +173,25 @@ class GatewayConfig(BaseModel):
     trusted_proxies: list[str] = Field(default_factory=list, alias="trustedProxies")
     nodes: GatewayNodesConfig | None = Field(default=None)
     tailscale: GatewayTailscaleConfig | None = Field(default=None)
+    
+    # New fields (aligned with TS)
+    tls: GatewayTlsConfig | None = Field(default=None)
+    """TLS/SSL configuration"""
+    
+    reload: GatewayReloadConfig | None = Field(default=None)
+    """Config hot-reload settings"""
+    
+    http: GatewayHttpConfig | None = Field(default=None)
+    """HTTP service configuration"""
+    
+    remote: GatewayRemoteConfig | None = Field(default=None)
+    """Remote access configuration"""
+    
+    channel_health_check_minutes: int | None = Field(
+        default=None,
+        alias="channelHealthCheckMinutes"
+    )
+    """Channel health check interval in minutes"""
     
     # Legacy fields for backward compatibility
     enable_web_ui: bool | None = Field(default=None, alias="enableWebUI", exclude=True)
@@ -421,13 +517,110 @@ class HeartbeatConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class CliWatchdogConfig(BaseModel):
+    """CLI watchdog configuration - mirrors TS CLI watchdog config"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    no_output_timeout_ms: Optional[int] = Field(default=None, alias="noOutputTimeoutMs")
+    """Fixed watchdog timeout in ms (overrides ratio when set)"""
+    
+    no_output_timeout_ratio: Optional[float] = Field(default=None, alias="noOutputTimeoutRatio")
+    """Fraction of overall timeout used when fixed timeout is not set"""
+    
+    min_ms: Optional[int] = Field(default=None, alias="minMs")
+    """Lower bound for computed watchdog timeout"""
+    
+    max_ms: Optional[int] = Field(default=None, alias="maxMs")
+    """Upper bound for computed watchdog timeout"""
+
+
+class CliReliabilityConfig(BaseModel):
+    """CLI reliability configuration - mirrors TS reliability config"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    watchdog: Optional[dict[str, CliWatchdogConfig]] = Field(default=None)
+    """No-output watchdog tuning (fresh vs resumed runs)"""
+
+
+class CliBackendConfig(BaseModel):
+    """CLI backend configuration - mirrors TS CliBackendConfig"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    command: str
+    """CLI command to execute (absolute path or on PATH)"""
+    
+    args: Optional[list[str]] = Field(default=None)
+    """Base args applied to every invocation"""
+    
+    output: Optional[Literal["json", "text", "jsonl"]] = Field(default=None)
+    """Output parsing mode (default: json)"""
+    
+    resume_output: Optional[Literal["json", "text", "jsonl"]] = Field(default=None, alias="resumeOutput")
+    """Output parsing mode when resuming a CLI session"""
+    
+    input: Optional[Literal["arg", "stdin"]] = Field(default=None)
+    """Prompt input mode (default: arg)"""
+    
+    max_prompt_arg_chars: Optional[int] = Field(default=None, alias="maxPromptArgChars")
+    """Max prompt length for arg mode (if exceeded, stdin is used)"""
+    
+    env: Optional[dict[str, str]] = Field(default=None)
+    """Extra env vars injected for this CLI"""
+    
+    clear_env: Optional[list[str]] = Field(default=None, alias="clearEnv")
+    """Env vars to remove before launching this CLI"""
+    
+    model_arg: Optional[str] = Field(default=None, alias="modelArg")
+    """Flag used to pass model id (e.g. --model)"""
+    
+    model_aliases: Optional[dict[str, str]] = Field(default=None, alias="modelAliases")
+    """Model aliases mapping (config model id → CLI model id)"""
+    
+    session_arg: Optional[str] = Field(default=None, alias="sessionArg")
+    """Flag used to pass session id (e.g. --session-id)"""
+    
+    session_args: Optional[list[str]] = Field(default=None, alias="sessionArgs")
+    """Extra args used when resuming a session (use {sessionId} placeholder)"""
+    
+    resume_args: Optional[list[str]] = Field(default=None, alias="resumeArgs")
+    """Alternate args to use when resuming a session (use {sessionId} placeholder)"""
+    
+    session_mode: Optional[Literal["always", "existing", "none"]] = Field(default=None, alias="sessionMode")
+    """When to pass session ids"""
+    
+    session_id_fields: Optional[list[str]] = Field(default=None, alias="sessionIdFields")
+    """JSON fields to read session id from (in order)"""
+    
+    system_prompt_arg: Optional[str] = Field(default=None, alias="systemPromptArg")
+    """Flag used to pass system prompt"""
+    
+    system_prompt_mode: Optional[Literal["append", "replace"]] = Field(default=None, alias="systemPromptMode")
+    """System prompt behavior (append vs replace)"""
+    
+    system_prompt_when: Optional[Literal["first", "always", "never"]] = Field(default=None, alias="systemPromptWhen")
+    """When to send system prompt"""
+    
+    image_arg: Optional[str] = Field(default=None, alias="imageArg")
+    """Flag used to pass image paths"""
+    
+    image_mode: Optional[Literal["repeat", "list"]] = Field(default=None, alias="imageMode")
+    """How to pass multiple images"""
+    
+    serialize: Optional[bool] = Field(default=None)
+    """Serialize runs for this CLI"""
+    
+    reliability: Optional[CliReliabilityConfig] = Field(default=None)
+    """Runtime reliability tuning for this backend's process lifecycle"""
+
+
 class AgentDefaults(BaseModel):
     """Default agent settings - mirrors TS AgentDefaultsSchema"""
 
     workspace: str | None = Field(default=None)
     agentDir: str | None = Field(default=None)
     model: str | ModelConfig = Field(default="google/gemini-3-pro-preview")
-    models: dict[str, Any] | None = Field(default=None)
+    models: dict[str, AgentModelEntryConfig] | None = Field(default=None)
+    """Model directory mapping model IDs to their configuration entries"""
     tools: ToolsConfig | None = Field(default=None)
     compaction: CompactionConfig | None = Field(default=None)
     contextPruning: ContextPruningConfig | None = Field(default=None)
@@ -459,7 +652,7 @@ class AgentDefaults(BaseModel):
     envelopeTimestamp: Literal["on", "off"] | None = Field(default=None)
     envelopeElapsed: Literal["on", "off"] | None = Field(default=None)
     contextTokens: int | None = Field(default=None)
-    cliBackends: dict[str, Any] | None = Field(default=None)
+    cliBackends: Optional[dict[str, CliBackendConfig]] = Field(default=None)
     embeddedPi: dict[str, Any] | None = Field(default=None)
     thinkingDefault: Literal["off", "minimal", "low", "medium", "high", "xhigh", "adaptive"] | None = Field(default=None)
     verboseDefault: Literal["off", "on", "full"] | None = Field(default=None)
@@ -965,8 +1158,44 @@ class MetaConfig(BaseModel):
 
 
 class MessagesConfig(BaseModel):
-    """Messages configuration (TS alignment)"""
+    """Messages configuration - mirrors TS MessagesConfig
+    
+    Controls message handling, acknowledgments, queueing, and text-to-speech.
+    """
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    
+    message_prefix: str | None = Field(default=None, alias="messagePrefix")
+    """Prefix to prepend to user messages"""
+    
+    response_prefix: str | Literal["auto"] | None = Field(default=None, alias="responsePrefix")
+    """Prefix for assistant responses. 'auto' uses agent identity."""
+    
+    group_chat: dict[str, Any] | None = Field(default=None, alias="groupChat")
+    """Group chat behavior configuration"""
+    
+    queue: dict[str, Any] | None = Field(default=None)
+    """Message queue configuration per channel"""
+    
+    inbound: dict[str, Any] | None = Field(default=None)
+    """Inbound message debouncing configuration"""
+    
+    ack_reaction: str | None = Field(default=None, alias="ackReaction")
+    """Emoji/reaction for message acknowledgment. Default: '👀'"""
+    
     ack_reaction_scope: str | None = Field(default="group-mentions", alias="ackReactionScope")
+    """When to add ack reaction: 'group-mentions', 'group-all', 'direct', 'all', 'off', 'none'"""
+    
+    remove_ack_after_reply: bool | None = Field(default=None, alias="removeAckAfterReply")
+    """Whether to remove ack reaction after sending reply"""
+    
+    status_reactions: dict[str, Any] | None = Field(default=None, alias="statusReactions")
+    """Status reactions configuration (e.g., for thinking, errors)"""
+    
+    suppress_tool_errors: bool | None = Field(default=None, alias="suppressToolErrors")
+    """Whether to suppress tool error messages"""
+    
+    tts: dict[str, Any] | None = Field(default=None)
+    """Text-to-speech configuration"""
 
 
 class CommandsConfig(BaseModel):
@@ -985,20 +1214,96 @@ class WizardConfig(BaseModel):
 
 
 class LoggingConfig(BaseModel):
-    """Logging configuration"""
-    level: str = Field(default="INFO")
-    format: str = Field(default="colored")
+    """Logging configuration - mirrors TS LoggingConfig from src/config/types.base.ts"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    level: str | None = Field(default="INFO")
+    """Root logger level. Default: INFO"""
+    
+    format: str | None = Field(default="colored")
+    """Python-specific format field (maps to consoleStyle in TS)"""
+    
+    # New fields (aligned with TS)
+    file: str | None = Field(default=None)
+    """Path to log file. If set, logs will be written to this file."""
+    
+    max_file_bytes: int | str | None = Field(default=None, alias="maxFileBytes")
+    """Maximum log file size before rotation. Supports "10mb", "1gb" format or integer bytes."""
+    
+    console_level: str | None = Field(default=None, alias="consoleLevel")
+    """Console-specific log level (can differ from file level)."""
+    
+    console_style: str | None = Field(default=None, alias="consoleStyle")
+    """Console output style: 'pretty' | 'compact' | 'json'. Default: pretty"""
+    
+    redact_sensitive: bool | None = Field(default=None, alias="redactSensitive")
+    """Whether to automatically redact sensitive information (API keys, tokens, etc.). Default: true"""
+    
+    redact_patterns: list[str] | None = Field(default=None, alias="redactPatterns")
+    """Custom regex patterns for redacting sensitive data."""
+
+
+class UpdateAutoConfig(BaseModel):
+    """Auto update configuration - mirrors TS update.auto
+    
+    Configures automatic update behavior for different release channels.
+    """
+    enabled: bool | None = Field(default=None)
+    """Whether auto-update is enabled. Default: false"""
+    
+    stable_delay_hours: int | None = Field(default=None, alias="stableDelayHours")
+    """Hours to wait before auto-updating to stable releases. Default: 6"""
+    
+    stable_jitter_hours: int | None = Field(default=None, alias="stableJitterHours")
+    """Random jitter hours to add to stable delay. Default: 12"""
+    
+    beta_check_interval_hours: int | None = Field(default=None, alias="betaCheckIntervalHours")
+    """Hours between beta update checks. Default: 1"""
+    
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class UpdateConfig(BaseModel):
-    """Update configuration"""
+    """Update configuration - mirrors TS UpdateConfig
+    
+    Controls update checking and automatic update behavior.
+    """
     channel: str = Field(default="stable")
+    """Update channel: 'stable', 'beta', or 'dev'"""
+    
     check_on_start: bool = Field(default=False, alias="checkOnStart")
+    """Whether to check for updates on startup. Default: false"""
+    
+    auto: UpdateAutoConfig | None = Field(default=None)
+    """Automatic update configuration"""
+    
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class UIAssistantConfig(BaseModel):
+    """UI assistant identity configuration - mirrors TS ui.assistant
+    
+    Configures the display name and avatar for the assistant in the Control UI.
+    """
+    name: str | None = Field(default=None)
+    """Assistant display name. Default: 'Assistant'"""
+    
+    avatar: str | None = Field(default=None)
+    """Assistant avatar (emoji, short text, or image URL/data URI). Default: 'A'"""
 
 
 class UIConfig(BaseModel):
-    """UI configuration"""
+    """UI configuration - mirrors TS ui schema
+    
+    Controls visual and identity aspects of the Control UI.
+    """
     seam_color: str | None = Field(default=None, alias="seamColor")
+    """Hex color for UI seam/accent elements"""
+    
+    assistant: UIAssistantConfig | None = Field(default=None)
+    """Assistant identity configuration"""
+    
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ModelsConfig(BaseModel):
@@ -1135,9 +1440,122 @@ class MemoryConfig(BaseModel):
     # Full configuration should use agents.defaults.memorySearch and agents.defaults.memoryFlush
 
 
+class CronRetryConfig(BaseModel):
+    """Cron retry configuration - mirrors TS CronRetryConfig
+    
+    Controls retry behavior for one-time (at-scheduled) cron jobs that fail with transient errors.
+    """
+    max_attempts: int | None = Field(default=None, alias="maxAttempts")
+    """Maximum number of retry attempts for transient errors. Default: 3"""
+    
+    backoff_ms: list[int] | None = Field(default=None, alias="backoffMs")
+    """Backoff schedule in milliseconds for each retry. Default: [30000, 60000, 300000]"""
+    
+    retry_on: list[Literal["rate_limit", "network", "timeout", "server_error"]] | None = Field(
+        default=None, alias="retryOn"
+    )
+    """Error types to retry. If not specified, retries all transient errors."""
+    
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CronRunLogConfig(BaseModel):
+    """Cron run log configuration - mirrors TS runLog
+    
+    Controls pruning behavior for cron job execution logs.
+    """
+    max_bytes: int | str | None = Field(default=None, alias="maxBytes")
+    """Maximum log file size. Supports numeric (bytes) or string ('2mb'). Default: 2000000"""
+    
+    keep_lines: int | None = Field(default=None, alias="keepLines")
+    """Number of lines to keep when pruning. Default: 2000"""
+    
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CronFailureAlertConfig(BaseModel):
+    """Cron failure alert configuration - mirrors TS CronFailureAlertConfig
+    
+    Configures when and how to send failure alerts for cron jobs.
+    """
+    enabled: bool | None = Field(default=None)
+    """Whether to enable failure alerts"""
+    
+    after: int | None = Field(default=None)
+    """Number of consecutive failures before alerting. Default: 2"""
+    
+    cooldown_ms: int | None = Field(default=None, alias="cooldownMs")
+    """Cooldown period between alerts in milliseconds. Default: 3600000 (1 hour)"""
+    
+    mode: Literal["announce", "webhook"] | None = Field(default=None)
+    """Alert delivery mode: 'announce' sends to agent session, 'webhook' posts to URL"""
+    
+    account_id: str | None = Field(default=None, alias="accountId")
+    """Account ID for multi-account scenarios"""
+    
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CronFailureDestinationConfig(BaseModel):
+    """Cron failure destination configuration - mirrors TS CronFailureDestinationConfig
+    
+    Default destination for failure notifications across all cron jobs.
+    Can be overridden per-job via delivery.failureDestination.
+    """
+    channel: str | None = Field(default=None)
+    """Channel for failure notifications (e.g., 'telegram')"""
+    
+    to: str | None = Field(default=None)
+    """Destination identifier (webhook URL for webhook mode, peer ID for announce mode)"""
+    
+    account_id: str | None = Field(default=None, alias="accountId")
+    """Account ID for the destination channel"""
+    
+    mode: Literal["announce", "webhook"] | None = Field(default=None)
+    """Delivery mode for failure notifications"""
+    
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class CronConfig(BaseModel):
-    """Cron configuration"""
+    """Cron configuration - mirrors TS CronConfig
+    
+    Top-level configuration for the cron service, controlling job storage,
+    execution behavior, retry policies, and failure handling.
+    """
     enabled: bool = Field(default=True)
+    """Whether the cron service is enabled. Default: True"""
+    
+    store: str | None = Field(default=None)
+    """Path to cron jobs storage file. Default: ~/.openclaw/cron/jobs.json"""
+    
+    max_concurrent_runs: int | None = Field(default=None, alias="maxConcurrentRuns")
+    """Maximum number of concurrent cron job executions. Default: 1"""
+    
+    retry: CronRetryConfig | None = Field(default=None)
+    """Retry configuration for one-time jobs with transient failures"""
+    
+    webhook: str | None = Field(default=None)
+    """(Deprecated) Legacy webhook URL for jobs with notify=true"""
+    
+    webhook_token: str | None = Field(default=None, alias="webhookToken")
+    """Bearer token for webhook POST requests"""
+    
+    session_retention: str | Literal[False] | None = Field(default=None, alias="sessionRetention")
+    """How long to retain completed cron sessions. Default: '24h'. Set to false to disable cleanup."""
+    
+    run_log: CronRunLogConfig | None = Field(default=None, alias="runLog")
+    """Configuration for cron job execution log pruning"""
+    
+    failure_alert: CronFailureAlertConfig | None = Field(default=None, alias="failureAlert")
+    """Global failure alert configuration"""
+    
+    failure_destination: CronFailureDestinationConfig | None = Field(
+        default=None, alias="failureDestination"
+    )
+    """Default destination for failure notifications"""
+    
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class InternalHooksConfig(BaseModel):
@@ -1156,8 +1574,17 @@ class HooksConfig(BaseModel):
 
 
 class ShellEnvConfig(BaseModel):
-    """Shell env import configuration (mirrors TS env.shellEnv)"""
+    """Shell env import configuration - mirrors TS env.shellEnv
+    
+    Controls whether and how to import environment variables from the user's shell.
+    """
     enabled: bool = Field(default=False)
+    """Whether to import shell environment variables. Default: false"""
+    
+    timeout_ms: int | None = Field(default=None, alias="timeoutMs")
+    """Timeout in milliseconds for shell environment loading. Default: 15000"""
+    
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class EnvConfig(BaseModel):
@@ -1290,11 +1717,16 @@ class CliConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-class ClawdbotConfig(BaseModel):
+class OpenClawConfig(BaseModel):
     """Root configuration schema - mirrors TypeScript OpenClawConfig"""
     
     # Core configs (original 7)
-    agent: AgentConfig | None = Field(default_factory=AgentConfig)
+    # Note: 'agent' field is deprecated - use 'agents.defaults' instead
+    # This field is kept for backward compatibility with legacy configs
+    agent: AgentConfig | None = Field(
+        default_factory=AgentConfig,
+        deprecated="Use 'agents.defaults' instead. This field will be auto-migrated on load."
+    )
     gateway: GatewayConfig | None = Field(default_factory=GatewayConfig)
     agents: AgentsConfig | None = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig | None = Field(default_factory=ChannelsConfig)
@@ -1339,3 +1771,11 @@ class ClawdbotConfig(BaseModel):
     class Config:
         extra = "allow"  # Allow extra fields for extensibility
         populate_by_name = True  # Support camelCase aliases
+
+
+# Rebuild models to resolve forward references
+# This is necessary because some classes reference other classes defined later in the file
+AgentConfig.model_rebuild()
+AgentDefaults.model_rebuild()
+AgentsConfig.model_rebuild()
+OpenClawConfig.model_rebuild()

@@ -58,7 +58,7 @@ async def build_gateway_cron_service(
     cron_config: dict[str, Any] = (config_dict or {}).get("cron") or {}
     store_path = _resolve_store_path(cron_config)
     store_path.parent.mkdir(parents=True, exist_ok=True)
-    log_dir = store_path.parent / "logs"
+    log_dir = store_path.parent / "runs"  # Unified to use "runs/" consistently with TS
 
     logger.info(f"Cron store path: {store_path}")
 
@@ -140,17 +140,18 @@ async def build_gateway_cron_service(
     # ------------------------------------------------------------------
     async def run_isolated_agent(job: "CronJob", message: str) -> dict[str, Any]:
         """Run isolated agent for cron job."""
+        from openclaw.cron.isolated_agent.session_key import resolve_cron_agent_session_key
 
         # Resolve job-level identifiers once so _agent_run can use them
         job_agent_id = getattr(job, "agent_id", None) or "default"
+        
+        # Resolve session key - mirrors TS run.ts:146-147
         base_session_key = (
             getattr(job, "session_key", None) or f"cron:{job.id}"
         ).strip()
-        job_session_key = (
-            f"{job_agent_id}:{base_session_key}"
-            if job_agent_id and job_agent_id != "default"
-            and not base_session_key.startswith(f"{job_agent_id}:")
-            else base_session_key
+        job_session_key = resolve_cron_agent_session_key(
+            session_key=base_session_key,
+            agent_id=job_agent_id,
         )
 
         async def _agent_run(job: "CronJob", message: str) -> dict[str, Any]:
@@ -210,52 +211,149 @@ async def build_gateway_cron_service(
                 payload_timeout: int | None = getattr(job_payload, "timeout_seconds", None)
 
                 response_text = ""
-                run_kwargs: dict[str, Any] = {
-                    "tools": tools,
-                    "system_prompt": system_prompt,
-                }
-                if model_override:
-                    # TS uses 'model' parameter (not 'model_override')
-                    # See: openclaw/src/agents/pi-embedded-runner/run.ts line 243
-                    run_kwargs["model"] = model_override
-                if payload_fallbacks:
-                    run_kwargs["model_fallbacks"] = payload_fallbacks
-
-                async def _collect_response() -> str:
-                    text = ""
-                    async for event in runtime.run_turn(session, message, **run_kwargs):
-                        evt_type = getattr(event, "type", "")
-                        if evt_type in ("text", "text_delta"):
-                            data = getattr(event, "data", {}) or {}
-                            chunk = data.get("text") or data.get("delta") or ""
-                            text += str(chunk) if chunk else ""
-                    return text
-
-                if payload_timeout and payload_timeout > 0:
-                    response_text = await asyncio.wait_for(
-                        _collect_response(), timeout=float(payload_timeout)
+                
+                # Check if the model uses a CLI provider (mirrors TS run.ts line 464-487)
+                from openclaw.agents.cli_backends import resolve_cli_backend_ids
+                from openclaw.agents.model_selection import get_provider_from_model
+                
+                provider = get_provider_from_model(model_override) if model_override else None
+                cli_backend_ids = resolve_cli_backend_ids(config_dict)
+                
+                # CLI provider routing
+                if provider and provider in cli_backend_ids:
+                    from openclaw.agents.cli_runner import run_cli_agent
+                    from openclaw.agents.cli_session import get_cli_session_id, set_cli_session_id
+                    from openclaw.agents.agent_scope import resolve_agent_workspace_dir
+                    
+                    # Get session entry
+                    session_entry = getattr(session, "entry", None)
+                    
+                    # Determine if this is a new session
+                    is_new_session = session_entry is None or not hasattr(session_entry, "sessionId")
+                    
+                    # Get CLI session ID (None for new sessions)
+                    cli_session_id = None if is_new_session else get_cli_session_id(session_entry, provider)
+                    
+                    # Resolve workspace directory
+                    workspace_dir = resolve_agent_workspace_dir(config_dict, job_agent_id)
+                    
+                    # Run CLI agent
+                    timeout_ms = payload_timeout * 1000 if payload_timeout else None
+                    result = await run_cli_agent(
+                        session_id=getattr(session, "id", None) or job_session_key,
+                        session_key=job_session_key,
+                        agent_id=job_agent_id,
+                        workspace_dir=str(workspace_dir),
+                        config=config_dict,
+                        prompt=message,
+                        provider=provider,
+                        model=model_override,
+                        timeout_ms=timeout_ms,
+                        run_id=f"cron-{job.id}",
+                        extra_system_prompt=system_prompt,
+                        cli_session_id=cli_session_id,
                     )
+                    
+                    # Save new CLI session ID if available
+                    if result.get("meta", {}).get("agentMeta", {}).get("sessionId") and session_entry:
+                        set_cli_session_id(session_entry, provider, result["meta"]["agentMeta"]["sessionId"])
+                    
+                    # Extract response text
+                    response_text = ""
+                    for payload in result.get("payloads", []):
+                        if "text" in payload:
+                            response_text += payload["text"]
+                    
+                    # Extract telemetry
+                    used_model = model_override
+                    used_provider = provider
+                    usage = result.get("meta", {}).get("usage")
                 else:
-                    response_text = await _collect_response()
+                    # Default embedded runtime path
+                    run_kwargs: dict[str, Any] = {
+                        "tools": tools,
+                        "system_prompt": system_prompt,
+                    }
+                    if model_override:
+                        # TS uses 'model' parameter (not 'model_override')
+                        # See: openclaw/src/agents/pi-embedded-runner/run.ts line 243
+                        run_kwargs["model"] = model_override
+                    if payload_fallbacks:
+                        run_kwargs["model_fallbacks"] = payload_fallbacks
 
-                # Collect basic telemetry if runtime exposes it
-                used_model: str | None = None
-                used_provider: str | None = None
-                usage: dict[str, Any] | None = None
+                    async def _collect_response() -> str:
+                        text = ""
+                        async for event in runtime.run_turn(session, message, **run_kwargs):
+                            evt_type = getattr(event, "type", "")
+                            if evt_type in ("text", "text_delta"):
+                                data = getattr(event, "data", {}) or {}
+                                chunk = data.get("text") or data.get("delta") or ""
+                                text += str(chunk) if chunk else ""
+                        return text
+
+                    if payload_timeout and payload_timeout > 0:
+                        response_text = await asyncio.wait_for(
+                            _collect_response(), timeout=float(payload_timeout)
+                        )
+                    else:
+                        response_text = await _collect_response()
+                    
+                    # Collect basic telemetry if runtime exposes it
+                    used_model: str | None = None
+                    used_provider: str | None = None
+                    usage: dict[str, Any] | None = None
+                    try:
+                        last_meta = getattr(runtime, "last_run_meta", None)
+                        if isinstance(last_meta, dict):
+                            used_model = last_meta.get("model") or model_override
+                            used_provider = last_meta.get("provider")
+                            usage = last_meta.get("usage")
+                    except Exception:
+                        pass
+
+                # Build payloads array (mirrors TS structure for delivery)
+                payloads: list[dict[str, Any]] = []
+                if response_text.strip():
+                    payloads.append({
+                        "text": response_text,
+                        "role": "assistant",
+                    })
+
+                # Resolve delivery target (mirrors TS delivery resolution)
+                resolved_delivery: dict[str, Any] = {}
                 try:
-                    last_meta = getattr(runtime, "last_run_meta", None)
-                    if isinstance(last_meta, dict):
-                        used_model = last_meta.get("model") or model_override
-                        used_provider = last_meta.get("provider")
-                        usage = last_meta.get("usage")
-                except Exception:
-                    pass
+                    delivery_config = getattr(job, "delivery", None)
+                    if delivery_config and getattr(delivery_config, "mode", "none") != "none":
+                        channel_mode = getattr(delivery_config, "channel", "last")
+                        if channel_mode == "last":
+                            # Find last-used channel from session store
+                            running_channels = cm.list_running() if hasattr(cm, "list_running") else []
+                            all_keys = _list_all_session_keys(cm)
+                            agent_part = _extract_agent_part(job_session_key)
+                            targets = _extract_delivery_targets(all_keys, agent_part, running_channels)
+                            
+                            if targets:
+                                # Use first target
+                                channel_id, chat_id, thread_id = targets[0]
+                                resolved_delivery = {
+                                    "channel": channel_id,
+                                    "to": chat_id,
+                                }
+                                if thread_id is not None:
+                                    resolved_delivery["threadId"] = thread_id
+                                logger.info(f"cron: resolved delivery target: {resolved_delivery}")
+                            else:
+                                logger.warning(f"cron: no delivery targets found for agent={agent_part}")
+                except Exception as e:
+                    logger.warning(f"cron: delivery resolution error: {e}", exc_info=True)
 
                 return {
                     "status": "ok",
                     "summary": response_text.strip(),
                     "output_text": response_text,
-                    "delivered": False,
+                    "payloads": payloads,
+                    "resolved_delivery": resolved_delivery,
+                    "delivered": False,  # Let run_cron_isolated_agent_turn decide
                     "session_id": str(session.id) if hasattr(session, "id") else None,
                     "session_key": job_session_key,
                     "model": used_model or model_override,
@@ -301,8 +399,15 @@ async def build_gateway_cron_service(
 
                 # Append run log
                 try:
+                    from openclaw.cron.run_log import resolve_cron_run_log_prune_options
+                    
                     runs_dir = log_dir.parent / "runs"
-                    run_log = CronRunLog(runs_dir, job_id)
+                    
+                    # Resolve prune options from config
+                    run_log_config = cron_config.get("runLog") if isinstance(cron_config, dict) else None
+                    prune_options = resolve_cron_run_log_prune_options(run_log_config)
+                    
+                    run_log = CronRunLog(runs_dir, job_id, prune_options=prune_options)
                     import time as _time
                     run_log.append({
                         "ts": event.get("ts") or int(_time.time() * 1000),
@@ -483,6 +588,7 @@ async def _run_heartbeat_async(
             message,
             tools=tools,
             system_prompt=system_prompt,
+            streaming_behavior="followUp",  # Queue if agent is busy
         ):
             evt_type = getattr(event, "type", "")
             if evt_type in (_ET.TEXT, _ET.TEXT_DELTA, "text", "text_delta"):
@@ -569,18 +675,14 @@ async def _deliver_via_channels(
         all_session_keys = _list_all_session_keys(cm)
         agent_part = _extract_agent_part(session_key)
 
-        # Resolve cron session workspace for relative-path media resolution
-        _cron_workspace: str | None = None
+        # Extract agent_id from session key for agent-scoped media resolution
+        # Mirrors TS cron delivery logic which uses job agent_id
+        cron_agent_id = "main"  # Default to main
         try:
-            sm = getattr(cm, "session_manager", None)
-            if sm:
-                _cron_session = sm.get_or_create_session_by_key(session_key)
-                if _cron_session:
-                    from openclaw.agents.session_workspace import resolve_session_workspace_dir
-                    _cron_workspace = str(resolve_session_workspace_dir(
-                        workspace_root=_cron_session.workspace_dir,
-                        session_key=session_key,
-                    ))
+            from openclaw.routing.session_key import parse_agent_session_key
+            parsed = parse_agent_session_key(session_key)
+            if parsed and parsed.agent_id:
+                cron_agent_id = parsed.agent_id
         except Exception:
             pass
 
@@ -616,7 +718,7 @@ async def _deliver_via_channels(
             # Send media files extracted from MEDIA: tokens
             for media_url in all_media:
                 try:
-                    resolved_url = _resolve_media_url(media_url, _cron_workspace)
+                    resolved_url = _resolve_media_url(media_url, None, cron_agent_id)
                     if resolved_url is None:
                         continue
                     mime = detect_mime(resolved_url)
@@ -645,19 +747,17 @@ def _extract_delivery_targets(
     running_channel_ids: list[str],
 ) -> list[tuple[str, str, int | None]]:
     """
-    Extract (channel_id, chat_id, thread_id) delivery triples from session keys.
+    Extract (channel_id, chat_id, thread_id) delivery triples from session store.
 
-    Mirrors TS resolveSessionDeliveryTarget("last") — finds all active
-    channel sessions for this agent and returns the channel + recipient.
+    Mirrors TypeScript resolveSessionDeliveryTarget("last"):
+    - Loads sessions.json via loadSessionStore
+    - Extracts lastChannel/lastTo/lastThreadId from each SessionEntry via deliveryContextFromSession
+    - Returns matching delivery targets for running channels
 
-    Session key formats:
-      Standard:     agent:<agent>:<channel>:<kind>:<peer_id>
-      Forum topic:  agent:<agent>:telegram:group:<chat_id>:topic:<thread_id>
-                    agent:<agent>:telegram:group:<chat_id>:thread:<thread_id>
-
-    For Telegram forum topic sessions the peer is <chat_id>, NOT the last segment
-    (which would be the topic/thread ID). thread_id is returned separately so
-    callers can pass message_thread_id to send_text.
+    TypeScript reference:
+    - openclaw/src/cron/isolated-agent/delivery-target.ts: resolveDeliveryTarget()
+    - openclaw/src/config/sessions/store.ts: loadSessionStore()
+    - openclaw/src/utils/delivery-context.ts: deliveryContextFromSession()
     """
     _KNOWN_CHANNELS = {
         "telegram", "feishu", "discord", "whatsapp", "slack",
@@ -666,105 +766,192 @@ def _extract_delivery_targets(
     targets: list[tuple[str, str, int | None]] = []
     seen: set[tuple[str, str]] = set()
 
-    for sk in all_session_keys:
-        parts = sk.split(":")
-        # Minimum: agent:<agent>:<channel>:<kind>:<peer_id>
-        if len(parts) < 5 or parts[0] != "agent":
-            continue
-        sk_agent = parts[1]
-        sk_channel = parts[2]
+    # Normalize agent_part for matching (mirrors TS agent matching logic)
+    # "default" should match "main" sessions for backward compatibility
+    target_agent = agent_part
+    if target_agent == "default":
+        target_agent = "main"
+    
+    logger.info(f"cron: _extract_delivery_targets looking for agent='{target_agent}' (original='{agent_part}')")
 
-        if agent_part and sk_agent != agent_part:
-            continue
-        if sk_channel not in _KNOWN_CHANNELS:
-            continue
-        if sk_channel not in running_channel_ids:
-            continue
+    # Load session store (mirrors TS loadSessionStore)
+    try:
+        from pathlib import Path
+        import json
 
-        # Detect Telegram forum topic patterns:
-        #   agent:A:telegram:group:<chat_id>:topic:<thread_id>
-        #   agent:A:telegram:group:<chat_id>:thread:<thread_id>
-        thread_id: int | None = None
-        sk_peer = parts[-1]
-        if sk_channel == "telegram" and len(parts) >= 7:
-            for _sep in ("topic", "thread"):
+        sessions_file = Path.home() / ".openclaw" / "agents" / "main" / "sessions" / "sessions.json"
+        if not sessions_file.exists():
+            logger.warning(f"cron: session store not found at {sessions_file}")
+            return targets
+
+        with open(sessions_file) as f:
+            session_store = json.load(f)
+
+        logger.info(f"cron: loaded {len(session_store)} sessions from store")
+
+        # Extract delivery context from each session entry
+        # (mirrors TS deliveryContextFromSession)
+        for session_key, entry in session_store.items():
+            if not isinstance(entry, dict):
+                continue
+
+            # Filter by agent (match cron's agent with session's agent)
+            # Session keys can be: "main", "agent:main:...", "agent:main:telegram:...", etc.
+            session_agent = "main"  # Default for simple keys like "main"
+            if isinstance(session_key, str) and session_key.startswith("agent:"):
+                parts = session_key.split(":")
+                if len(parts) >= 2:
+                    session_agent = parts[1]
+            
+            # Skip sessions from other agents
+            if target_agent and session_agent != target_agent:
+                logger.debug(f"cron: skipping session {session_key} (agent={session_agent}, want={target_agent})")
+                continue
+
+            # Extract last* fields from session entry
+            last_channel = entry.get("lastChannel")
+            last_to = entry.get("lastTo")
+            last_thread_id = entry.get("lastThreadId")
+
+            # Validate channel
+            if not last_channel or last_channel not in _KNOWN_CHANNELS:
+                logger.debug(f"cron: skipping session {session_key} (no valid lastChannel)")
+                continue
+            if last_channel not in running_channel_ids:
+                logger.debug(f"cron: skipping session {session_key} (channel {last_channel} not running)")
+                continue
+
+            # Validate recipient
+            if not last_to or not isinstance(last_to, str):
+                logger.debug(f"cron: skipping session {session_key} (no valid lastTo)")
+                continue
+
+            # Skip test chat IDs for Telegram
+            if last_channel == "telegram":
                 try:
-                    sep_idx = parts.index(_sep, 4)  # look after channel segment
-                    sk_peer = ":".join(parts[4:sep_idx])  # chat_id may contain ":"
-                    _tid_str = parts[sep_idx + 1] if sep_idx + 1 < len(parts) else ""
-                    thread_id = int(_tid_str) if _tid_str.lstrip("-").isdigit() else None
-                    break
-                except (ValueError, IndexError):
+                    chat_id_num = int(last_to)
+                    if 0 < abs(chat_id_num) < 1000:
+                        logger.debug(f"cron: skipping test chat_id={last_to} from session {session_key}")
+                        continue
+                except ValueError:
                     pass
 
-        if not sk_peer:
-            continue
+            # Normalize threadId (mirrors TS: can be string | number)
+            thread_id: int | None = None
+            if last_thread_id is not None:
+                if isinstance(last_thread_id, int):
+                    thread_id = last_thread_id
+                elif isinstance(last_thread_id, str) and last_thread_id.strip():
+                    try:
+                        thread_id = int(last_thread_id.strip())
+                    except ValueError:
+                        pass
 
-        # Skip test/dummy chat IDs (单个数字通常是测试数据)
-        # Real Telegram chat IDs are typically large integers (6+ digits) or negative supergroup IDs
-        if sk_channel == "telegram":
-            try:
-                chat_id_num = int(sk_peer)
-                # Skip small test IDs (1-999) that are likely from test sessions
-                if 0 < abs(chat_id_num) < 1000:
-                    logger.debug(f"cron: skipping test chat_id={sk_peer} from session {sk}")
-                    continue
-            except ValueError:
-                # Non-numeric peer ID, allow it (e.g., @username)
-                pass
+            # Add unique target
+            key = (last_channel, last_to)
+            if key not in seen:
+                seen.add(key)
+                targets.append((last_channel, last_to, thread_id))
+                logger.info(f"cron: ✅ delivery target {last_channel} -> {last_to} (session={session_key})")
 
-        key = (sk_channel, sk_peer)
-        if key not in seen:
-            seen.add(key)
-            targets.append((sk_channel, sk_peer, thread_id))
+    except Exception as e:
+        logger.error(f"cron: failed to load session store: {e}", exc_info=True)
 
+    if not targets:
+        logger.warning(f"cron: no delivery targets found for agent='{target_agent}' (running_channels={running_channel_ids})")
+    else:
+        logger.info(f"cron: found {len(targets)} delivery target(s)")
+    
     return targets
 
 
-def _resolve_media_url(media_url: str, cron_workspace: str | None) -> str | None:
+def _resolve_media_url(media_url: str, workspace_dir: str | None, agent_id: str = "main") -> str | None:
     """
-    Resolve a possibly-relative media URL to an absolute path.
-
-    Returns the resolved path string, or None if the file is not found.
+    Resolve media URL with agent-scoped local roots.
+    
+    Mirrors TS resolveSandboxedMediaSource + getAgentScopedMediaLocalRoots.
+    
+    Args:
+        media_url: The media URL/path to resolve
+        workspace_dir: Optional workspace directory (deprecated, kept for compatibility)
+        agent_id: Agent identifier for scoped root resolution
+    
+    Returns:
+        Resolved absolute path string, or None if not found
     """
     from pathlib import Path
-
-    if media_url.startswith(("http://", "https://", "file://", "/")):
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+    
+    # Strip MEDIA: prefix if present
+    if media_url.upper().startswith("MEDIA:"):
+        media_url = media_url[6:].strip()
+    
+    # HTTP(S) URLs: return as-is
+    if media_url.startswith(("http://", "https://")):
         return media_url
-
-    search_dirs: list[Path] = []
-    if cron_workspace:
-        search_dirs.append(Path(cron_workspace))
-    _oc_workspace_root = Path.home() / ".openclaw" / "workspace"
-    if _oc_workspace_root.is_dir():
+    
+    # file:// URLs: convert to local path
+    if media_url.startswith("file://"):
         try:
-            for _ws_dir in sorted(
-                _oc_workspace_root.iterdir(),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            ):
-                if _ws_dir.is_dir() and _ws_dir not in search_dirs:
-                    search_dirs.append(_ws_dir)
+            parsed = urlparse(media_url)
+            return url2pathname(parsed.path)
         except Exception:
-            pass
-    search_dirs.append(Path.cwd())
-    search_dirs.append(Path.home())
-
-    p = Path(media_url)
-    for search_dir in search_dirs:
-        # Try full relative path (e.g. presentations/file.pptx)
-        candidate = search_dir / p
-        if candidate.exists():
-            logger.info("cron: resolved relative path '%s' -> %s", media_url, candidate)
-            return str(candidate)
-        # Fall back to filename only
-        candidate = search_dir / p.name
-        if candidate.exists():
-            logger.info("cron: resolved filename '%s' -> %s", media_url, candidate)
-            return str(candidate)
-
-    logger.warning("cron: media file '%s' not found in any workspace, skipping", media_url)
-    return None
+            logger.warning("cron: invalid file:// URL: %s", media_url)
+            return None
+    
+    # Expand ~ to home directory
+    p = Path(media_url).expanduser()
+    
+    # Absolute paths: validate against allowed roots
+    if p.is_absolute():
+        if p.exists():
+            try:
+                from openclaw.media.local_roots import get_agent_scoped_media_local_roots, is_path_in_allowed_roots
+                from openclaw.config.loader import load_config
+                
+                cfg = load_config()
+                allowed_roots = get_agent_scoped_media_local_roots(cfg, agent_id)
+                
+                if is_path_in_allowed_roots(p, allowed_roots):
+                    logger.info("cron: resolved absolute path '%s' (validated)", media_url)
+                    return str(p)
+                else:
+                    logger.warning("cron: absolute path '%s' outside allowed roots, blocked", media_url)
+                    return None
+            except Exception as e:
+                logger.warning("cron: failed to validate absolute path '%s': %s", media_url, e)
+                return None
+        else:
+            logger.warning("cron: absolute path '%s' does not exist", media_url)
+            return None
+    
+    # Relative paths: search in agent-scoped roots
+    try:
+        from openclaw.media.local_roots import get_agent_scoped_media_local_roots
+        from openclaw.config.loader import load_config
+        
+        cfg = load_config()
+        local_roots = get_agent_scoped_media_local_roots(cfg, agent_id)
+        
+        for root in local_roots:
+            # Try full relative path first (e.g. "presentations/file.pptx")
+            candidate = root / p
+            if candidate.exists():
+                logger.info("cron: resolved relative path '%s' -> %s", media_url, candidate)
+                return str(candidate)
+            
+            # Fall back to filename-only search (mirrors TS local-roots fallback)
+            candidate = root / p.name
+            if candidate.exists():
+                logger.info("cron: resolved filename '%s' -> %s (filename-only fallback)", media_url, candidate)
+                return str(candidate)
+        
+        logger.warning("cron: media file '%s' not found in any agent-scoped root", media_url)
+        return None
+    except Exception as e:
+        logger.error("cron: failed to resolve media URL '%s': %s", media_url, e, exc_info=True)
+        return None
 
 
 def _extract_agent_part(session_key: str) -> str | None:

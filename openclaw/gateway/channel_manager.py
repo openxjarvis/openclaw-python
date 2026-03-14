@@ -1023,6 +1023,47 @@ class ChannelManager:
             snapshot[channel_id] = snap
         return snapshot
 
+    def get_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return channel status snapshot for all channels.
+        
+        This method directly accesses _runtime_envs to ensure we capture
+        all running channels even if registration state is inconsistent.
+        
+        Returns dict with channel_id -> snapshot dict containing:
+        - label: channel label
+        - enabled: whether enabled
+        - running: whether running
+        - connected: whether connected (from channel if available)
+        - healthy: whether healthy
+        - state: current state
+        """
+        snapshot: dict[str, dict[str, Any]] = {}
+        for channel_id, env in self._runtime_envs.items():
+            channel = self._channels.get(channel_id)
+            
+            # Get connection status from channel if available
+            connected = False
+            healthy = False
+            if channel:
+                if hasattr(channel, "is_connected"):
+                    connected = channel.is_connected()
+                elif hasattr(channel, "_connected"):
+                    connected = getattr(channel, "_connected", False)
+                
+                # Healthy if running and connected (or just running if no connection status)
+                healthy = channel.is_running() and (connected if hasattr(channel, "is_connected") else True)
+            
+            snap: dict[str, Any] = {
+                "label": channel_id.capitalize() if channel_id else "Unknown",
+                "enabled": env.enabled,
+                "running": channel.is_running() if channel else False,
+                "connected": connected,
+                "healthy": healthy,
+                "state": env.state.value,
+            }
+            snapshot[channel_id] = snap
+        return snapshot
+
     def get_all_channels(self) -> list[dict[str, Any]]:
         """
         Get all channels with full details

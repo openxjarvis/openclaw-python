@@ -4,7 +4,7 @@ import logging
 from typing import Any, Optional
 from ..wizard.session import WizardSession
 from ..config.loader import save_config
-from ..config.schema import ClawdbotConfig, ModelsConfig
+from ..config.schema import OpenClawConfig, ModelsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ class WizardRPCHandler:
         """Apply wizard answers to configuration"""
         try:
             # Create or load config
-            config = ClawdbotConfig()
+            config = OpenClawConfig()
             
             # Apply answers
             agent_name = session.get_answer("agent_name") or "OpenClaw"

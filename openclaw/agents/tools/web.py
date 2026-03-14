@@ -609,11 +609,27 @@ class WebSearchTool(AgentTool):
 
     @staticmethod
     def _build_description(provider: str) -> str:
-        if provider == "perplexity":
-            return (
-                "Search the web using Perplexity Sonar (direct or via OpenRouter). "
-                "Returns AI-synthesized answers with citations from real-time web search."
-            )
+        """
+        Build dynamic description matching TS web-search.ts:1379-1418.
+        
+        Provides provider-specific guidance and parameter explanations.
+        """
+        provider_note = {
+            "brave": "Using Brave Search API.",
+            "perplexity": "Using Perplexity AI (Sonar model via OpenRouter or direct).",
+            "grok": "Using xAI Grok.",
+            "duckduckgo": "Using DuckDuckGo (free, no API key required).",
+        }.get(provider, f"Using {provider}.")
+        
+        return (
+            f"Search the web for real-time information. {provider_note} "
+            "Supports parameters: query (required), count (1-10), country, search_lang, ui_lang, freshness. "
+            "freshness filters by discovery time: 'pd' (past day), 'pw' (past week), 'pm' (past month), "
+            "'py' (past year), or date range 'YYYY-MM-DDtoYYYY-MM-DD' (Brave only). "
+            "search_lang is a 2-letter ISO code (e.g., 'en', 'de', 'fr', 'tr'). "
+            "ui_lang is a locale code in language-region format (e.g., 'en-US', 'de-DE', 'fr-FR', 'tr-TR'). "
+            "Results are cached for 5 minutes. Returns array of {title, url, description, age}."
+        )
         if provider == "grok":
             return (
                 "Search the web using xAI Grok. "

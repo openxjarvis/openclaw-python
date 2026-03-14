@@ -85,8 +85,19 @@ def start(
     
     # Start server
     try:
+        # Setup logging with daily log files (matching TypeScript)
+        log_dir = Path.home() / ".openclaw" / "tmp"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        log_file = str(log_dir / f"openclaw-{date_str}.log")
+        
         from ..monitoring import setup_logging
-        setup_logging(level=log_level.upper())
+        setup_logging(
+            level=log_level.upper(),
+            format_type="colored",
+            log_file=log_file,
+        )
         
         console.print("[green]✓[/green] Starting Gateway + Telegram...")
         
@@ -496,7 +507,10 @@ def doctor(
 # Register subcommand modules
 from .gateway_cmd import gateway_app
 from .channels_cmd import channels_app
-from .agent_cmd import agent_app
+from .agent_cmd import agent_app, agents_app
+from .reset_cmd import reset_app
+from .uninstall_cmd import uninstall_app
+from .dashboard_cmd import dashboard_app
 from .config_cmd import config_app
 from .status_cmd import status_app
 from .memory_cmd import memory_app
@@ -524,6 +538,10 @@ app.add_typer(gateway_app, name="gateway")
 app.add_typer(channels_app, name="channels")
 app.add_typer(pairing_app, name="pairing")
 app.add_typer(agent_app, name="agent")
+app.add_typer(agents_app, name="agents")  # Separate top-level command (not nested under agent)
+app.add_typer(reset_app, name="reset")
+app.add_typer(uninstall_app, name="uninstall")
+app.add_typer(dashboard_app, name="dashboard")
 app.add_typer(config_app, name="config")
 app.add_typer(status_app, name="status")
 app.add_typer(memory_app, name="memory")

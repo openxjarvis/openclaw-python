@@ -36,17 +36,62 @@ class CronTool(AgentTool):
     """
 
     name = "cron"
-    description = """Schedule recurring tasks and manage cron jobs.
+    description = """Manage Gateway cron jobs (status/list/add/update/remove/run/runs) and send wake events.
 
-Actions:
-- status: Get cron service status
-- list: List all jobs (set includeDisabled=true to include disabled jobs)
-- add: Add new job (requires job config with schedule, payload, etc)
-- update: Update existing job (requires jobId and patch object)
-- remove: Remove job (requires jobId)
-- run: Trigger job immediately (requires jobId, optional mode: "due"|"force")
-- runs: Get job run history (requires jobId, optional limit)
-- wake: Send wake event to main session (requires text, optional mode: "now"|"next-heartbeat")
+ACTIONS:
+- status: Check cron scheduler status
+- list: List jobs (use includeDisabled=true to include disabled)
+- add: Create job (requires job object, see schema below)
+- update: Modify job (requires jobId + patch object)
+- remove: Delete job (requires jobId)
+- run: Trigger job immediately (requires jobId)
+- runs: Get job run history (requires jobId)
+- wake: Send wake event (requires text, optional mode)
+
+JOB SCHEMA (for add action):
+{
+  "name": "string (optional)",
+  "schedule": { ... },      // Required: when to run
+  "payload": { ... },       // Required: what to execute
+  "delivery": { ... },      // Optional: announce summary or webhook POST
+  "sessionTarget": "main" | "isolated",  // Required
+  "enabled": true | false   // Optional, default true
+}
+
+SCHEDULE TYPES (schedule.kind):
+- "at": One-shot at absolute time
+  { "kind": "at", "at": "<ISO-8601 timestamp>" }
+- "every": Recurring interval
+  { "kind": "every", "everyMs": <interval-ms>, "anchorMs": <optional-start-ms> }
+- "cron": Cron expression
+  { "kind": "cron", "expr": "<cron-expression>", "tz": "<optional-timezone>" }
+
+ISO timestamps without an explicit timezone are treated as UTC.
+
+PAYLOAD TYPES (payload.kind):
+- "systemEvent": Injects text as system event into session
+  { "kind": "systemEvent", "text": "<message>" }
+- "agentTurn": Runs agent with message (isolated sessions only)
+  { "kind": "agentTurn", "message": "<prompt>", "model": "<optional>", "thinking": "<optional>", "timeoutSeconds": <optional, 0 means no timeout> }
+
+DELIVERY (top-level):
+  { "mode": "none|announce|webhook", "channel": "<optional>", "to": "<optional>", "bestEffort": <optional-bool> }
+  - Default for isolated agentTurn jobs (when delivery omitted): "announce"
+  - announce: send to chat channel (optional channel/to target)
+  - webhook: send finished-run event as HTTP POST to delivery.to (URL required)
+  - If the task needs to send to a specific chat/recipient, set announce delivery.channel/to; do not call messaging tools inside the run.
+
+CRITICAL CONSTRAINTS:
+- sessionTarget="main" REQUIRES payload.kind="systemEvent"
+- sessionTarget="isolated" REQUIRES payload.kind="agentTurn"
+- For webhook callbacks, use delivery.mode="webhook" with delivery.to set to a URL.
+Default: prefer isolated agentTurn jobs unless the user explicitly wants a main-session system event.
+
+WAKE MODES (for wake action):
+- "next-heartbeat" (default): Wake on next heartbeat
+- "now": Wake immediately
+
+Use jobId as the canonical identifier; id is accepted for compatibility. Use contextMessages (0-10) to add previous messages as context to the job text.
     """
 
     def __init__(self, cron_service=None, channel_registry=None, session_manager=None):
@@ -128,7 +173,7 @@ Actions:
                         "sessionTarget": {
                             "type": "string",
                             "enum": ["main", "isolated"],
-                            "default": "main",
+                            "description": "Session target: 'main' (requires systemEvent) or 'isolated' (requires agentTurn). Default: prefer 'isolated' for most tasks.",
                         },
                         "wakeMode": {
                             "type": "string",
@@ -142,7 +187,7 @@ Actions:
                                 "kind": {
                                     "type": "string",
                                     "enum": ["systemEvent", "agentTurn"],
-                                    "description": "systemEvent=heartbeat wakeup, agentTurn=isolated session",
+                                    "description": "CRITICAL: 'systemEvent' for main session (injects text), 'agentTurn' for isolated session (runs agent with message)",
                                 },
                                 "text": {
                                     "type": "string",
@@ -376,6 +421,19 @@ Actions:
 
         # --- Session target ---
         session_target = job_config.get("sessionTarget", job_config.get("session_target", "main"))
+        
+        # Auto-fix: If payload is agentTurn but session_target is "main", 
+        # and we have delivery config or current chat context, switch to "isolated"
+        # This matches TypeScript behavior where agentTurn with delivery implies isolated
+        if session_target == "main" and isinstance(payload, AgentTurnPayload):
+            delivery_config = job_config.get("delivery")
+            has_delivery_or_context = (
+                delivery_config is not None or 
+                self._current_chat_info is not None
+            )
+            if has_delivery_or_context:
+                session_target = "isolated"
+                logger.info(f"Auto-switching session_target from 'main' to 'isolated' for agentTurn payload with delivery context")
 
         # --- Delivery (auto-fill from context for isolated jobs) ---
         delivery = None

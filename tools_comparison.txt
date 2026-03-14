@@ -1,0 +1,62 @@
+# TypeScript 工具列表（从 openclaw-tools.ts）:
+1. browser (createBrowserTool)
+2. canvas (createCanvasTool)
+3. nodes (createNodesTool)
+4. cron (createCronTool)
+5. message (createMessageTool)
+6. tts (createTtsTool)
+7. gateway (createGatewayTool)
+8. agents_list (createAgentsListTool)
+9. sessions_list (createSessionsListTool)
+10. sessions_history (createSessionsHistoryTool)
+11. sessions_send (createSessionsSendTool)
+12. sessions_spawn (createSessionsSpawnTool)
+13. subagents (createSubagentsTool)
+14. session_status (createSessionStatusTool)
+15. web_search (createWebSearchTool)
+16. web_fetch (createWebFetchTool)
+17. image (createImageTool)
+18. pdf (createPdfTool) ← 需要检查
+
+# 加上 pi_coding_agent 提供的工具:
+19. read (codingTools)
+20. write (codingTools)
+21. edit (codingTools)
+22. bash/exec (codingTools)
+23. grep (codingTools)
+24. find (codingTools)
+25. ls (codingTools)
+26. apply_patch (createApplyPatchTool)
+27. process (createProcessTool)
+
+# Python 工具列表:
+1. browser ✓
+2. canvas ✓
+3. nodes ✓
+4. cron ✓
+5. channel_actions (包括 message, telegram, discord, slack, whatsapp) ✓
+6. tts ✓
+7. gateway ✓
+8. agents_list ✓
+9. sessions (包括 list, history, send, spawn) ✓
+10. subagents ✓
+11. session_status ✓
+12. web (包括 search, fetch) ✓
+13. image ✓
+14. pdf ??? ← 需要检查
+15. memory ✓
+
+# 加上 pi_coding_agent:
+16. read ✓
+17. write ✓
+18. edit ✓
+19. bash ✓
+20. grep ✓
+21. find ✓
+22. ls ✓
+23. patch ✓
+24. process ✓
+
+# 额外的 Python 工具:
+25. voice_call
+26. document_gen (PPT, PDF generator)

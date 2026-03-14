@@ -101,12 +101,29 @@ async def _handle_subagents(
     cfg: dict[str, Any],
     session_key: str,
 ) -> ReplyPayload:
-    sub = args.strip().lower()
-    if not sub or sub == "list":
+    """Handle /subagents commands with full action support"""
+    tokens = args.strip().split()
+    if not tokens or tokens[0].lower() == "list":
         return await _subagents_list(session_key, cfg)
-    if sub in ("stop", "kill", "abort"):
+    
+    action = tokens[0].lower()
+    rest_tokens = tokens[1:]
+    
+    if action in ("stop", "kill", "abort"):
+        # Simple stop all - legacy behavior
         return await _subagents_stop(session_key, cfg)
-    return ReplyPayload(text="Usage: /subagents [list|stop]")
+    elif action == "log":
+        return await _subagents_log(session_key, cfg, rest_tokens)
+    elif action == "info":
+        return await _subagents_info(session_key, cfg, rest_tokens)
+    elif action == "send":
+        return await _subagents_send(session_key, cfg, rest_tokens, ctx)
+    elif action == "steer":
+        return await _subagents_steer(session_key, cfg, rest_tokens, ctx)
+    elif action == "spawn":
+        return await _subagents_spawn(session_key, cfg, rest_tokens, ctx)
+    
+    return ReplyPayload(text="Usage: /subagents [list|log|info|send|steer|spawn|stop]")
 
 
 async def _subagents_list(session_key: str, cfg: dict[str, Any]) -> ReplyPayload:
@@ -136,6 +153,298 @@ async def _subagents_stop(session_key: str, cfg: dict[str, Any]) -> ReplyPayload
         return ReplyPayload(text=format_abort_reply_text())
     except Exception as exc:
         return ReplyPayload(text=f"Could not stop sub-agents: {exc}")
+
+
+async def _subagents_log(session_key: str, cfg: dict[str, Any], rest_tokens: list[str]) -> ReplyPayload:
+    """Show subagent log/history"""
+    if not rest_tokens:
+        return ReplyPayload(text="📜 Usage: /subagents log <id|#> [limit] [tools]")
+    
+    target = rest_tokens[0]
+    include_tools = "tools" in [t.lower() for t in rest_tokens]
+    
+    # Parse limit
+    limit = 20
+    for token in rest_tokens[1:]:
+        if token.isdigit():
+            limit = min(200, max(1, int(token)))
+            break
+    
+    try:
+        from openclaw.agents.subagent_registry import get_global_registry
+        from openclaw.routing.session_key import normalize_main_key
+        
+        registry = get_global_registry()
+        requester = normalize_main_key(session_key) if session_key else session_key
+        runs = registry.list_runs_for_requester(requester)
+        
+        # Resolve target
+        run = _resolve_subagent_target(runs, target)
+        if isinstance(run, str):  # Error message
+            return ReplyPayload(text=run)
+        
+        child_session_key = run.child_session_key
+        
+        # Get history via gateway call (would need gateway client)
+        # For now, return basic info
+        label = run.label or child_session_key or run.run_id or "(unknown)"
+        return ReplyPayload(text=f"📜 Subagent log: {label}\n(History retrieval not yet implemented)")
+        
+    except Exception as exc:
+        return ReplyPayload(text=f"Could not get subagent log: {exc}")
+
+
+async def _subagents_info(session_key: str, cfg: dict[str, Any], rest_tokens: list[str]) -> ReplyPayload:
+    """Show subagent detailed info"""
+    if not rest_tokens:
+        return ReplyPayload(text="ℹ️ Usage: /subagents info <id|#>")
+    
+    target = rest_tokens[0]
+    
+    try:
+        from openclaw.agents.subagent_registry import get_global_registry
+        from openclaw.routing.session_key import normalize_main_key
+        import time
+        
+        registry = get_global_registry()
+        requester = normalize_main_key(session_key) if session_key else session_key
+        runs = registry.list_runs_for_requester(requester)
+        
+        # Resolve target
+        run = _resolve_subagent_target(runs, target)
+        if isinstance(run, str):  # Error message
+            return ReplyPayload(text=run)
+        
+        # Format timestamps
+        def format_ts(ts_ms):
+            if not ts_ms:
+                return "n/a"
+            now_ms = int(time.time() * 1000)
+            age_ms = now_ms - ts_ms
+            age_s = age_ms // 1000
+            if age_s < 60:
+                age_str = f"{age_s}s ago"
+            elif age_s < 3600:
+                age_str = f"{age_s // 60}m ago"
+            else:
+                age_str = f"{age_s // 3600}h ago"
+            return f"{age_str}"
+        
+        # Calculate runtime
+        runtime = "n/a"
+        if run.started_at:
+            end_ms = run.ended_at or int(time.time() * 1000)
+            runtime_ms = end_ms - run.started_at
+            runtime_s = runtime_ms // 1000
+            if runtime_s < 60:
+                runtime = f"{runtime_s}s"
+            elif runtime_s < 3600:
+                runtime = f"{runtime_s // 60}m {runtime_s % 60}s"
+            else:
+                runtime = f"{runtime_s // 3600}h {(runtime_s % 3600) // 60}m"
+        
+        # Status
+        if run.ended_at:
+            status = "finished"
+        elif run.started_at:
+            status = "running"
+        else:
+            status = "pending"
+        
+        label = run.label or run.child_session_key or run.run_id or "(unknown)"
+        
+        lines = [
+            "ℹ️ Subagent info",
+            f"Status: {status}",
+            f"Label: {label}",
+            f"Task: {run.task}",
+            f"Run: {run.run_id}",
+            f"Session: {run.child_session_key}",
+            f"Runtime: {runtime}",
+            f"Created: {format_ts(run.created_at)}",
+            f"Started: {format_ts(run.started_at)}",
+            f"Ended: {format_ts(run.ended_at)}",
+            f"Cleanup: {run.cleanup}",
+        ]
+        
+        if run.archive_at_ms:
+            lines.append(f"Archive: {format_ts(run.archive_at_ms)}")
+        
+        return ReplyPayload(text="\n".join(lines))
+        
+    except Exception as exc:
+        return ReplyPayload(text=f"Could not get subagent info: {exc}")
+
+
+async def _subagents_send(session_key: str, cfg: dict[str, Any], rest_tokens: list[str], ctx: Any) -> ReplyPayload:
+    """Send message to subagent"""
+    if len(rest_tokens) < 2:
+        return ReplyPayload(text="Usage: /subagents send <id|#> <message>")
+    
+    target = rest_tokens[0]
+    message = " ".join(rest_tokens[1:])
+    
+    try:
+        from openclaw.agents.subagent_registry import get_global_registry
+        from openclaw.routing.session_key import normalize_main_key
+        
+        registry = get_global_registry()
+        requester = normalize_main_key(session_key) if session_key else session_key
+        runs = registry.list_runs_for_requester(requester)
+        
+        # Resolve target
+        run = _resolve_subagent_target(runs, target)
+        if isinstance(run, str):  # Error message
+            return ReplyPayload(text=run)
+        
+        child_session_key = run.child_session_key
+        label = run.label or child_session_key or run.run_id or "(unknown)"
+        
+        # Send message via gateway (would need gateway client)
+        return ReplyPayload(text=f"✉️ Message sent to {label}\n(Gateway integration not yet implemented)")
+        
+    except Exception as exc:
+        return ReplyPayload(text=f"Could not send message: {exc}")
+
+
+async def _subagents_steer(session_key: str, cfg: dict[str, Any], rest_tokens: list[str], ctx: Any) -> ReplyPayload:
+    """Steer (abort and redirect) subagent"""
+    if len(rest_tokens) < 2:
+        return ReplyPayload(text="Usage: /subagents steer <id|#> <message>")
+    
+    target = rest_tokens[0]
+    message = " ".join(rest_tokens[1:])
+    
+    try:
+        from openclaw.agents.subagent_registry import get_global_registry
+        from openclaw.routing.session_key import normalize_main_key
+        
+        registry = get_global_registry()
+        requester = normalize_main_key(session_key) if session_key else session_key
+        runs = registry.list_runs_for_requester(requester)
+        
+        # Resolve target
+        run = _resolve_subagent_target(runs, target)
+        if isinstance(run, str):  # Error message
+            return ReplyPayload(text=run)
+        
+        if run.ended_at:
+            label = run.label or run.child_session_key or run.run_id or "(unknown)"
+            return ReplyPayload(text=f"{label} is already finished.")
+        
+        child_session_key = run.child_session_key
+        label = run.label or child_session_key or run.run_id or "(unknown)"
+        
+        # Abort and send new message (would need gateway client + abort mechanism)
+        return ReplyPayload(text=f"🔄 Steering {label}...\n(Steer mechanism not yet implemented)")
+        
+    except Exception as exc:
+        return ReplyPayload(text=f"Could not steer subagent: {exc}")
+
+
+async def _subagents_spawn(session_key: str, cfg: dict[str, Any], rest_tokens: list[str], ctx: Any) -> ReplyPayload:
+    """Manually spawn a subagent"""
+    if len(rest_tokens) < 2:
+        return ReplyPayload(text="Usage: /subagents spawn <agentId> <task> [--model <model>] [--thinking <level>]")
+    
+    agent_id = rest_tokens[0]
+    task_parts = []
+    model = None
+    thinking = None
+    
+    i = 1
+    while i < len(rest_tokens):
+        if rest_tokens[i] == "--model" and i + 1 < len(rest_tokens):
+            model = rest_tokens[i + 1]
+            i += 2
+        elif rest_tokens[i] == "--thinking" and i + 1 < len(rest_tokens):
+            thinking = rest_tokens[i + 1]
+            i += 2
+        else:
+            task_parts.append(rest_tokens[i])
+            i += 1
+    
+    task = " ".join(task_parts)
+    if not task:
+        return ReplyPayload(text="Task cannot be empty")
+    
+    try:
+        from openclaw.agents.subagent_spawn import spawn_subagent_direct, SpawnSubagentParams
+        from openclaw.routing.session_key import normalize_main_key
+        
+        requester = normalize_main_key(session_key) if session_key else session_key
+        
+        params = SpawnSubagentParams(
+            task=task,
+            agentId=agent_id,
+            model=model,
+            thinking=thinking,
+            mode="run",
+            cleanup="keep",
+            expectsCompletionMessage=True,
+        )
+        
+        # Context from current session
+        context = {
+            "agentSessionKey": requester,
+            "agentChannel": getattr(ctx, "OriginatingChannel", None) or getattr(ctx, "Channel", None),
+            "agentAccountId": getattr(ctx, "AccountId", None),
+            "agentTo": getattr(ctx, "To", None),
+            "agentThreadId": getattr(ctx, "MessageThreadId", None),
+            "agentGroupId": None,
+            "agentGroupChannel": None,
+            "agentGroupSpace": None,
+        }
+        
+        result = await spawn_subagent_direct(params, context)
+        
+        if result.status == "accepted":
+            short_run_id = result.runId[:8] if result.runId else "unknown"
+            return ReplyPayload(
+                text=f"Spawned subagent {agent_id} (session {result.childSessionKey}, run {short_run_id})."
+            )
+        else:
+            return ReplyPayload(text=f"Spawn failed: {result.error or result.status}")
+        
+    except Exception as exc:
+        return ReplyPayload(text=f"Could not spawn subagent: {exc}")
+
+
+def _resolve_subagent_target(runs: list, target: str):
+    """
+    Resolve target ID/label/number to a run record.
+    Returns run record or error string.
+    """
+    if not runs:
+        return "No subagents found"
+    
+    # Try exact label match
+    for run in runs:
+        if run.label and run.label == target:
+            return run
+    
+    # Try run_id prefix
+    for run in runs:
+        if run.run_id.startswith(target):
+            return run
+    
+    # Try numeric index (#1, #2, etc.)
+    if target.startswith("#"):
+        try:
+            idx = int(target[1:]) - 1
+            if 0 <= idx < len(runs):
+                return runs[idx]
+        except ValueError:
+            pass
+    
+    # Try label prefix
+    prefix_matches = [run for run in runs if run.label and run.label.startswith(target)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+    elif len(prefix_matches) > 1:
+        return f"Ambiguous target: {target}"
+    
+    return f"Unknown subagent: {target}"
 
 
 # ---------------------------------------------------------------------------

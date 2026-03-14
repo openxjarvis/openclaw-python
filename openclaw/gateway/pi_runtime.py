@@ -1096,6 +1096,7 @@ class PiAgentRuntime:
         run_id: str | None = None,
         session_key: str | None = None,
         stream_callback: Any | None = None,
+        streaming_behavior: str | None = None,
     ) -> AsyncIterator[Any]:
         """Stream agent events for one conversation turn.
 
@@ -1112,6 +1113,7 @@ class PiAgentRuntime:
             images:        Optional list of image data URLs or http URLs
             run_id:        Optional run identifier for active-run registry
             session_key:   Optional session key for active-run registry
+            streaming_behavior: 'steer' or 'followUp' to queue if agent is busy
         """
         import uuid as _uuid
         session_id = getattr(session, "session_id", "") or ""
@@ -1801,8 +1803,17 @@ class PiAgentRuntime:
                                 _extra_params = self._build_extra_params(provider, model_id)
                                 import inspect as _inspect
                                 _prompt_sig = _inspect.signature(_pi_session.prompt)
+                                
+                                # Build kwargs for prompt call
+                                prompt_kwargs = {}
                                 if "extra_params" in _prompt_sig.parameters and _extra_params:
-                                    await _pi_session.prompt(message, pi_images, extra_params=_extra_params)
+                                    prompt_kwargs["extra_params"] = _extra_params
+                                if "streaming_behavior" in _prompt_sig.parameters and streaming_behavior:
+                                    prompt_kwargs["streaming_behavior"] = streaming_behavior
+                                
+                                # Call prompt with appropriate parameters
+                                if prompt_kwargs:
+                                    await _pi_session.prompt(message, pi_images, **prompt_kwargs)
                                 else:
                                     await _pi_session.prompt(message, pi_images)
                             finally:

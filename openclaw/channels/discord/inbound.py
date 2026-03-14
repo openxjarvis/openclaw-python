@@ -246,15 +246,32 @@ class DiscordInboundProcessor:
             return
 
         # ── 12b. Ack reaction — react immediately to signal processing ────────
+        from openclaw.channels.ack_reactions import should_ack_reaction
+        
         ack_emoji = self._account.ack_reaction
         ack_scope = self._account.ack_reaction_scope
-        if ack_emoji and ack_scope and ack_scope != "off" and ack_scope != "none":
-            _should_ack = (
-                ack_scope == "all"
-                or (ack_scope == "direct" and is_dm)
-                or (ack_scope in ("group-all", "group", "groups") and (is_guild or is_group_dm))
-                or (ack_scope == "group-mentions" and (is_guild or is_group_dm))
+        if ack_emoji:
+            # Check if message has mentions (for group-mentions scope)
+            was_mentioned = False
+            if not is_dm and message.mentions:
+                # Check if bot was mentioned
+                for mentioned_user in message.mentions:
+                    if mentioned_user.id == client.user.id:
+                        was_mentioned = True
+                        break
+            
+            # Use helper function to determine if we should ack
+            _should_ack = should_ack_reaction(
+                scope=ack_scope,
+                is_direct=is_dm,
+                is_group=is_guild or is_group_dm,
+                is_mentionable_group=is_guild or is_group_dm,
+                require_mention=True,  # Discord requires explicit mentions
+                can_detect_mention=True,  # Discord supports mention detection
+                effective_was_mentioned=was_mentioned,
+                should_bypass_mention=False,  # No bypass for Discord
             )
+            
             if _should_ack:
                 asyncio.create_task(
                     _send_ack_reaction(message, client, ack_emoji),

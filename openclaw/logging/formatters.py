@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import os
-from datetime import datetime
 from typing import Optional
 
 try:
@@ -15,6 +14,7 @@ except ImportError:
     HAS_COLOR = False
 
 from .levels import LogLevel
+from .timestamps import format_local_iso_with_offset
 
 
 # Color mappings (fallback to no color if colorama not available)
@@ -156,6 +156,8 @@ def format_console_line(
 ) -> str:
     """Format log line for console output.
     
+    Matches TypeScript src/logging/subsystem.ts console formatting.
+    
     Args:
         level: Log level
         subsystem: Subsystem name
@@ -170,8 +172,9 @@ def format_console_line(
     
     if style == "json":
         import json
+        from .timestamps import format_local_iso_with_offset
         return json.dumps({
-            "time": datetime.now().isoformat(),
+            "time": format_local_iso_with_offset(),
             "level": level.name.lower(),
             "subsystem": display_subsystem,
             "message": message,
@@ -185,10 +188,18 @@ def format_console_line(
     prefix = get_color(subsystem_color, f"[{display_subsystem}]")
     level_text = get_color(level_color, message)
     
-    # Add timestamp for pretty style
+    # Pretty style (TTY): HH:MM:SS [subsystem] message
     if style == "pretty":
+        from datetime import datetime
         time_str = datetime.now().strftime("%H:%M:%S")
         time_colored = get_color("gray", time_str)
         return f"{time_colored} {prefix} {level_text}"
+    
+    # Compact style (non-TTY): full ISO timestamp [subsystem] message
+    elif style == "compact":
+        timestamp = format_local_iso_with_offset()
+        return f"{timestamp} {prefix} {level_text}"
+    
+    # Default: just prefix and message
     else:
         return f"{prefix} {level_text}"

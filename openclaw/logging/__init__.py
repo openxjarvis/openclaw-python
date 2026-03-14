@@ -1,20 +1,23 @@
-"""Structured logging system for OpenClaw.
+"""Unified logging system for openclaw-python.
 
-Aligned with TypeScript src/logging/subsystem.ts
+Provides tslog-compatible JSON logging matching TypeScript openclaw.
 """
 
-from __future__ import annotations
-
 from .subsystem import create_subsystem_logger, SubsystemLogger
-from .levels import LogLevel, MIN_LEVEL, MAX_LEVEL
-from .state import get_logging_state, set_logging_state
+from .state import setup_logging, get_logging_state, set_logging_state
+from .levels import LogLevel, level_from_string, MIN_LEVEL, MAX_LEVEL
+from .console_capture import enable_console_capture, disable_console_capture
 
 __all__ = [
     "create_subsystem_logger",
     "SubsystemLogger",
-    "LogLevel",
-    "MIN_LEVEL",
-    "MAX_LEVEL",
+    "setup_logging",
     "get_logging_state",
     "set_logging_state",
+    "LogLevel",
+    "level_from_string",
+    "MIN_LEVEL",
+    "MAX_LEVEL",
+    "enable_console_capture",
+    "disable_console_capture",
 ]

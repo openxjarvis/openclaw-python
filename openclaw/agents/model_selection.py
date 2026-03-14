@@ -730,3 +730,19 @@ def resolve_subagent_spawn_model_selection(
         )
         or f"{runtime_default.provider}/{runtime_default.model}"
     )
+
+
+def get_provider_from_model(model_string: str) -> str | None:
+    """Extract provider from a model string (e.g., 'anthropic/claude-3-opus' -> 'anthropic').
+    
+    Returns None if no provider prefix is found.
+    Mirrors TypeScript getProviderFromModel() functionality.
+    """
+    if not model_string or not isinstance(model_string, str):
+        return None
+    
+    if "/" in model_string:
+        provider, _ = model_string.split("/", 1)
+        return normalize_provider_id(provider)
+    
+    return None

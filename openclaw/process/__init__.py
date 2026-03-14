@@ -1,11 +1,25 @@
-"""Process execution utilities"""
+"""Process management for OpenClaw Python.
 
-from .exec import exec_command, exec_command_stream
-from .spawn import spawn_process, SpawnedProcess
+Mirrors TypeScript src/process/supervisor/ implementation.
+"""
+from .supervisor import (
+    ProcessSupervisor,
+    get_process_supervisor,
+    create_process_supervisor,
+    RunState,
+    TerminationReason,
+    RunRecord,
+    RunExit,
+    ManagedRun,
+)
 
 __all__ = [
-    "exec_command",
-    "exec_command_stream",
-    "spawn_process",
-    "SpawnedProcess",
+    "ProcessSupervisor",
+    "get_process_supervisor",
+    "create_process_supervisor",
+    "RunState",
+    "TerminationReason",
+    "RunRecord",
+    "RunExit",
+    "ManagedRun",
 ]

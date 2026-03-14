@@ -1,342 +1,249 @@
-"""Subagent completion announcement
+"""
+Subagent announce flow
 
-Fully aligned with TypeScript openclaw/src/agents/subagent-announce.ts
+Matches TypeScript src/agents/subagent-announce.ts (simplified)
 
-This module handles announcing subagent completion back to the requester session:
-- Wait for subagent completion
-- Read subagent output
-- Build announcement message with stats
-- Deliver via queue/steer/direct paths
-- Handle cleanup (delete or keep session)
+Handles sending subagent results back to parent session.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Any, Literal
+from typing import Optional
+
+from openclaw.agents.subagent_registry import (
+    SUBAGENT_RUNS,
+    SubagentRunRecord,
+)
 
 logger = logging.getLogger(__name__)
 
-# Constants
-SILENT_REPLY_TOKEN = "◻️"
-
-SubagentDeliveryPath = Literal["queued", "steered", "direct", "none"]
-SubagentAnnounceType = Literal["subagent task", "cron job"]
-
 
 def build_subagent_system_prompt(
-    *,
-    requester_session_key: str | None = None,
-    requester_origin: dict[str, Any] | None = None,
-    child_session_key: str,
-    label: str | None = None,
-    task: str | None = None,
-    child_depth: int = 1,
+    task: str,
+    child_depth: int | None = None,
+    mode: str = "run",
     max_spawn_depth: int = 1,
+    requester_session_key: str | None = None,
+    requester_origin: dict | None = None,
+    child_session_key: str | None = None,
+    label: str | None = None,
+    acp_enabled: bool = False,
+    # Legacy parameter names for backward compatibility
+    depth: int | None = None,
+    max_depth: int | None = None,
 ) -> str:
     """
-    Build system prompt for subagent.
+    Build system prompt for subagent (matches TS buildSubagentSystemPrompt).
     
-    Mirrors TS buildSubagentSystemPrompt() from subagent-announce.ts lines 594-681
+    Mirrors TS buildSubagentSystemPrompt() from subagent-announce.ts:964-1068.
+    Supports both new TS-style params and legacy Python params for compatibility.
     
     Args:
-        requester_session_key: Parent session key
-        requester_origin: Parent origin context
-        child_session_key: Child session key
-        label: Optional label
         task: Task description
-        child_depth: Depth of child (1 = subagent, 2 = sub-subagent)
-        max_spawn_depth: Maximum allowed depth
+        child_depth: Spawn depth (1 = subagent, 2 = sub-subagent)
+        mode: Run mode (run or session)
+        max_spawn_depth: Maximum spawn depth
+        requester_session_key: Parent session key
+        requester_origin: Parent delivery context (channel, accountId, etc)
+        child_session_key: Child session key
+        label: Optional task label
+        acp_enabled: Whether ACP routing guidance should be included
+        depth: Legacy depth parameter (for compatibility)
+        max_depth: Legacy max depth parameter (for compatibility)
     
     Returns:
-        System prompt string
+        System prompt in Markdown format
     """
-    task_text = (
-        task.replace("  ", " ").strip()
-        if task and task.strip()
-        else "{{TASK_DESCRIPTION}}"
-    )
+    # Resolve depth params (prefer new names, fall back to legacy)
+    actual_depth = child_depth if child_depth is not None else (depth if depth is not None else 1)
+    actual_max_depth = max_spawn_depth if max_spawn_depth != 1 else (max_depth if max_depth is not None else 1)
     
-    can_spawn = child_depth < max_spawn_depth
-    parent_label = "parent orchestrator" if child_depth >= 2 else "main agent"
+    # Determine if this subagent can spawn children
+    can_spawn = actual_depth < actual_max_depth
     
+    # Resolve parent label
+    parent_label = "parent agent"
+    if requester_session_key:
+        if "cron" in requester_session_key:
+            parent_label = "cron job scheduler"
+        elif "main" in requester_session_key:
+            parent_label = "main agent"
+        elif requester_origin and requester_origin.get("channel"):
+            parent_label = f"parent session via {requester_origin['channel']}"
+        else:
+            parent_label = requester_session_key
+    
+    # Build comprehensive Markdown prompt (matches TS structure)
     lines = [
         "# Subagent Context",
         "",
-        f"You are a **subagent** spawned by the {parent_label} for a specific task.",
+        f"You are a **subagent** spawned by {parent_label} for a specific task.",
         "",
         "## Your Role",
-        f"- You were created to handle: {task_text}",
+        f"- You were created to handle: {task}",
         "- Complete this task. That's your entire purpose.",
-        f"- You are NOT the {parent_label}. Don't try to be.",
+        "- Your results will automatically be delivered to your requester.",
         "",
         "## Rules",
-        "1. **Stay focused** - Do your assigned task, nothing else",
-        f"2. **Complete the task** - Your final message will be automatically reported to the {parent_label}",
-        "3. **Don't initiate** - No heartbeats, no proactive actions, no side quests",
-        "4. **Be ephemeral** - You may be terminated after task completion. That's fine.",
-        "5. **Trust push-based completion** - Descendant results are auto-announced back to you; do not busy-poll for status.",
-        "6. **Recover from compacted/truncated tool output** - If you see `[compacted: tool output removed to free context]` or `[truncated: output exceeded context limit]`, assume prior output was reduced. Re-read only what you need using smaller chunks (`read` with offset/limit, or targeted `rg`/`head`/`tail`) instead of full-file `cat`.",
+        "1. **Focus**: Stay on task. Don't deviate from your assigned work.",
+        "2. **Completion**: When done, provide a clear final result.",
+        "3. **NO_REPLY**: If you have nothing useful to say, output `NO_REPLY` (no additional text).",
+        "4. **No polling**: Don't check your own status or ask if the requester received your result.",
+        "5. **Concise**: Be direct and efficient. Avoid unnecessary explanation.",
+        "6. **Tools**: Use available tools as needed to complete your task.",
         "",
         "## Output Format",
-        "When complete, your final response should include:",
-        "- What you accomplished or found",
-        f"- Any relevant details the {parent_label} should know",
-        "- Keep it concise but informative",
+        "- Provide your final result as plain text or structured output.",
+        "- If the task asks for a specific format (JSON, CSV, etc), follow it exactly.",
+        "- Use `NO_REPLY` if you have no useful output (e.g., task cannot be completed).",
         "",
         "## What You DON'T Do",
-        f"- NO user conversations (that's {parent_label}'s job)",
-        "- NO external messages (email, tweets, etc.) unless explicitly tasked with a specific recipient/channel",
-        "- NO cron jobs or persistent state",
-        f"- NO pretending to be the {parent_label}",
-        f"- Only use the `message` tool when explicitly instructed to contact a specific external recipient; otherwise return plain text and let the {parent_label} deliver it",
+        "- Don't ask the requester for confirmation or feedback mid-task.",
+        "- Don't provide status updates unless explicitly asked.",
+        "- Don't explain your process unless the task requires it.",
+        "- Don't repeat the task description back.",
         "",
     ]
     
+    # Add sub-agent spawning section if allowed
     if can_spawn:
         lines.extend([
             "## Sub-Agent Spawning",
-            "You CAN spawn your own sub-agents for parallel or complex work using `sessions_spawn`.",
-            "Use the `subagents` tool to steer, kill, or do an on-demand status check for your spawned sub-agents.",
-            "Your sub-agents will announce their results back to you automatically (not to the main agent).",
-            "Default workflow: spawn work, continue orchestrating, and wait for auto-announced completions.",
-            "Do NOT repeatedly poll `subagents list` in a loop unless you are actively debugging or intervening.",
-            "Coordinate their work and synthesize results before reporting back.",
+            f"You may spawn sub-agents using the `sessions_spawn` tool if your task requires delegation.",
+            f"- Current depth: {actual_depth}/{actual_max_depth}",
+            f"- You can spawn sub-agents at depth {actual_depth + 1}.",
+            "- Use this for parallel or delegated work, not for simple sequential steps.",
             "",
         ])
-    elif child_depth >= 2:
+    else:
+        # Leaf worker - cannot spawn
         lines.extend([
             "## Sub-Agent Spawning",
-            "You are a leaf worker and CANNOT spawn further sub-agents. Focus on your assigned task.",
+            f"You are a **leaf worker** at max depth ({actual_depth}/{actual_max_depth}).",
+            f"- You CANNOT spawn sub-agents.",
+            "- Complete this task directly using available tools.",
             "",
         ])
     
-    lines.append("## Session Context")
-    if label:
-        lines.append(f"- Label: {label}")
-    if requester_session_key:
-        lines.append(f"- Requester session: {requester_session_key}.")
-    if requester_origin and requester_origin.get("channel"):
-        lines.append(f"- Requester channel: {requester_origin['channel']}.")
-    lines.append(f"- Your session: {child_session_key}.")
-    lines.append("")
+    # Add session mode info
+    if mode == "session":
+        lines.extend([
+            "## Session Mode",
+            "This is a **persistent subagent session**.",
+            "- Your session remains active after completing tasks.",
+            "- The requester can send follow-up messages to this session.",
+            "- Use this mode when ongoing interaction is expected.",
+            "",
+        ])
+    
+    # Add ACP routing guidance
+    if acp_enabled:
+        lines.extend([
+            "## ACP Routing",
+            "You have access to the ACP (Agent Communication Protocol) harness.",
+            "- Use ACP for structured communication with your requester.",
+            "- ACP allows sending progress updates, asking questions, or delivering partial results.",
+            "",
+        ])
+    
+    # Add session context
+    if child_session_key or requester_session_key:
+        lines.extend([
+            "## Session Context",
+        ])
+        if child_session_key:
+            lines.append(f"- Your session key: `{child_session_key}`")
+        if requester_session_key:
+            lines.append(f"- Requester session: `{requester_session_key}`")
+        if label:
+            lines.append(f"- Task label: {label}")
+        lines.append("")
     
     return "\n".join(lines)
 
 
-def format_duration_short(value_ms: int | None) -> str:
-    """Format duration in short form (mirrors TS formatDurationShort lines 197-212)"""
-    if not value_ms or value_ms <= 0:
-        return "n/a"
-    
-    total_seconds = round(value_ms / 1000)
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    
-    if hours > 0:
-        return f"{hours}h{minutes}m"
-    if minutes > 0:
-        return f"{minutes}m{seconds}s"
-    return f"{seconds}s"
-
-
-def format_token_count(value: int | None) -> str:
-    """Format token count in compact form (mirrors TS formatTokenCount lines 214-225)"""
-    if not value or value <= 0:
-        return "0"
-    
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:.1f}m"
-    if value >= 1_000:
-        return f"{value / 1_000:.1f}k"
-    return str(round(value))
-
-
-async def build_compact_announce_stats_line(
-    session_key: str,
-    started_at: int | None,
-    ended_at: int | None,
-    gateway: Any = None,
+def format_subagent_announce(
+    label: str,
+    status: str,
+    result: Optional[str] = None,
+    error: Optional[str] = None,
+    mode: str = "run",
 ) -> str:
     """
-    Build compact stats line for announce message.
+    Format subagent completion announcement.
     
-    Mirrors TS buildCompactAnnounceStatsLine() from subagent-announce.ts lines 227-265
+    Matches TS buildCompletionDeliveryMessage() concept (simplified).
     
     Args:
-        session_key: Child session key
-        started_at: Start timestamp (ms)
-        ended_at: End timestamp (ms)
-        gateway: Gateway instance
+        label: Task label
+        status: Run status (completed, error, timeout, killed)
+        result: Optional result text
+        error: Optional error message
+        mode: Run mode
     
     Returns:
-        Stats line string like "Stats: runtime 5s • tokens 1.2k (in 800 / out 400)"
+        Formatted announcement text
     """
-    # Read session entry to get token counts
-    input_tokens = 0
-    output_tokens = 0
-    total_tokens = None
-    
-    if gateway and hasattr(gateway, "session_manager"):
-        try:
-            session_manager = gateway.session_manager
-            if hasattr(session_manager, "get_session_entry"):
-                entry = session_manager.get_session_entry(session_key)
-                
-                # Retry a few times to let token data settle
-                for _ in range(3):
-                    if isinstance(entry, dict):
-                        has_token_data = (
-                            isinstance(entry.get("inputTokens"), int)
-                            or isinstance(entry.get("outputTokens"), int)
-                            or isinstance(entry.get("totalTokens"), int)
-                        )
-                        if has_token_data:
-                            break
-                    
-                    await asyncio.sleep(0.15)
-                    entry = session_manager.get_session_entry(session_key)
-                
-                if isinstance(entry, dict):
-                    input_tokens = entry.get("inputTokens", 0) or 0
-                    output_tokens = entry.get("outputTokens", 0) or 0
-                    total_tokens = entry.get("totalTokens")
-        except Exception as e:
-            logger.debug(f"Failed to read token stats: {e}")
-    
-    io_total = input_tokens + output_tokens
-    
-    # Calculate runtime
-    runtime_ms = None
-    if isinstance(started_at, int) and isinstance(ended_at, int):
-        runtime_ms = max(0, ended_at - started_at)
-    
-    # Build stats parts
-    parts = [
-        f"runtime {format_duration_short(runtime_ms)}",
-        f"tokens {format_token_count(io_total)} (in {format_token_count(input_tokens)} / out {format_token_count(output_tokens)})",
-    ]
-    
-    if isinstance(total_tokens, int) and total_tokens > io_total:
-        parts.append(f"prompt/cache {format_token_count(total_tokens)}")
-    
-    return f"Stats: {' • '.join(parts)}"
-
-
-def build_completion_delivery_message(
-    findings: str,
-    subagent_name: str,
-) -> str:
-    """
-    Build user-facing completion message.
-    
-    Mirrors TS buildCompletionDeliveryMessage() lines 48-59
-    """
-    findings_text = findings.strip()
-    has_findings = findings_text and findings_text != "(no output)"
-    header = f"✅ Subagent {subagent_name} finished"
-    
-    if not has_findings:
-        return header
-    
-    return f"{header}\n\n{findings_text}"
-
-
-def build_announce_reply_instruction(
-    *,
-    remaining_active_subagent_runs: int,
-    requester_is_subagent: bool,
-    announce_type: SubagentAnnounceType,
-    expects_completion_message: bool = False,
-) -> str:
-    """
-    Build reply instruction for announce message.
-    
-    Mirrors TS buildAnnounceReplyInstruction() lines 690-707
-    """
-    if expects_completion_message:
-        return (
-            f"A completed {announce_type} is ready for user delivery. "
-            "Convert the result above into your normal assistant voice and send that user-facing update now. "
-            "Keep this internal context private (don't mention system/log/stats/session details or announce type)."
+    # Build header
+    if status == "error":
+        header = (
+            f"❌ Subagent {label} failed this task (session remains active)"
+            if mode == "session"
+            else f"❌ Subagent {label} failed"
+        )
+    elif status == "timeout":
+        header = (
+            f"⏱️ Subagent {label} timed out on this task (session remains active)"
+            if mode == "session"
+            else f"⏱️ Subagent {label} timed out"
+        )
+    elif status == "killed":
+        header = f"🛑 Subagent {label} was killed"
+    else:
+        header = (
+            f"✅ Subagent {label} completed this task (session remains active)"
+            if mode == "session"
+            else f"✅ Subagent {label} finished"
         )
     
-    if remaining_active_subagent_runs > 0:
-        active_runs_label = "run" if remaining_active_subagent_runs == 1 else "runs"
-        return (
-            f"There are still {remaining_active_subagent_runs} active subagent {active_runs_label} for this session. "
-            "If they are part of the same workflow, wait for the remaining results before sending a user update. "
-            "If they are unrelated, respond normally using only the result above."
-        )
+    # Build body
+    parts = [header]
     
-    if requester_is_subagent:
-        return (
-            "Convert this completion into a concise internal orchestration update for your parent agent in your own words. "
-            f"Keep this internal context private (don't mention system/log/stats/session details or announce type). "
-            f"If this result is duplicate or no update is needed, reply ONLY: {SILENT_REPLY_TOKEN}."
-        )
+    if result and result.strip():
+        parts.append("")
+        parts.append(result.strip())
     
-    return (
-        f"A completed {announce_type} is ready for user delivery. "
-        "Convert the result above into your normal assistant voice and send that user-facing update now. "
-        "Keep this internal context private (don't mention system/log/stats/session details or announce type), "
-        f"and do not copy the system message verbatim. Reply ONLY: {SILENT_REPLY_TOKEN} if this exact result was already delivered to the user in this same turn."
-    )
+    if error and error.strip():
+        parts.append("")
+        parts.append(f"Error: {error.strip()}")
+    
+    return "\n".join(parts)
 
 
-async def read_latest_subagent_output(
-    session_key: str,
-    gateway: Any = None,
-) -> str | None:
+async def extract_subagent_result(child_session_key: str) -> str:
     """
-    Read latest output from subagent session.
+    Extract result from subagent transcript.
     
-    Mirrors TS readLatestSubagentOutput() lines 164-178
+    Reads the latest assistant message from chat history.
+    Matches TS readLatestSubagentOutput() concept.
+    
+    Args:
+        child_session_key: Child session key
+    
+    Returns:
+        Extracted result text
     """
-    if not gateway:
-        return None
-    
     try:
-        # Call chat.history to get recent messages
-        from openclaw.gateway.api.chat import chat_history
+        # Import here to avoid circular dependency
+        from openclaw.agents.tools.agent_step import read_latest_assistant_reply
         
-        mock_connection = type("MockConnection", (), {"gateway": gateway})()
-        result = await chat_history(
-            mock_connection,
-            {"sessionKey": session_key, "limit": 50},
-        )
-        
-        messages = result.get("messages", [])
-        if not isinstance(messages, list):
-            return None
-        
-        # Find last assistant message
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            if isinstance(msg, dict):
-                role = msg.get("role")
-                content = msg.get("content")
-                
-                if role == "assistant":
-                    if isinstance(content, str):
-                        return content.strip() or None
-                    if isinstance(content, list):
-                        # Extract text from content array
-                        text_parts = []
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                text_parts.append(str(item.get("text", "")))
-                            elif isinstance(item, str):
-                                text_parts.append(item)
-                        result_text = " ".join(text_parts).strip()
-                        if result_text:
-                            return result_text
-    
+        result = await read_latest_assistant_reply(child_session_key, limit=50)
+        if result and result.strip():
+            return result
+        return "(no output)"
     except Exception as e:
-        logger.debug(f"Failed to read subagent output: {e}")
-    
-    return None
+        logger.warning(f"Failed to extract subagent result: {e}")
+        return "(extraction failed)"
 
 
 async def run_subagent_announce_flow(
@@ -344,357 +251,233 @@ async def run_subagent_announce_flow(
     child_session_key: str,
     child_run_id: str,
     requester_session_key: str,
-    requester_origin: dict[str, Any] | None,
-    requester_display_key: str,
+    requester_origin: dict,
     task: str,
-    timeout_ms: int,
-    cleanup: Literal["delete", "keep"],
+    timeout_ms: int | None = None,
+    cleanup: str = "keep",
+    round_one_reply: str | None = None,
     wait_for_completion: bool = True,
+    announce_type: str | None = None,
     started_at: int | None = None,
     ended_at: int | None = None,
-    label: str | None = None,
-    outcome: dict[str, Any] | None = None,
-    announce_type: SubagentAnnounceType = "subagent task",
-    expects_completion_message: bool = False,
-    gateway: Any = None,
+    outcome: dict | None = None,
+    expects_completion_message: bool | None = None,
+    best_effort_deliver: bool = False,
+    signal: any = None,
+    requester_display_key: str | None = None,
 ) -> bool:
     """
-    Run subagent completion announcement flow.
+    Run the announce flow for a subagent.
     
-    Fully aligned with TS runSubagentAnnounceFlow() from subagent-announce.ts lines 709-990
+    Matches TS runSubagentAnnounceFlow() signature (openclaw/src/agents/subagent-announce.ts:823).
     
-    This function:
-    1. Waits for subagent completion (if wait_for_completion=True)
-    2. Reads subagent output
-    3. Builds announcement message with stats
-    4. Delivers to requester (via queue/steer/direct)
-    5. Handles cleanup (optional session deletion)
+    Sends the subagent's result back to the parent session.
     
     Args:
         child_session_key: Child session key
-        child_run_id: Run ID
-        requester_session_key: Requester session key
-        requester_origin: Origin delivery context
-        requester_display_key: Display key for requester
-        task: Task description
+        child_run_id: Child run ID
+        requester_session_key: Parent/requester session key
+        requester_origin: Delivery context (channel, to, accountId, threadId)
+        task: Task description/label
         timeout_ms: Timeout in milliseconds
-        cleanup: Cleanup strategy ("delete" or "keep")
+        cleanup: "keep" or "delete" session after announce
+        round_one_reply: Initial reply text (for cron jobs, this is the result)
         wait_for_completion: Whether to wait for completion
-        started_at: Start timestamp (ms)
-        ended_at: End timestamp (ms)
-        label: Optional label
-        outcome: Outcome data
-        announce_type: Type of announcement
-        expects_completion_message: Whether requester expects completion message
-        gateway: Gateway instance
+        announce_type: Type of announcement ("cron job", etc.)
+        started_at: Start timestamp
+        ended_at: End timestamp
+        outcome: Run outcome (status, error, etc.)
+        expects_completion_message: Whether this expects a completion message
+        best_effort_deliver: Whether to treat delivery failures as best-effort
+        signal: Abort signal
+        requester_display_key: Display key for requester
     
     Returns:
-        True if announcement was delivered successfully
+        True if announce succeeded, False otherwise
     """
-    did_announce = False
-    should_delete_child_session = cleanup == "delete"
+    from typing import Any
     
-    try:
-        target_requester_session_key = requester_session_key
+    # For cron jobs, use direct delivery path (TS line 319: expectsCompletionMessage: true)
+    # This sends the message directly to the target channel instead of injecting into main session
+    if announce_type == "cron job":
+        logger.info(
+            f"[subagent-announce] Cron job announce: {task[:50]} → {requester_session_key}"
+        )
         
-        # Wait for completion if needed (mirrors TS lines 755-789)
-        if wait_for_completion and gateway:
-            try:
-                from openclaw.gateway.handlers import handle_agent_wait
-                
-                mock_connection = type("MockConnection", (), {"gateway": gateway})()
-                wait_result = await handle_agent_wait(
-                    mock_connection,
-                    {
-                        "runId": child_run_id,
-                        "timeoutMs": timeout_ms,
-                    },
-                )
-                
-                wait_status = wait_result.get("status")
-                if wait_status == "timeout":
-                    outcome = {"status": "timeout"}
-                elif wait_status == "error":
-                    outcome = {"status": "error", "error": wait_result.get("error")}
-                elif wait_status == "ok":
-                    outcome = {"status": "ok"}
-                
-                if "startedAt" in wait_result and not started_at:
-                    started_at = wait_result["startedAt"]
-                if "endedAt" in wait_result and not ended_at:
-                    ended_at = wait_result["endedAt"]
+        # Use the round_one_reply directly (this is the agent's result text)
+        announce_text = round_one_reply
+        if not announce_text or not announce_text.strip():
+            logger.debug("[subagent-announce] Empty cron result, skipping delivery")
+            return True
+        
+        # Extract delivery target from requester_origin
+        channel = requester_origin.get("channel")
+        to = requester_origin.get("to")
+        account_id = requester_origin.get("accountId")
+        thread_id = requester_origin.get("threadId")
+        
+        if not channel or not to:
+            logger.warning(
+                f"[subagent-announce] Missing delivery target: channel={channel}, to={to}"
+            )
+            return False if not best_effort_deliver else True
+        
+        # Direct delivery via deliver_outbound_payloads (matches TS)
+        try:
+            from openclaw.infra.outbound.deliver import deliver_outbound_payloads
+            from openclaw.config.loader import load_config
+            from openclaw.routing.session_key import parse_agent_session_key
             
-            except Exception as e:
-                logger.warning(f"Failed to wait for subagent completion: {e}")
-                outcome = {"status": "unknown"}
-        
-        # Read subagent output (mirrors TS lines 792-812)
-        reply = await read_latest_subagent_output(child_session_key, gateway)
-        
-        if not reply or not reply.strip():
-            reply = "(no output)"
-        
-        if not outcome:
-            outcome = {"status": "unknown"}
-        
-        # Build status label (mirrors TS lines 832-840)
-        status = outcome.get("status", "unknown")
-        if status == "ok":
-            status_label = "completed successfully"
-        elif status == "timeout":
-            status_label = "timed out"
-        elif status == "error":
-            error = outcome.get("error", "unknown error")
-            status_label = f"failed: {error}"
-        else:
-            status_label = "finished with unknown status"
-        
-        # Resolve agent name and IDs (mirrors TS lines 844-846)
-        from openclaw.routing.session_key import resolve_agent_id_from_session_key
-        
-        task_label = label or task or "task"
-        subagent_name = resolve_agent_id_from_session_key(child_session_key) or "subagent"
-        
-        # Get session ID for logging
-        announce_session_id = "unknown"
-        if gateway and hasattr(gateway, "session_manager"):
-            try:
-                entry = gateway.session_manager.get_session_entry(child_session_key)
-                if isinstance(entry, dict):
-                    announce_session_id = entry.get("sessionId", "unknown")
-            except Exception:
-                pass
-        
-        findings = reply or "(no output)"
-        
-        # Check requester depth (mirrors TS lines 851-889)
-        from openclaw.agents.subagent_spawn import get_subagent_depth_from_session_store
-        
-        requester_depth = get_subagent_depth_from_session_store(
-            target_requester_session_key,
-            gateway=gateway,
-        )
-        requester_is_subagent = not expects_completion_message and requester_depth >= 1
-        
-        # Count remaining active subagent runs (mirrors TS lines 891-900)
-        from openclaw.agents.subagent_registry import get_global_registry
-        
-        registry = get_global_registry()
-        remaining_active_runs = 0
-        
-        try:
-            # Count active descendants for target requester
-            active_runs = registry.list_runs_for_requester(
-                target_requester_session_key,
-                active_only=True,
+            # Load config for channel plugins
+            cfg = load_config()
+            
+            # Extract agent ID from session key
+            parsed = parse_agent_session_key(requester_session_key)
+            agent_id = parsed.get("agent_id") if parsed else None
+            
+            # Build payloads
+            payloads = [{"text": announce_text}]
+            
+            logger.info(
+                f"[subagent-announce] Direct delivery to {channel}:{to} (agent={agent_id})"
             )
-            remaining_active_runs = len(active_runs)
+            
+            # Deliver directly to channel
+            results = await deliver_outbound_payloads(
+                cfg=cfg,
+                channel=channel,
+                to=to,
+                account_id=account_id,
+                thread_id=thread_id,
+                payloads=payloads,
+                agent_id=agent_id,
+            )
+            
+            # Check if any delivery succeeded
+            delivered = any(r.get("ok") for r in results)
+            
+            if delivered:
+                logger.info(
+                    f"[subagent-announce] Successfully delivered cron result to {channel}:{to}"
+                )
+                return True
+            else:
+                error_msgs = [r.get("error") for r in results if r.get("error")]
+                logger.warning(
+                    f"[subagent-announce] Failed to deliver to {channel}:{to}: {error_msgs}"
+                )
+                return False if not best_effort_deliver else True
+        
         except Exception as e:
-            logger.debug(f"Failed to count active runs: {e}")
-        
-        # Build announce message (mirrors TS lines 901-924)
-        reply_instruction = build_announce_reply_instruction(
-            remaining_active_subagent_runs=remaining_active_runs,
-            requester_is_subagent=requester_is_subagent,
-            announce_type=announce_type,
-            expects_completion_message=expects_completion_message,
-        )
-        
-        stats_line = await build_compact_announce_stats_line(
-            child_session_key,
-            started_at,
-            ended_at,
-            gateway,
-        )
-        
-        completion_message = build_completion_delivery_message(
-            findings,
-            subagent_name,
-        )
-        
-        internal_summary_message = "\n".join([
-            f"[System Message] [sessionId: {announce_session_id}] A {announce_type} \"{task_label}\" just {status_label}.",
-            "",
-            "Result:",
-            findings,
-            "",
-            stats_line,
-        ])
-        
-        trigger_message = "\n\n".join([internal_summary_message, reply_instruction])
-        
-        # Deliver announcement (mirrors TS lines 941-955)
-        delivery_result = await _deliver_subagent_announcement(
-            requester_session_key=target_requester_session_key,
-            trigger_message=trigger_message,
-            completion_message=completion_message,
-            requester_origin=requester_origin,
-            requester_is_subagent=requester_is_subagent,
-            expects_completion_message=expects_completion_message,
-            gateway=gateway,
-        )
-        
-        did_announce = delivery_result.get("delivered", False)
-        
-        if not delivery_result.get("delivered") and delivery_result.get("error"):
             logger.error(
-                f"Subagent completion direct announce failed for run {child_run_id}: "
-                f"{delivery_result['error']}"
+                f"[subagent-announce] Cron delivery error to {channel}:{to}: {e}",
+                exc_info=True
             )
+            return False if not best_effort_deliver else True
     
-    except Exception as err:
-        logger.error(f"Subagent announce failed: {err}", exc_info=True)
-    
-    finally:
-        # Patch label after all writes complete (mirrors TS lines 966-976)
-        if label and gateway:
-            try:
-                from openclaw.gateway.api.sessions_methods import SessionsPatchMethod
-                
-                patch_method = SessionsPatchMethod()
-                mock_connection = type("MockConnection", (), {"gateway": gateway})()
-                
-                await patch_method.execute(
-                    mock_connection,
-                    {"key": child_session_key, "patch": {"label": label}},
-                )
-            except Exception:
-                pass
+    # For non-cron subagents, check registry for existing run record
+    record = SUBAGENT_RUNS.get(child_run_id)
+    if record:
+        # Don't announce if already sent
+        if record.announce_sent:
+            return True
         
-        # Delete child session if requested (mirrors TS lines 977-987)
-        if should_delete_child_session and gateway:
-            try:
-                from openclaw.gateway.api.sessions_methods import SessionsDeleteMethod
-                
-                delete_method = SessionsDeleteMethod()
-                mock_connection = type("MockConnection", (), {"gateway": gateway})()
-                
-                await delete_method.execute(
-                    mock_connection,
-                    {"key": child_session_key, "deleteTranscript": True},
-                )
-            except Exception:
-                pass
-    
-    return did_announce
-
-
-# ---------------------------------------------------------------------------
-# Transient / permanent error classification — mirrors TS subagent-announce.ts
-# ---------------------------------------------------------------------------
-
-_PERMANENT_ERROR_PATTERNS = [
-    "unsupported channel", "chat not found", "user not found",
-    "session not found", "forbidden", "unauthorized",
-]
-_TRANSIENT_ERROR_PATTERNS = [
-    "unavailable", "gateway timeout", "econnreset", "etimedout",
-    "epipe", "econnrefused", "network", "internal server error",
-    "service unavailable",
-]
-
-# Retry delays aligned with TS DIRECT_ANNOUNCE_TRANSIENT_RETRY_DELAYS_MS
-_DIRECT_ANNOUNCE_RETRY_DELAYS_S = [5.0, 10.0, 20.0]
-
-
-def _classify_delivery_error(err: str) -> str:
-    """Return 'permanent', 'transient', or 'unknown'."""
-    lower = err.lower()
-    for pat in _PERMANENT_ERROR_PATTERNS:
-        if pat in lower:
-            return "permanent"
-    for pat in _TRANSIENT_ERROR_PATTERNS:
-        if pat in lower:
-            return "transient"
-    return "unknown"
-
-
-async def _deliver_subagent_announcement(
-    *,
-    requester_session_key: str,
-    trigger_message: str,
-    completion_message: str | None,
-    requester_origin: dict[str, Any] | None,
-    requester_is_subagent: bool,
-    expects_completion_message: bool,
-    gateway: Any = None,
-) -> dict[str, Any]:
-    """Deliver announcement to requester session.
-
-    Mirrors TS ``runSubagentAnnounceDispatch`` with two strategies:
-    - ``expects_completion_message=True``:  direct first, queue fallback.
-    - ``expects_completion_message=False``: queue first, direct fallback.
-
-    Direct delivery retries transient errors with exponential backoff
-    (5s, 10s, 20s) matching TS ``DIRECT_ANNOUNCE_TRANSIENT_RETRY_DELAYS_MS``.
-    """
-    if not gateway:
-        return {"delivered": False, "path": "none", "error": "No gateway"}
-
-    async def _try_direct() -> dict[str, Any]:
-        """Attempt direct delivery via handle_agent with transient retry."""
-        from openclaw.gateway.handlers import handle_agent
-
-        mock_connection = type("MockConnection", (), {"gateway": gateway})()
-        agent_params: dict[str, Any] = {
-            "message": trigger_message,
-            "sessionKey": requester_session_key,
-            "deliver": not requester_is_subagent,
-        }
-        if not requester_is_subagent and requester_origin:
-            for k in ("channel", "to", "accountId", "threadId"):
-                val = requester_origin.get(k)
-                if val:
-                    agent_params[k] = str(val)
-
-        last_error: str | None = None
-        for attempt_idx in range(1 + len(_DIRECT_ANNOUNCE_RETRY_DELAYS_S)):
-            try:
-                await handle_agent(mock_connection, agent_params)
-                return {"delivered": True, "path": "direct"}
-            except Exception as exc:
-                last_error = str(exc)
-                kind = _classify_delivery_error(last_error)
-                if kind == "permanent":
-                    return {"delivered": False, "path": "direct", "error": last_error}
-                if attempt_idx < len(_DIRECT_ANNOUNCE_RETRY_DELAYS_S):
-                    delay = _DIRECT_ANNOUNCE_RETRY_DELAYS_S[attempt_idx]
-                    logger.warning(
-                        "Announce direct delivery transient error (attempt %d): %s — retrying in %.0fs",
-                        attempt_idx + 1, last_error, delay,
-                    )
-                    await asyncio.sleep(delay)
-        return {"delivered": False, "path": "direct", "error": last_error}
-
-    async def _try_queue() -> dict[str, Any]:
-        """Attempt queue-based delivery (steer/enqueue into session)."""
+        # Extract result from child session
+        result = record.result or await extract_subagent_result(child_session_key)
+        
+        # Format announce message
+        announce_text = format_subagent_announce(
+            label=record.label or task[:50],
+            status=record.status,
+            result=result,
+            error=record.error,
+            mode=record.mode,
+        )
+        
+        if not announce_text.strip():
+            # Empty announce, mark as sent
+            record.announce_sent = True
+            record.announce_pending = False
+            return True
+        
+        # Send to parent session via gateway (matches TS)
         try:
-            from openclaw.gateway.handlers import handle_agent
+            from openclaw.gateway.rpc_client import GatewayRPCClient
+            
+            client = GatewayRPCClient()
+            
+            # Call agent method to inject message into parent session
+            # Matches TS: callGateway({ method: "agent", params: {...} })
+            await client.call(
+                method="agent",
+                params={
+                    "message": announce_text,
+                    "sessionKey": requester_session_key,
+                    "channel": "internal",  # Internal message channel
+                    "lane": "nested",       # Nested lane for subagent messages
+                    "deliver": False,       # Don't deliver to external channels
+                    # Add internal events if needed
+                    "internalEvents": [{
+                        "type": "subagent_completed",
+                        "runId": child_run_id,
+                        "childSessionKey": child_session_key,
+                        "taskLabel": record.label or task,
+                        "status": record.status,
+                    }] if record.status == "completed" else None,
+                },
+            )
+            
+            logger.info(
+                f"[subagent-announce] Successfully announced run={child_run_id} "
+                f"→ {requester_session_key}"
+            )
+            
+            record.announce_sent = True
+            record.announce_pending = False
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to announce subagent result for run={child_run_id}: {e}")
+            # Don't mark as sent on failure, allow retry
+            return False
+    
+    # No registry record - this is likely a cron job or direct call
+    # Fall back to simple gateway injection
+    if round_one_reply and round_one_reply.strip():
+        try:
+            from openclaw.gateway.rpc_client import GatewayRPCClient
+            
+            client = GatewayRPCClient()
+            
+            await client.call(
+                method="agent",
+                params={
+                    "message": round_one_reply,
+                    "sessionKey": requester_session_key,
+                    "channel": "internal",
+                    "lane": "nested",
+                    "deliver": False,
+                },
+            )
+            
+            logger.info(
+                f"[subagent-announce] Announced direct message → {requester_session_key}"
+            )
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to announce direct message: {e}")
+            return False
+    
+    logger.warning(
+        f"[subagent-announce] No announce path for run={child_run_id}, announce_type={announce_type}"
+    )
+    return False
 
-            mock_connection = type("MockConnection", (), {"gateway": gateway})()
-            agent_params: dict[str, Any] = {
-                "message": trigger_message,
-                "sessionKey": requester_session_key,
-                "deliver": False,
-            }
-            await handle_agent(mock_connection, agent_params)
-            return {"delivered": True, "path": "queued"}
-        except Exception as exc:
-            return {"delivered": False, "path": "queued", "error": str(exc)}
 
-    # Dispatch strategy — mirrors TS subagent-announce-dispatch.ts
-    if expects_completion_message:
-        # Direct first, queue fallback
-        result = await _try_direct()
-        if result.get("delivered"):
-            return result
-        fallback = await _try_queue()
-        if fallback.get("delivered"):
-            return fallback
-        return result  # return original direct error
-    else:
-        # Queue first, direct fallback
-        result = await _try_queue()
-        if result.get("delivered"):
-            return result
-        return await _try_direct()
+__all__ = [
+    "build_subagent_system_prompt",
+    "format_subagent_announce",
+    "extract_subagent_result",
+    "run_subagent_announce_flow",
+]

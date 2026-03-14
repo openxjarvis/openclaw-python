@@ -59,11 +59,16 @@ def load_workspace_skill_entries(
     if managed_skills_dir is None:
         managed_skills_dir = get_managed_skills_dir()
     
+    # Resolve bundled skills directory if not provided (mirrors TS line 326)
+    if bundled_skills_dir is None:
+        from openclaw.agents.skills.bundled_dir import resolve_bundled_skills_dir
+        bundled_skills_dir = resolve_bundled_skills_dir()
+    
     workspace_skills_dir = workspace_dir / "skills"
     
     # Load from different sources
     bundled_entries = []
-    if bundled_skills_dir and bundled_skills_dir.exists():
+    if bundled_skills_dir and Path(bundled_skills_dir).exists():
         bundled_entries = load_skill_entries_from_dir(bundled_skills_dir, source="openclaw-bundled")
     
     # Extra dirs from config

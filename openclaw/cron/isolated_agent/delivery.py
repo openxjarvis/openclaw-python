@@ -524,8 +524,20 @@ def _update_delivery_state(
         job.state.last_delivered = ts
 
 
-def format_delivery_message(job: "CronJob", result: dict[str, Any]) -> str:
-    """Format a delivery message string for a cron job result."""
+def format_delivery_message(job: "CronJob", result: dict[str, Any] | None) -> str:
+    """Format a delivery message string for a cron job result.
+    
+    Args:
+        job: The cron job
+        result: The result dict (can be None for failure alerts)
+        
+    Returns:
+        Formatted message string
+    """
+    # Handle None result (shouldn't happen but be defensive)
+    if result is None:
+        return f"\u26a0\ufe0f Cron job '{job.name}' - no result available"
+    
     if not result.get("success") and result.get("error"):
         error = result.get("error", "Unknown error")
         return f"\u26a0\ufe0f Cron job '{job.name}' failed:\n\n{error}"

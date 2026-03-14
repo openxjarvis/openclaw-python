@@ -6,13 +6,13 @@ Aligned with TypeScript src/logging/subsystem.ts
 from __future__ import annotations
 
 import sys
-import logging
 from typing import Optional, Protocol
 from pathlib import Path
 
 from .levels import LogLevel, should_log
 from .state import get_console_settings, get_logging_state
 from .formatters import format_console_line
+from .tslog_formatter import TslogFormatter
 
 
 class SubsystemLogger(Protocol):
@@ -34,6 +34,7 @@ class SubsystemLoggerImpl:
     """Implementation of subsystem logger.
     
     Provides structured, colorized logging with subsystem tagging.
+    Outputs to file in tslog JSON format.
     """
     
     def __init__(self, subsystem: str):
@@ -43,36 +44,28 @@ class SubsystemLoggerImpl:
             subsystem: Subsystem name (e.g., "gateway/auth")
         """
         self.subsystem = subsystem
-        self._file_logger: Optional[logging.Logger] = None
+        self._tslog_formatter = TslogFormatter()
+        self._file_handle = None
     
-    def _get_file_logger(self) -> logging.Logger:
-        """Get or create file logger.
+    def _get_file_handle(self):
+        """Get or create file handle for logging.
         
         Returns:
-            Standard library logger for file logging
+            File handle for writing logs
         """
-        if self._file_logger:
-            return self._file_logger
+        if self._file_handle:
+            return self._file_handle
         
-        logger = logging.getLogger(f"openclaw.{self.subsystem}")
-        logger.setLevel(logging.DEBUG)
-        
-        # Add file handler if enabled
         state = get_logging_state()
-        if state.file_logging_enabled and state.file_log_path:
-            log_path = Path(state.file_log_path)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            handler = logging.FileHandler(log_path)
-            handler.setLevel(logging.DEBUG)
-            formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
+        if not state.file_logging_enabled or not state.file_log_path:
+            return None
         
-        self._file_logger = logger
-        return self._file_logger
+        log_path = Path(state.file_log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Open in append mode
+        self._file_handle = open(log_path, 'a', encoding='utf-8')
+        return self._file_handle
     
     def _emit(self, level: LogLevel, message: str, meta: Optional[dict] = None) -> None:
         """Emit log message.
@@ -85,19 +78,22 @@ class SubsystemLoggerImpl:
         state = get_logging_state()
         console_settings = get_console_settings()
         
-        # Log to file
+        # Log to file in tslog JSON format
         if state.file_logging_enabled:
-            file_logger = self._get_file_logger()
-            
-            # Map to standard library levels
-            if level == LogLevel.TRACE or level == LogLevel.DEBUG:
-                file_logger.debug(message)
-            elif level == LogLevel.INFO:
-                file_logger.info(message)
-            elif level == LogLevel.WARN:
-                file_logger.warning(message)
-            elif level in (LogLevel.ERROR, LogLevel.FATAL):
-                file_logger.error(message)
+            file_handle = self._get_file_handle()
+            if file_handle:
+                try:
+                    json_line = self._tslog_formatter.format_log_entry(
+                        level=level,
+                        subsystem=self.subsystem,
+                        message=message,
+                        meta=meta,
+                    )
+                    file_handle.write(json_line + '\n')
+                    file_handle.flush()
+                except Exception as e:
+                    # Fallback to stderr if file logging fails
+                    print(f"Logging error: {e}", file=sys.stderr)
         
         # Check if should log to console
         if not should_log(level, console_settings["level"]):
@@ -115,11 +111,7 @@ class SubsystemLoggerImpl:
         # Write to appropriate stream
         stream = sys.stderr if state.force_console_to_stderr or level >= LogLevel.ERROR else sys.stdout
         
-        if state.raw_console:
-            # Use custom console if provided
-            print(formatted, file=stream)
-        else:
-            print(formatted, file=stream)
+        print(formatted, file=stream)
     
     def trace(self, message: str, meta: Optional[dict] = None) -> None:
         """Log trace message."""
@@ -166,6 +158,14 @@ class SubsystemLoggerImpl:
         """
         child_subsystem = f"{self.subsystem}/{name}"
         return create_subsystem_logger(child_subsystem)
+    
+    def __del__(self):
+        """Clean up file handle on deletion."""
+        if self._file_handle:
+            try:
+                self._file_handle.close()
+            except Exception:
+                pass
 
 
 def create_subsystem_logger(subsystem: str) -> SubsystemLogger:

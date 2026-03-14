@@ -392,3 +392,49 @@ def get_skill_path(workspace_dir: Path | str, skill_name: str) -> Path | None:
             if fp and Path(fp).exists():
                 return Path(fp)
     return None
+
+
+def collect_skill_bins(entries: list) -> list[str]:
+    """
+    Collect all binary dependencies from skill entries.
+    
+    Mirrors TS collectSkillBins() from skills.ts lines 26-55
+    
+    Args:
+        entries: List of skill entries
+    
+    Returns:
+        Sorted list of required binary names
+    """
+    bins: set[str] = set()
+    
+    for entry in entries:
+        # Get requires.bins
+        metadata = getattr(entry.skill, 'metadata', None) if hasattr(entry, 'skill') else entry.get('metadata')
+        if metadata:
+            requires = getattr(metadata, 'requires', None) if hasattr(metadata, 'requires') else metadata.get('requires', {})
+            if requires:
+                # Add bins
+                required_bins = getattr(requires, 'bins', []) if hasattr(requires, 'bins') else requires.get('bins', [])
+                for bin_name in required_bins:
+                    trimmed = str(bin_name).strip()
+                    if trimmed:
+                        bins.add(trimmed)
+                
+                # Add anyBins
+                any_bins = getattr(requires, 'anyBins', []) if hasattr(requires, 'anyBins') else requires.get('anyBins', [])
+                for bin_name in any_bins:
+                    trimmed = str(bin_name).strip()
+                    if trimmed:
+                        bins.add(trimmed)
+            
+            # Add bins from install specs
+            install_specs = getattr(metadata, 'install', []) if hasattr(metadata, 'install') else metadata.get('install', [])
+            for spec in install_specs:
+                spec_bins = getattr(spec, 'bins', []) if hasattr(spec, 'bins') else spec.get('bins', []) if isinstance(spec, dict) else []
+                for bin_name in spec_bins:
+                    trimmed = str(bin_name).strip()
+                    if trimmed:
+                        bins.add(trimmed)
+    
+    return sorted(list(bins))

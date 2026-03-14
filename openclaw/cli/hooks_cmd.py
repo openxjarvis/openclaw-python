@@ -12,25 +12,21 @@ hooks_app = typer.Typer(help="Lifecycle hooks")
 
 
 @hooks_app.command("list")
-def list_hooks(json_output: bool = typer.Option(False, "--json", help="Output JSON")):
+def list_hooks(
+    eligible: bool = typer.Option(False, "--eligible", help="Show only eligible hooks"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed info"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
     """List registered hooks"""
     try:
-        from ..hooks.registry import get_hook_registry
+        from ..config.loader import load_config
+        from ..hooks.hooks_cli import build_hooks_report, format_hooks_list
         
-        registry = get_hook_registry()
-        hooks = registry.list_hooks() if hasattr(registry, 'list_hooks') else []
+        config = load_config()
+        report = build_hooks_report(config)
+        output = format_hooks_list(report, json_output=json_output, eligible_only=eligible, verbose=verbose)
         
-        if json_output:
-            console.print(json.dumps({"hooks": hooks}, indent=2))
-            return
-        
-        if not hooks:
-            console.print("[yellow]No hooks registered[/yellow]")
-            return
-        
-        console.print(f"[cyan]Registered Hooks ({len(hooks)}):[/cyan]")
-        for hook in hooks:
-            console.print(f"  • {hook}")
+        console.print(output)
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
@@ -48,32 +44,22 @@ def test(
 
 @hooks_app.command("info")
 def info(
-    hook_id: str = typer.Argument(..., help="Hook ID"),
+    hook_name: str = typer.Argument(..., help="Hook name"),
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
     """Show detailed info about a hook"""
     try:
-        from ..hooks.registry import get_hook_registry
-        registry = get_hook_registry()
-        hook = None
-        if hasattr(registry, "get_hook"):
-            hook = registry.get_hook(hook_id)
-        elif hasattr(registry, "list_hooks"):
-            for h in registry.list_hooks():
-                if (isinstance(h, dict) and h.get("id") == hook_id) or h == hook_id:
-                    hook = h
-                    break
-        if hook is None:
-            console.print(f"[red]Hook not found:[/red] {hook_id}")
+        from ..config.loader import load_config
+        from ..hooks.hooks_cli import build_hooks_report, format_hook_info
+        
+        config = load_config()
+        report = build_hooks_report(config)
+        output = format_hook_info(report, hook_name, json_output=json_output)
+        
+        console.print(output)
+        
+        if not json_output and "not found" in output.lower():
             raise typer.Exit(1)
-        if json_output:
-            print(json.dumps(hook if isinstance(hook, dict) else {"id": hook}, indent=2))
-        else:
-            if isinstance(hook, dict):
-                for k, v in hook.items():
-                    console.print(f"  [cyan]{k}:[/cyan] {v}")
-            else:
-                console.print(f"  [cyan]id:[/cyan] {hook}")
     except typer.Exit:
         raise
     except Exception as e:
@@ -83,70 +69,50 @@ def info(
 
 @hooks_app.command("check")
 def check(
-    eligible: bool = typer.Option(False, "--eligible", help="Show only eligible hooks"),
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
     """Check which hooks are eligible to run"""
     try:
-        from ..hooks.registry import get_hook_registry
-        registry = get_hook_registry()
-        hooks = registry.list_hooks() if hasattr(registry, "list_hooks") else []
-        if eligible:
-            hooks = [h for h in hooks if (isinstance(h, dict) and h.get("enabled", True)) or isinstance(h, str)]
-        if json_output:
-            print(json.dumps({"hooks": hooks}, indent=2))
-        else:
-            if not hooks:
-                console.print("[yellow]No hooks found[/yellow]")
-            else:
-                t = Table(title="Hooks")
-                t.add_column("ID")
-                t.add_column("Status")
-                for h in hooks:
-                    hid = h.get("id", str(h)) if isinstance(h, dict) else str(h)
-                    enabled = h.get("enabled", True) if isinstance(h, dict) else True
-                    t.add_row(hid, "[green]enabled[/green]" if enabled else "[red]disabled[/red]")
-                console.print(t)
+        from ..config.loader import load_config
+        from ..hooks.hooks_cli import build_hooks_report, format_hooks_check
+        
+        config = load_config()
+        report = build_hooks_report(config)
+        output = format_hooks_check(report, json_output=json_output)
+        
+        console.print(output)
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
 
 
 @hooks_app.command("enable")
-def enable(
-    hook_id: str = typer.Argument(..., help="Hook ID to enable"),
-    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
-):
+def enable(hook_name: str = typer.Argument(..., help="Hook name to enable")):
     """Enable a hook"""
     try:
-        from ..hooks.registry import get_hook_registry
-        registry = get_hook_registry()
-        if hasattr(registry, "enable_hook"):
-            registry.enable_hook(hook_id)
-        if json_output:
-            print(json.dumps({"ok": True, "id": hook_id, "enabled": True}))
-        else:
-            console.print(f"[green]✓[/green] Hook enabled: {hook_id}")
+        from ..hooks.hooks_cli import enable_hook
+        
+        message = enable_hook(hook_name)
+        console.print(f"[green]{message}[/green]")
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
 
 
 @hooks_app.command("disable")
-def disable(
-    hook_id: str = typer.Argument(..., help="Hook ID to disable"),
-    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
-):
+def disable(hook_name: str = typer.Argument(..., help="Hook name to disable")):
     """Disable a hook"""
     try:
-        from ..hooks.registry import get_hook_registry
-        registry = get_hook_registry()
-        if hasattr(registry, "disable_hook"):
-            registry.disable_hook(hook_id)
-        if json_output:
-            print(json.dumps({"ok": True, "id": hook_id, "enabled": False}))
-        else:
-            console.print(f"[green]✓[/green] Hook disabled: {hook_id}")
+        from ..hooks.hooks_cli import disable_hook
+        
+        message = disable_hook(hook_name)
+        console.print(f"[yellow]{message}[/yellow]")
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)

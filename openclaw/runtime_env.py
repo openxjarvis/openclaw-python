@@ -224,6 +224,17 @@ class RuntimeEnv:
         self._agent_runtime = runtime
         logger.info(f"Set custom AgentRuntime for env '{self.env_id}'")
 
+    def log(self, message: str, level: str = "info") -> None:
+        """
+        Unified logging method matching TypeScript runtime.log()
+        
+        Args:
+            message: Message to log
+            level: Log level (info, debug, warning, error)
+        """
+        log_method = getattr(logger, level, logger.info)
+        log_method(f"[{self.env_id}] {message}")
+    
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary"""
         return {

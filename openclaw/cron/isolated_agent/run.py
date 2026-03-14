@@ -289,9 +289,27 @@ async def run_cron_isolated_agent_turn(
             delivery is not None and getattr(delivery, "mode", "none") != "none"
         )
         best_effort = resolve_cron_delivery_best_effort(job)
-        agent_cfg: dict[str, Any] | None = (
-            getattr(config, "agents", {}).get("defaults") if config else None
-        )
+        
+        # Get agent config defaults (handle both dict and Pydantic model)
+        agent_cfg: dict[str, Any] | None = None
+        if config:
+            try:
+                agents_obj = getattr(config, "agents", None)
+                if agents_obj is not None:
+                    # Handle Pydantic model
+                    if hasattr(agents_obj, "defaults"):
+                        defaults_obj = getattr(agents_obj, "defaults", None)
+                        if isinstance(defaults_obj, dict):
+                            agent_cfg = defaults_obj
+                        elif defaults_obj is not None:
+                            # Convert Pydantic model to dict
+                            agent_cfg = getattr(defaults_obj, "__dict__", None) or {}
+                    # Handle dict
+                    elif isinstance(agents_obj, dict):
+                        agent_cfg = agents_obj.get("defaults")
+            except Exception:
+                pass
+        
         if isinstance(agent_cfg, dict):
             ack_max_chars = resolve_heartbeat_ack_max_chars(agent_cfg)
         else:

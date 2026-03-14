@@ -22,6 +22,31 @@ MIN_LEVEL = LogLevel.TRACE
 MAX_LEVEL = LogLevel.FATAL
 
 
+# tslog level IDs (matches TypeScript tslog numbering)
+# Note: Different from Python's default numbering
+LOG_LEVEL_IDS = {
+    LogLevel.FATAL: 0,
+    LogLevel.ERROR: 1,
+    LogLevel.DEBUG: 2,
+    LogLevel.INFO: 3,
+    LogLevel.WARN: 4,
+    LogLevel.TRACE: 5,
+    LogLevel.SILENT: 999,
+}
+
+
+# tslog level names
+LOG_LEVEL_NAMES = {
+    LogLevel.FATAL: "FATAL",
+    LogLevel.ERROR: "ERROR",
+    LogLevel.DEBUG: "DEBUG",
+    LogLevel.INFO: "INFO",
+    LogLevel.WARN: "WARN",
+    LogLevel.TRACE: "TRACE",
+    LogLevel.SILENT: "SILENT",
+}
+
+
 def level_from_string(level: str) -> LogLevel:
     """Convert string to LogLevel.
     

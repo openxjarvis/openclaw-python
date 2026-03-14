@@ -289,7 +289,7 @@ class SubagentsTool(AgentToolBase[dict, dict]):
         """Kill subagent run (mirrors TS lines 468-566)"""
         from openclaw.config.unified import load_config
         from openclaw.agents.subagent_registry import get_global_registry
-        from openclaw.auto_reply.reply.abort import stop_subagents_for_requester
+        # Removed import of non-existent stop_subagents_for_requester
         
         target = params.get("target")
         if not target or not target.strip():

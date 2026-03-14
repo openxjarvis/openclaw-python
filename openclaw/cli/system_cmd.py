@@ -24,17 +24,21 @@ def _rpc(method: str, params: dict, timeout_ms: int = 10_000,
 
 
 # ---------------------------------------------------------------------------
-# system heartbeat
+# system heartbeat (with subcommands)
 # ---------------------------------------------------------------------------
 
-@system_app.command("heartbeat")
-def heartbeat(
+heartbeat_app = typer.Typer(help="Heartbeat management", no_args_is_help=True)
+system_app.add_typer(heartbeat_app, name="heartbeat")
+
+
+@heartbeat_app.command("ping")
+def heartbeat_ping(
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
     url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
     token: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
     timeout: int = typer.Option(10_000, "--timeout", help="Timeout in ms"),
 ):
-    """Ping gateway heartbeat"""
+    """Ping gateway heartbeat (also: openclaw system heartbeat)"""
     try:
         result = _rpc("system.heartbeat", {}, timeout_ms=timeout,
                       json_output=json_output, url=url, token=token)
@@ -49,6 +53,87 @@ def heartbeat(
     except Exception as e:
         console.print(f"[red]✗[/red] Gateway not responding: {e}")
         raise typer.Exit(1)
+
+
+# Default heartbeat callback (for `openclaw system heartbeat` without subcommand)
+@heartbeat_app.callback(invoke_without_command=True)
+def heartbeat_default(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+    url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
+    token: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
+    timeout: int = typer.Option(10_000, "--timeout", help="Timeout in ms"),
+):
+    """Ping gateway heartbeat"""
+    if ctx.invoked_subcommand is None:
+        # No subcommand, default to ping
+        try:
+            result = _rpc("system.heartbeat", {}, timeout_ms=timeout,
+                          json_output=json_output, url=url, token=token)
+
+            if json_output:
+                console.print(json.dumps(result or {}, indent=2))
+                return
+
+            ts = result.get("timestamp") or result.get("at") or "" if isinstance(result, dict) else ""
+            console.print(f"[green]✓[/green] Gateway heartbeat OK" + (f"  [{ts}]" if ts else ""))
+
+        except Exception as e:
+            console.print(f"[red]✗[/red] Gateway not responding: {e}")
+            raise typer.Exit(1)
+
+
+@heartbeat_app.command("last")
+def heartbeat_last(
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+    url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
+    token: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
+    timeout: int = typer.Option(10_000, "--timeout", help="Timeout in ms"),
+):
+    """Show last heartbeat timestamp"""
+    try:
+        result = _rpc("last-heartbeat", {}, timeout_ms=timeout,
+                      json_output=json_output, url=url, token=token)
+
+        if json_output:
+            console.print(json.dumps(result or {}, indent=2))
+            return
+
+        if isinstance(result, dict):
+            ts = result.get("ts", result.get("timestamp", ""))
+            if ts:
+                console.print(f"[cyan]Last heartbeat:[/cyan] {ts}")
+            else:
+                console.print("[dim]No heartbeat data available[/dim]")
+        else:
+            console.print(str(result) if result else "[dim]No heartbeat data[/dim]")
+
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@heartbeat_app.command("enable")
+def heartbeat_enable(
+    url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
+    token: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
+):
+    """Enable heartbeat"""
+    console.print("[yellow]Note:[/yellow] Heartbeat enable/disable is not yet fully implemented via CLI")
+    console.print("  To enable heartbeat, update your config file:")
+    console.print("  ~/.openclaw/openclaw.json -> agents.defaults.heartbeat.every: \"30m\"")
+
+
+@heartbeat_app.command("disable")
+def heartbeat_disable(
+    url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
+    token: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
+):
+    """Disable heartbeat"""
+    console.print("[yellow]Note:[/yellow] Heartbeat enable/disable is not yet fully implemented via CLI")
+    console.print("  To disable heartbeat, update your config file:")
+    console.print("  ~/.openclaw/openclaw.json -> agents.defaults.heartbeat.every: \"0m\"")
+
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +171,50 @@ def presence(
 
 
 # ---------------------------------------------------------------------------
-# system events
+# system event (enqueue a system event)
+# ---------------------------------------------------------------------------
+
+@system_app.command("event")
+def event(
+    text: str = typer.Argument(..., help="Event text to enqueue"),
+    mode: str = typer.Option("now", "--mode", help="Wake mode: 'now' or 'next-heartbeat'"),
+    session_key: Optional[str] = typer.Option(None, "--session", help="Target session key"),
+    agent_id: Optional[str] = typer.Option(None, "--agent", help="Target agent ID"),
+    url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
+    token: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Enqueue a system event and optionally wake the heartbeat"""
+    try:
+        params = {
+            "text": text,
+            "mode": mode,
+        }
+        if session_key:
+            params["sessionKey"] = session_key
+        if agent_id:
+            params["agentId"] = agent_id
+        
+        result = _rpc("system.event", params, timeout_ms=10_000,
+                      json_output=json_output, url=url, token=token)
+
+        if json_output:
+            console.print(json.dumps(result or {}, indent=2))
+            return
+
+        console.print(f"[green]✓[/green] System event enqueued")
+        if mode == "now":
+            console.print("  [dim]Heartbeat will run immediately[/dim]")
+        else:
+            console.print("  [dim]Event will be processed on next heartbeat[/dim]")
+
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# system events (list/follow)
 # ---------------------------------------------------------------------------
 
 @system_app.command("events")

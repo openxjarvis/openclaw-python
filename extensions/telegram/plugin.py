@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def register(api) -> None:
     try:
-        from openclaw.channels.telegram import TelegramChannel
+        from openclaw.channels.telegram.enhanced_telegram import EnhancedTelegramChannel
     except ImportError:
         logger.warning("Telegram channel unavailable — install python-telegram-bot")
         return
@@ -56,7 +56,7 @@ def register(api) -> None:
             merged_cfg = {**telegram_cfg, **account_cfg, "accountId": account_id}
             merged_cfg.pop("accounts", None)  # remove nested accounts block
 
-            channel = TelegramChannel(bot_token=bot_token)
+            channel = EnhancedTelegramChannel(bot_token=bot_token)
             channel._account_id = account_id
             channel._is_default_account = (account_id == default_account_id)
 
@@ -73,7 +73,7 @@ def register(api) -> None:
     else:
         # Single-account / legacy mode
         bot_token = telegram_cfg.get("botToken") or telegram_cfg.get("bot_token")
-        channel = TelegramChannel(bot_token=bot_token if bot_token else None)
+        channel = EnhancedTelegramChannel(bot_token=bot_token if bot_token else None)
         try:
             api.register_channel(channel)
             logger.info("Telegram channel registered (single-account mode)")

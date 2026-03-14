@@ -21,7 +21,7 @@ from ..agents.model_catalog import load_model_catalog, ModelCatalogEntry
 from ..agents.agent_paths import resolve_openclaw_agent_dir
 from ..config.loader import load_config, save_config
 from ..config.schema import (
-    ClawdbotConfig, AgentConfig, GatewayConfig, ChannelsConfig, AuthConfig, ModelsConfig,
+    OpenClawConfig, AgentConfig, GatewayConfig, ChannelsConfig, AuthConfig, ModelsConfig,
     TelegramChannelConfig, ChannelConfig, FeishuChannelConfig,
 )
 from .auth import configure_auth, check_env_api_key
@@ -33,8 +33,8 @@ from .onboard_finalize import finalize_onboarding
 logger = logging.getLogger(__name__)
 
 
-def _config_to_dict(config: "ClawdbotConfig") -> dict:
-    """Convert ClawdbotConfig to dict for skills/hooks setup."""
+def _config_to_dict(config: "OpenClawConfig") -> dict:
+    """Convert OpenClawConfig to dict for skills/hooks setup."""
     if hasattr(config, "model_dump"):
         return config.model_dump(exclude_none=True)
     if isinstance(config, dict):
@@ -42,8 +42,8 @@ def _config_to_dict(config: "ClawdbotConfig") -> dict:
     return {}
 
 
-def _merge_config_from_dict(config: "ClawdbotConfig", d: dict) -> None:
-    """Merge skills/hooks from dict back into ClawdbotConfig (in-place)."""
+def _merge_config_from_dict(config: "OpenClawConfig", d: dict) -> None:
+    """Merge skills/hooks from dict back into OpenClawConfig (in-place)."""
     if not d:
         return
     if "skills" in d and d["skills"]:
@@ -172,25 +172,25 @@ async def run_onboarding_wizard(
         
         if mode == "quickstart":
             print("QuickStart mode: Using existing configuration as base")
-            # Convert dict to ClawdbotConfig object
-            claw_config = ClawdbotConfig(**existing_config_dict) if existing_config_dict else ClawdbotConfig()
+            # Convert dict to OpenClawConfig object
+            claw_config = OpenClawConfig(**existing_config_dict) if existing_config_dict else OpenClawConfig()
             # NOTE: QuickStart will preserve old model config until provider auth step updates it
         else:
             action = _prompt_config_action()
             if action == "reset":
                 print("Creating fresh configuration...")
-                claw_config = ClawdbotConfig()
+                claw_config = OpenClawConfig()
             elif action == "modify":
                 print("Modifying existing configuration...")
-                # Convert dict to ClawdbotConfig object
-                claw_config = ClawdbotConfig(**existing_config_dict) if existing_config_dict else ClawdbotConfig()
+                # Convert dict to OpenClawConfig object
+                claw_config = OpenClawConfig(**existing_config_dict) if existing_config_dict else OpenClawConfig()
             else:  # keep
                 print("Keeping existing configuration...")
                 return {"completed": True, "skipped": False, "kept_existing": True}
     except Exception as e:
         logger.info(f"No existing config: {e}")
         print("\nCreating new configuration...")
-        claw_config = ClawdbotConfig()
+        claw_config = OpenClawConfig()
     
     # Step 4: Provider configuration
     # Note: _configure_provider now directly modifies claw_config via handler chain
@@ -699,15 +699,14 @@ async def run_onboarding_wizard(
         
         try:
             from ..agents.populate_workspace import populate_user_md, populate_soul_md, populate_identity_md
-            from ..agents.ensure_workspace import ensure_agent_workspace
+            from ..agents.ensure_workspace_and_sessions import ensure_workspace_and_sessions
             
             # Determine workspace directory
             ws_dir = workspace_dir or (Path.home() / ".openclaw" / "workspace")
             
-            # Ensure workspace exists
-            ensure_agent_workspace(
+            # Ensure workspace and sessions exist (unified)
+            ensure_workspace_and_sessions(
                 workspace_dir=ws_dir,
-                ensure_bootstrap_files=True,
                 skip_bootstrap=False
             )
             
@@ -737,10 +736,9 @@ async def run_onboarding_wizard(
     hooks_result: dict = {}
     skills_result: dict = {}
     try:
-        from ..agents.ensure_workspace import ensure_agent_workspace
-        ensure_agent_workspace(
+        from ..agents.ensure_workspace_and_sessions import ensure_workspace_and_sessions
+        ensure_workspace_and_sessions(
             workspace_dir=ws_dir,
-            ensure_bootstrap_files=True,
             skip_bootstrap=False,
         )
     except Exception as e:
@@ -1693,7 +1691,7 @@ async def _configure_custom_provider() -> dict:
     }
 
 
-async def _configure_permissions(mode: str, config: "ClawdbotConfig") -> Optional[str]:
+async def _configure_permissions(mode: str, config: "OpenClawConfig") -> Optional[str]:
     """Ask user to choose a permission preset. Returns the chosen preset key or None."""
     from .permission_presets import (
         display_presets_menu, detect_preset_level, PRESET_ORDER, DEFAULT_PRESET, PRESETS
@@ -1773,7 +1771,7 @@ async def _configure_permissions(mode: str, config: "ClawdbotConfig") -> Optiona
             print(f"  Invalid choice. Enter a number 1–{len(PRESET_ORDER)} or a preset name.")
 
 
-async def _configure_provider(mode: str, claw_config: "ClawdbotConfig") -> Optional[dict]:
+async def _configure_provider(mode: str, claw_config: "OpenClawConfig") -> Optional[dict]:
     """Configure LLM provider (aligned with TS)
     
     Uses new handler chain architecture for 25+ providers.

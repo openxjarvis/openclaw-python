@@ -50,7 +50,7 @@ ERROR_BACKOFF_SCHEDULE_MS = [
 # One-shot (at) transient retry backoff (first 3 steps only — mirrors TS default)
 ERROR_BACKOFF_RETRY_MS = ERROR_BACKOFF_SCHEDULE_MS[:3]  # [30s, 1min, 5min]
 DEFAULT_MAX_TRANSIENT_RETRIES = 3
-DEFAULT_FAILURE_ALERT_AFTER = 3
+DEFAULT_FAILURE_ALERT_AFTER = 2  # Aligned with TS (was 3)
 DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000  # 1 hour
 
 # Transient error patterns (mirrors TS TRANSIENT_PATTERNS)
@@ -948,7 +948,7 @@ class CronService:
                 "error": "cron: job execution timed out",
             }
         except Exception as err:
-            logger.warning("cron: job %r failed: %s", job_id, err)
+            logger.warning("cron: job %r failed: %s", job_id, err, exc_info=True)
             return {
                 "id": job_id,
                 "job": job,
@@ -1062,7 +1062,12 @@ class CronService:
         await self._persist()
 
     async def _run_missed_jobs(self, now_ms: int) -> None:
-        """Run overdue jobs after startup (matches TS runMissedJobs)."""
+        """Run overdue jobs after startup (matches TS runMissedJobs).
+        
+        IMPORTANT: Jobs are launched in background tasks to prevent blocking
+        the gateway startup (Issue #18892 - Gateway becomes unresponsive when
+        restarted with overdue cron jobs).
+        """
         missed = [
             j for j in self.jobs.values()
             if _is_job_runnable(j, now_ms, skip_at_if_already_ran=True)
@@ -1073,8 +1078,10 @@ class CronService:
                 f"cron: running {len(missed)} missed jobs after restart: "
                 f"{[j.id for j in missed]}"
             )
+            # Launch missed jobs in background tasks to prevent blocking startup
+            import asyncio
             for job in missed:
-                await self._execute_job(job, forced=False)
+                asyncio.create_task(self._execute_job(job, forced=False))
 
     async def _sweep_sessions(self) -> None:
         """Call session reaper (self-throttled, outside lock)."""
@@ -1380,7 +1387,17 @@ class CronService:
         if not self.log_dir:
             return
         try:
-            run_log = CronRunLog(self.log_dir, job.id)
+            # Import resolve function
+            from openclaw.cron.run_log import resolve_cron_run_log_prune_options
+            
+            # Resolve prune options from config
+            run_log_config = None
+            if isinstance(self.cron_config, dict):
+                run_log_config = self.cron_config.get("runLog")
+            
+            prune_options = resolve_cron_run_log_prune_options(run_log_config)
+            
+            run_log = CronRunLog(self.log_dir, job.id, prune_options=prune_options)
             run_log.append({
                 "ts": _now_ms(),
                 "jobId": job.id,

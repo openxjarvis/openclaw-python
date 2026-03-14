@@ -58,13 +58,22 @@ def load_session_store_from_path(store_path: Path | str) -> Dict[str, SessionEnt
         return {}
 
 
-def save_session_store_to_path(store_path: Path | str, store: Dict[str, SessionEntry]) -> None:
+def save_session_store_to_path(
+    store_path: Path | str,
+    store: Dict[str, SessionEntry],
+    skip_maintenance: bool = False,
+    active_session_key: Optional[str] = None,
+) -> None:
     """
     Save session store to file path.
+    
+    Matches TS saveSessionStoreUnlocked() with maintenance support.
     
     Args:
         store_path: Path to store.json file (Path or str)
         store: Dict mapping canonical session keys to SessionEntry objects
+        skip_maintenance: Skip prune/cap operations (default: False)
+        active_session_key: Protected session key (won't be pruned/capped)
     """
     # Convert to Path if string
     if isinstance(store_path, str):
@@ -72,6 +81,29 @@ def save_session_store_to_path(store_path: Path | str, store: Dict[str, SessionE
     
     # Ensure parent directory exists
     store_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Apply maintenance before save (matches TS store.ts lines 390-401)
+    if not skip_maintenance:
+        try:
+            from openclaw.agents.session_maintenance import (
+                prune_stale_entries,
+                cap_entry_count,
+            )
+            
+            # Default config: prune after 30 days, cap at 500 entries
+            pruned = prune_stale_entries(store)
+            capped = cap_entry_count(
+                store,
+                max_entries=500,
+                active_session_key=active_session_key,
+            )
+            
+            if pruned > 0 or capped > 0:
+                logger.info(
+                    f"Session maintenance applied: pruned={pruned}, capped={capped}"
+                )
+        except Exception as e:
+            logger.warning(f"Session maintenance failed: {e}")
     
     # Convert SessionEntry objects to dicts
     data = {}

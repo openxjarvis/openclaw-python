@@ -20,6 +20,7 @@ from .errors import (
 from .runtime import AgentEvent, AgentRuntime
 from .session import Message, Session, SessionManager
 from .tool_loop import ToolLoopOrchestrator
+from .ensure_workspace_and_sessions import ensure_workspace_and_sessions
 
 __all__ = [
     # Core
@@ -36,6 +37,8 @@ __all__ = [
     # Context
     "ContextManager",
     "ContextWindow",
+    # Workspace & Sessions
+    "ensure_workspace_and_sessions",
     # Errors
     "AgentError",
     "ContextOverflowError",
