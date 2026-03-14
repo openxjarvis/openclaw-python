@@ -7,7 +7,7 @@ from typing import Optional
 
 import aiohttp
 
-from openclaw.config.schema import ClawdbotConfig, GatewayConfig
+from openclaw.config.schema import OpenClawConfig, GatewayConfig
 from openclaw.config.loader import save_config
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ async def setup_remote_gateway() -> dict:
             return {"configured": False, "cancelled": True}
     
     # Create config
-    config = ClawdbotConfig()
+    config = OpenClawConfig()
     config.gateway = GatewayConfig(
         mode="remote",
         remote_url=url,

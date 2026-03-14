@@ -6,7 +6,7 @@ Allows users to modify configuration after initial onboarding
 from __future__ import annotations
 
 from ..config.loader import load_config, save_config
-from ..config.schema import ClawdbotConfig
+from ..config.schema import OpenClawConfig
 from .config import configure_telegram_enhanced, configure_discord_enhanced
 from .auth import configure_auth
 
@@ -32,7 +32,7 @@ async def run_configure_wizard(section: str | None = None) -> dict:
     except Exception as e:
         print(f"Error loading configuration: {e}")
         print("Creating new configuration...")
-        config = ClawdbotConfig()
+        config = OpenClawConfig()
     
     # Select section if not provided
     if section is None:
@@ -83,7 +83,7 @@ async def run_configure_wizard(section: str | None = None) -> dict:
     return config.model_dump()
 
 
-async def configure_gateway_section(config: ClawdbotConfig) -> ClawdbotConfig:
+async def configure_gateway_section(config: OpenClawConfig) -> OpenClawConfig:
     """Configure Gateway section"""
     print("\n" + "=" * 70)
     print("Gateway Configuration")
@@ -138,7 +138,7 @@ async def configure_gateway_section(config: ClawdbotConfig) -> ClawdbotConfig:
     return config
 
 
-async def configure_channels_section(config: ClawdbotConfig) -> ClawdbotConfig:
+async def configure_channels_section(config: OpenClawConfig) -> OpenClawConfig:
     """Configure Channels section"""
     print("\n" + "=" * 70)
     print("Channels Configuration")
@@ -177,7 +177,7 @@ async def configure_channels_section(config: ClawdbotConfig) -> ClawdbotConfig:
     return config
 
 
-async def configure_agents_section(config: ClawdbotConfig) -> ClawdbotConfig:
+async def configure_agents_section(config: OpenClawConfig) -> OpenClawConfig:
     """Configure Agents section"""
     print("\n" + "=" * 70)
     print("Agents Configuration")
@@ -213,7 +213,7 @@ async def configure_agents_section(config: ClawdbotConfig) -> ClawdbotConfig:
     return config
 
 
-async def configure_tools_section(config: ClawdbotConfig) -> ClawdbotConfig:
+async def configure_tools_section(config: OpenClawConfig) -> OpenClawConfig:
     """Configure Tools section"""
     print("\n" + "=" * 70)
     print("Tools Configuration")
@@ -251,7 +251,7 @@ async def configure_tools_section(config: ClawdbotConfig) -> ClawdbotConfig:
     return config
 
 
-async def configure_security_section(config: ClawdbotConfig) -> ClawdbotConfig:
+async def configure_security_section(config: OpenClawConfig) -> OpenClawConfig:
     """Configure Security section"""
     print("\n" + "=" * 70)
     print("Security Configuration")

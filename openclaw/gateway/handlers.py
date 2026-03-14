@@ -426,12 +426,12 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
                 logger.warning(f"Unknown agentId: {agent_id_raw!r}, proceeding with default")
 
     # Session key shape validation (malformed agent key guard)
-    import re as _re2
-    AGENT_SESSION_KEY_RE = _re2.compile(r"^agent:[^:]+:[^:]+$")
+    # Mirrors TS parseAgentSessionKey: agent:<agentId>:<rest> where rest can contain ":"
+    # Allow multi-segment rest format (e.g., agent:main:cron:job-id)
     if session_key and ":" in session_key:
         parts = session_key.split(":")
-        if parts[0] == "agent" and len(parts) != 3:
-            raise ValueError(f"malformed session key: {session_key!r}")
+        if parts[0] == "agent" and len(parts) < 3:
+            raise ValueError(f"malformed session key: {session_key!r} (requires at least agent:id:rest)")
 
     # Reset command: /new or /reset [optional message]
     skip_timestamp_injection = False
@@ -506,10 +506,37 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
 
     # Launch background agent turn via queue lanes (mirrors TS nested enqueue pattern)
     async def _agent_task() -> None:
-        await _run_agent_turn(
-            connection, run_id, session, message, tools, model,
-            images=images, extra_system_prompt=extra_system_prompt,
-        )
+        # Apply timeout if specified (mirrors TS runTimeoutSeconds)
+        if timeout_secs and timeout_secs > 0:
+            try:
+                await asyncio.wait_for(
+                    _run_agent_turn(
+                        connection, run_id, session, message, tools, model,
+                        images=images, extra_system_prompt=extra_system_prompt,
+                    ),
+                    timeout=timeout_secs
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Agent run {run_id} timed out after {timeout_secs}s")
+                # Mark subagent as timed out if this is a subagent
+                if lane == "subagent" or (session_key and ":subagent:" in session_key):
+                    try:
+                        from openclaw.agents.subagent_registry import get_global_registry
+                        registry = get_global_registry()
+                        # Find run by session key and mark as timed out
+                        runs = registry.list_all_runs()
+                        for run in runs:
+                            if run.child_session_key == session_key and not run.ended_at:
+                                registry.mark_subagent_run_terminated(run.run_id, reason="timeout")
+                                break
+                    except Exception as e:
+                        logger.debug(f"Failed to mark subagent as timed out: {e}")
+                raise
+        else:
+            await _run_agent_turn(
+                connection, run_id, session, message, tools, model,
+                images=images, extra_system_prompt=extra_system_prompt,
+            )
 
     if _queue_manager is not None:
         from openclaw.agents.queuing.lanes import CommandLane
@@ -550,8 +577,13 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
                 if future.cancelled():
                     status_payload["status"] = "aborted"
                 elif future.exception() is not None:
-                    status_payload["status"] = "error"
-                    status_payload["error"] = str(future.exception())
+                    exc = future.exception()
+                    if isinstance(exc, asyncio.TimeoutError):
+                        status_payload["status"] = "timeout"
+                        status_payload["error"] = f"Run timed out after {timeout_secs}s"
+                    else:
+                        status_payload["status"] = "error"
+                        status_payload["error"] = str(exc)
                 else:
                     status_payload["status"] = "ok"
             except Exception:
@@ -602,6 +634,60 @@ async def _run_agent_turn(
 
     try:
         await _emit("lifecycle", {"phase": "start"})
+        
+        # Check if the provider is a CLI provider
+        from openclaw.agents.cli_backends import resolve_cli_backend_ids
+        from openclaw.agents.model_selection import get_provider_from_model
+        
+        cfg = getattr(connection, "config", None)
+        provider = get_provider_from_model(model) if model else None
+        
+        # CLI provider routing
+        if provider and cfg:
+            cli_backend_ids = resolve_cli_backend_ids(cfg)
+            if provider in cli_backend_ids:
+                from openclaw.agents.cli_runner import run_cli_agent
+                from openclaw.agents.cli_session import get_cli_session_id, set_cli_session_id
+                
+                # Get session info
+                session_key = getattr(session, "session_key", None) or getattr(session, "session_id", None)
+                session_id = getattr(session, "id", None) or session_key
+                workspace_dir = getattr(session, "workspace_dir", None)
+                agent_id = getattr(session, "agent_id", "main")
+                
+                # Get CLI session ID
+                cli_session_id = get_cli_session_id(session, provider)
+                
+                # Run CLI agent
+                result = await run_cli_agent(
+                    session_id=session_id,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    workspace_dir=workspace_dir,
+                    config=cfg,
+                    prompt=message,
+                    provider=provider,
+                    model=model,
+                    timeout_ms=None,  # Use default
+                    run_id=run_id,
+                    extra_system_prompt=extra_system_prompt,
+                    cli_session_id=cli_session_id,
+                    images=images,
+                )
+                
+                # Save new CLI session ID if available
+                if result.get("meta", {}).get("agentMeta", {}).get("sessionId"):
+                    set_cli_session_id(session, provider, result["meta"]["agentMeta"]["sessionId"])
+                
+                # Emit result events
+                for payload in result.get("payloads", []):
+                    if "text" in payload:
+                        await _emit("assistant", {"type": "text", "payload": {"text": payload["text"]}})
+                
+                await _emit("lifecycle", {"phase": "end"})
+                return
+        
+        # Default embedded runtime path
         run_kwargs: dict[str, Any] = {}
         if images:
             run_kwargs["images"] = images
@@ -639,6 +725,7 @@ async def _run_agent_turn(
 async def handle_agent_identity_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Get agent identity"""
     from openclaw.routing.session_key import resolve_agent_id_from_session_key
+    from pathlib import Path
 
     requested_agent_id = str(params.get("agentId") or "").strip()
     session_key = str(params.get("sessionKey") or "").strip()
@@ -669,6 +756,28 @@ async def handle_agent_identity_get(connection: Any, params: dict[str, Any]) -> 
                 if getattr(entry, "id", None) == agent_id:
                     agent_name = getattr(entry, "name", None) or agent_name
                     break
+        
+        # Read workspace identity.md file (mirrors TS resolveAssistantIdentity)
+        # Priority: workspace identity > agents config > ui.assistant config
+        workspace_dir = Path.home() / ".openclaw" / "agents" / agent_id
+        workspace_identity_path = workspace_dir / "identity.md"
+        
+        if workspace_identity_path.exists():
+            try:
+                identity_content = workspace_identity_path.read_text(encoding="utf-8")
+                workspace_identity = _parse_identity_md(identity_content)
+                
+                # Override with workspace values if present
+                if workspace_identity.get("name"):
+                    agent_name = workspace_identity["name"]
+                if workspace_identity.get("avatar"):
+                    avatar = workspace_identity["avatar"]
+                if workspace_identity.get("emoji"):
+                    agent_emoji = workspace_identity["emoji"]
+                if workspace_identity.get("theme"):
+                    agent_theme = workspace_identity["theme"]
+            except Exception as e:
+                logger.warning(f"Failed to read workspace identity for {agent_id}: {e}")
     except Exception:
         pass
 
@@ -692,6 +801,43 @@ async def handle_agent_identity_get(connection: Any, params: dict[str, Any]) -> 
         "avatar": avatar,
         "avatarUrl": avatar_url,
     }
+
+
+def _parse_identity_md(content: str) -> dict[str, str]:
+    """Parse identity.md file content.
+    
+    Extracts YAML front matter or key-value pairs from identity.md
+    
+    Returns:
+        Dict with keys: name, avatar, emoji, theme, creature, vibe
+    """
+    result = {}
+    
+    # Try YAML front matter first
+    if content.startswith("---"):
+        try:
+            import yaml
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                front_matter = parts[1].strip()
+                parsed = yaml.safe_load(front_matter)
+                if isinstance(parsed, dict):
+                    result = parsed
+                    return result
+        except Exception:
+            pass
+    
+    # Fallback: parse key-value pairs (key: value)
+    for line in content.split("\n"):
+        line = line.strip()
+        if ":" in line and not line.startswith("#"):
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key in ("name", "avatar", "emoji", "theme", "creature", "vibe"):
+                result[key] = value
+    
+    return result
 
 
 @register_handler("agent.wait")
@@ -747,28 +893,11 @@ async def handle_agent_wait(connection: Any, params: dict[str, Any]) -> dict[str
 @register_handler("agents.list")
 async def handle_agents_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """List available agents (matches TypeScript agents.ts format)"""
-    # Return configured agents from config in the correct format
-    agents_data = [
-        {
-            "id": "main",
-            "name": "Main Agent",
-            "identity": {
-                "name": "OpenClaw Assistant",
-                "theme": None,
-                "emoji": None,
-                "avatar": None,
-                "avatarUrl": None,
-            }
-        }
-    ]
+    from openclaw.gateway.session_utils import list_agents_for_gateway
     
-    # Return in TypeScript-aligned format
-    return {
-        "defaultId": "main",
-        "mainKey": "main",
-        "scope": "user",
-        "agents": agents_data
-    }
+    cfg = _get_current_config()
+    result = list_agents_for_gateway(cfg)
+    return result
 
 
 @register_handler("agent.queue.status")
@@ -882,7 +1011,11 @@ async def handle_browser_request(connection: Any, params: dict[str, Any]) -> dic
 @register_handler("channels.status")
 async def handle_channels_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Get channel connection status (TS-compatible shape)."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
     if not _channel_registry:
+        logger.warning("channels.status: _channel_registry is None")
         return {
             "ts": int(datetime.now(UTC).timestamp() * 1000),
             "channelOrder": [],
@@ -895,7 +1028,11 @@ async def handle_channels_status(connection: Any, params: dict[str, Any]) -> dic
             "channelDefaultAccountId": {},
         }
 
-    channels = _channel_registry.get_all_channels()
+    # Use get_snapshot() which directly accesses _runtime_envs instead of relying on list_channels()
+    # This ensures we capture all running channels even if registration state is inconsistent
+    snapshot = _channel_registry.get_snapshot()
+    logger.info(f"channels.status: get_snapshot() returned {len(snapshot)} channels: {list(snapshot.keys())}")
+    
     probe = bool(params.get("probe", False))
     timeout_ms = max(1000, int(params.get("timeoutMs", 5000)))
     now_ts = int(datetime.now(UTC).timestamp() * 1000)
@@ -906,47 +1043,40 @@ async def handle_channels_status(connection: Any, params: dict[str, Any]) -> dic
     channel_accounts: dict[str, Any] = {}
     default_account: dict[str, Any] = {}
 
-    for ch in channels:
-        channel_id = ch["id"]
+    for channel_id, snap in snapshot.items():
         channel_order.append(channel_id)
-        label = ch.get("label", channel_id)
-        detail_label = ch.get("detailLabel", label)
-        system_image = ch.get("systemImage")
+        label = snap.get("label", channel_id)
         channel_labels[channel_id] = label
         channel_meta[channel_id] = {
             "id": channel_id,
             "label": label,
         }
         channels_summary[channel_id] = {
-            "configured": bool(ch.get("configured", ch.get("connected", False))),
-            "running": bool(ch.get("running", False)),
-            "connected": bool(ch.get("connected", False)),
-            "state": ch.get("state", "unknown"),
+            "configured": snap.get("enabled", False),
+            "running": snap.get("running", False),
+            "connected": snap.get("connected", False),
+            "state": snap.get("state", "unknown"),
         }
         account_snapshot = {
             "accountId": "default",
-            "configured": bool(ch.get("configured", ch.get("connected", False))),
-            "enabled": bool(ch.get("enabled", True)),
-            "running": bool(ch.get("running", False)),
-            "connected": bool(ch.get("connected", False)),
-            "healthy": bool(ch.get("healthy", ch.get("connected", False))),
+            "configured": snap.get("enabled", False),
+            "enabled": snap.get("enabled", True),
+            "running": snap.get("running", False),
+            "connected": snap.get("connected", False),
+            "healthy": snap.get("healthy", snap.get("connected", False)),
         }
         if probe:
             account_snapshot["lastProbeAt"] = now_ts
             account_snapshot["probe"] = {"ok": account_snapshot["healthy"], "timeoutMs": timeout_ms}
         channel_accounts[channel_id] = [account_snapshot]
         default_account[channel_id] = "default"
-        # Keep optional UI metadata when available.
-        channel_meta[channel_id]["detailLabel"] = detail_label
-        if system_image:
-            channel_meta[channel_id]["systemImage"] = system_image
 
     return {
         "ts": now_ts,
         "channelOrder": channel_order,
         "channelLabels": channel_labels,
-        "channelDetailLabels": {cid: meta.get("detailLabel", channel_labels[cid]) for cid, meta in channel_meta.items()},
-        "channelSystemImages": {cid: meta.get("systemImage") for cid, meta in channel_meta.items() if meta.get("systemImage")},
+        "channelDetailLabels": channel_labels,  # Simplified: same as labels
+        "channelSystemImages": {},
         "channelMeta": list(channel_meta.values()),
         "channels": channels_summary,
         "channelAccounts": channel_accounts,
@@ -1263,9 +1393,13 @@ async def handle_cron_runs(connection: Any, params: dict[str, Any]) -> dict[str,
     
     try:
         from openclaw.cron.store import CronRunLog
+        from pathlib import Path
         
         # Read run log for the job (arg order: log_dir, job_id)
-        run_log = CronRunLog(cron_service.store.store_path.parent / "runs", job_id)
+        # CronService uses _store_path internally, not store.store_path
+        cron_dir = Path.home() / ".openclaw" / "cron"
+        run_log_dir = cron_dir / "runs"
+        run_log = CronRunLog(run_log_dir, job_id)
         entries = run_log.read(limit=limit)
         
         # Convert to TypeScript API format
@@ -1278,78 +1412,209 @@ async def handle_cron_runs(connection: Any, params: dict[str, Any]) -> dict[str,
 
 
 @register_handler("device.pair.list")
-async def handle_device_pair_list(connection: Any, params: dict[str, Any]) -> list[dict[str, Any]]:
-    """List paired devices and pending pairs"""
+async def handle_device_pair_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """List paired devices and pending pairs - mirrors TS device.pair.list"""
     from openclaw.devices.manager import get_device_manager
     
     device_manager = get_device_manager()
-    devices = device_manager.list_devices()
-    pending = device_manager.list_pending_pairs()
+    result = device_manager.list_pairing()
+    
+    # Convert to serializable format
+    pending_list = []
+    for req in result["pending"]:
+        pending_list.append({
+            "requestId": req.request_id,
+            "deviceId": req.device_id,
+            "publicKey": req.public_key,
+            "displayName": req.display_name,
+            "platform": req.platform,
+            "deviceFamily": req.device_family,
+            "clientId": req.client_id,
+            "clientMode": req.client_mode,
+            "role": req.role,
+            "roles": req.roles,
+            "scopes": req.scopes,
+            "remoteIp": req.remote_ip,
+            "silent": req.silent,
+            "isRepair": req.is_repair,
+            "ts": req.ts,
+        })
+    
+    paired_list = []
+    for device in result["paired"]:
+        # Redact token values, only show summaries
+        tokens_summary = {}
+        if device.tokens:
+            for role, token in device.tokens.items():
+                tokens_summary[role] = {
+                    "role": token.role,
+                    "scopes": token.scopes,
+                    "createdAtMs": token.created_at_ms,
+                    "rotatedAtMs": token.rotated_at_ms,
+                    "revokedAtMs": token.revoked_at_ms,
+                    "lastUsedAtMs": token.last_used_at_ms,
+                }
+        
+        paired_list.append({
+            "deviceId": device.device_id,
+            "publicKey": device.public_key,
+            "displayName": device.display_name,
+            "platform": device.platform,
+            "deviceFamily": device.device_family,
+            "role": device.role,
+            "roles": device.roles,
+            "approvedScopes": device.approved_scopes,
+            "createdAtMs": device.created_at_ms,
+            "approvedAtMs": device.approved_at_ms,
+            "label": device.label,
+            "tokens": tokens_summary,
+        })
     
     return {
-        "devices": devices,
-        "pending": pending
+        "pending": pending_list,
+        "paired": paired_list,
     }
 
 
 @register_handler("device.pair.approve")
 async def handle_device_pair_approve(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Approve device pairing"""
+    """Approve device pairing - mirrors TS device.pair.approve"""
     from openclaw.devices.manager import get_device_manager
     
-    device_id = params.get("deviceId")
-    label = params.get("label")
+    request_id = params.get("requestId")
+    if not request_id:
+        raise ValueError("requestId is required")
     
     device_manager = get_device_manager()
-    token = device_manager.approve_pairing(device_id, label)
+    result = device_manager.approve_pairing(request_id)
+    
+    if not result:
+        raise ValueError(f"unknown requestId: {request_id}")
+    
+    # Redact sensitive token data for response (summarize tokens, don't send actual token strings)
+    device = result["device"]
+    
+    def summarize_tokens(tokens_dict: dict) -> dict | None:
+        if not tokens_dict:
+            return None
+        return {
+            role: {
+                "role": token.role,
+                "scopes": token.scopes,
+                "createdAtMs": token.created_at_ms,
+                "rotatedAtMs": token.rotated_at_ms,
+                "revokedAtMs": token.revoked_at_ms,
+                "lastUsedAtMs": token.last_used_at_ms,
+            }
+            for role, token in tokens_dict.items()
+        }
+    
+    device_dict = {
+        "deviceId": device.device_id,
+        "publicKey": device.public_key,
+        "displayName": device.display_name,
+        "platform": device.platform,
+        "deviceFamily": device.device_family,
+        "role": device.role,
+        "roles": device.roles,
+        "approvedScopes": device.approved_scopes,
+        "createdAtMs": device.created_at_ms,
+        "approvedAtMs": device.approved_at_ms,
+        "label": device.label,
+        "tokens": summarize_tokens(device.tokens),
+    }
+    
+    logger.info(f"Device pairing approved: device={device.device_id} role={device.role or 'unknown'}")
+    
+    # TODO: Broadcast device.pair.resolved event
     
     return {
-        "deviceId": device_id,
-        "approved": token is not None,
-        "token": token
+        "requestId": result["requestId"],
+        "device": device_dict,
     }
 
 
 @register_handler("device.pair.reject")
 async def handle_device_pair_reject(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Reject device pairing"""
+    """Reject device pairing - mirrors TS device.pair.reject"""
     from openclaw.devices.manager import get_device_manager
     
-    device_id = params.get("deviceId")
+    request_id = params.get("requestId")
+    if not request_id:
+        raise ValueError("requestId is required")
+    
     reason = params.get("reason")
     
     device_manager = get_device_manager()
-    device_manager.reject_pairing(device_id, reason)
+    result = device_manager.reject_pairing(request_id, reason)
     
-    return {"deviceId": device_id, "rejected": True}
+    if not result:
+        raise ValueError(f"unknown requestId: {request_id}")
+    
+    logger.info(f"Device pairing rejected: requestId={request_id}")
+    
+    # TODO: Broadcast device.pair.resolved event
+    
+    return result
 
 
 @register_handler("device.token.rotate")
 async def handle_device_token_rotate(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Rotate device token"""
+    """Rotate device token - mirrors TS device.token.rotate"""
     from openclaw.devices.manager import get_device_manager
     
     device_id = params.get("deviceId")
+    role = params.get("role")
+    scopes = params.get("scopes")
+    
+    if not device_id:
+        raise ValueError("deviceId is required")
+    if not role:
+        raise ValueError("role is required")
+    
     device_manager = get_device_manager()
-    new_token = device_manager.rotate_token(device_id)
+    entry = device_manager.rotate_token(device_id, role, scopes)
+    
+    if not entry:
+        raise ValueError(f"unknown deviceId/role: {device_id}/{role}")
+    
+    logger.info(f"Device token rotated: device={device_id} role={entry.role} scopes={','.join(entry.scopes)}")
     
     return {
         "deviceId": device_id,
-        "rotated": new_token is not None,
-        "token": new_token
+        "role": entry.role,
+        "token": entry.token,
+        "scopes": entry.scopes,
+        "rotatedAtMs": entry.rotated_at_ms or entry.created_at_ms,
     }
 
 
 @register_handler("device.token.revoke")
 async def handle_device_token_revoke(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Revoke device token"""
+    """Revoke device token - mirrors TS device.token.revoke"""
     from openclaw.devices.manager import get_device_manager
     
-    token = params.get("token")
-    device_manager = get_device_manager()
-    success = device_manager.revoke_token(token)
+    device_id = params.get("deviceId")
+    role = params.get("role")
     
-    return {"revoked": success}
+    if not device_id:
+        raise ValueError("deviceId is required")
+    if not role:
+        raise ValueError("role is required")
+    
+    device_manager = get_device_manager()
+    entry = device_manager.revoke_token(device_id, role)
+    
+    if not entry:
+        raise ValueError(f"unknown deviceId/role: {device_id}/{role}")
+    
+    logger.info(f"Device token revoked: device={device_id} role={entry.role}")
+    
+    return {
+        "deviceId": device_id,
+        "role": entry.role,
+        "revokedAtMs": entry.revoked_at_ms or int(time.time() * 1000),
+    }
 
 
 @register_handler("exec.approval.request")
@@ -1422,17 +1687,180 @@ async def handle_exec_approvals_set(connection: Any, params: dict[str, Any]) -> 
     return {"policyId": policy_id, "set": True}
 
 
+# Rolling log file pattern (matches TypeScript ROLLING_LOG_RE)
+ROLLING_LOG_RE = re.compile(r'^openclaw-\d{4}-\d{2}-\d{2}\.log$')
+
+
+def resolve_log_file(file_path: Path) -> Path:
+    """Resolve log file with rolling log support (matches TS resolveLogFile).
+    
+    If the file exists, return it.
+    If it doesn't exist and matches the rolling log pattern,
+    scan the directory and return the most recently modified matching file.
+    
+    Args:
+        file_path: Initial log file path
+        
+    Returns:
+        Resolved log file path
+    """
+    # If file exists, use it
+    if file_path.exists():
+        return file_path
+    
+    # Check if it's a rolling log pattern
+    if not ROLLING_LOG_RE.match(file_path.name):
+        return file_path
+    
+    # Find latest rolling log file in the directory
+    log_dir = file_path.parent
+    if not log_dir.exists():
+        return file_path
+    
+    candidates = []
+    try:
+        for entry in log_dir.iterdir():
+            if entry.is_file() and ROLLING_LOG_RE.match(entry.name):
+                stat = entry.stat()
+                candidates.append((entry, stat.st_mtime))
+    except (OSError, PermissionError):
+        return file_path
+    
+    if candidates:
+        # Sort by modification time, newest first
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
+    
+    return file_path
+
+
+@register_handler("logs.tail")
 @register_handler("logs.tail")
 async def handle_logs_tail(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Tail gateway logs"""
+    """Tail gateway logs - mirrors TS logs.tail handler
+    
+    Returns log lines with cursor-based pagination matching TS format:
+    {
+        "cursor": number,
+        "size": number,
+        "lines": string[],
+        "truncated": boolean,
+        "reset": boolean,
+        "file": string
+    }
+    """
     from pathlib import Path
-    limit = params.get("limit", 200)
-    log_file = Path.home() / ".openclaw" / "logs" / "gateway.log"
+    import os
+    
+    # Default values (mirrors TS constants)
+    DEFAULT_LIMIT = 500
+    DEFAULT_MAX_BYTES = 250_000
+    MAX_LIMIT = 5000
+    MAX_BYTES = 1_000_000
+    
+    # Parse params
+    cursor_param = params.get("cursor")
+    limit = min(params.get("limit", DEFAULT_LIMIT), MAX_LIMIT)
+    max_bytes = min(params.get("maxBytes", DEFAULT_MAX_BYTES), MAX_BYTES)
+    
+    # Resolve log file with rolling log support
+    # Use daily log files in ~/.openclaw/tmp/ (matches CLI setup_logging)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = Path.home() / ".openclaw" / "tmp" / f"openclaw-{date_str}.log"
+    log_file = resolve_log_file(log_file)
+    
+    # Check if file exists
+    if not log_file.exists():
+        return {
+            "cursor": 0,
+            "size": 0,
+            "lines": [],
+            "truncated": False,
+            "reset": False,
+            "file": str(log_file)
+        }
+    
+    # Get file size
+    size = log_file.stat().st_size
+    
+    # Determine read position
+    cursor = None
+    if isinstance(cursor_param, (int, float)):
+        cursor = max(0, int(cursor_param))
+    
+    reset = False
+    truncated = False
+    start = 0
+    
+    if cursor is not None:
+        if cursor > size:
+            # File was truncated/rotated
+            reset = True
+            start = max(0, size - max_bytes)
+            truncated = start > 0
+        else:
+            start = cursor
+            if size - start > max_bytes:
+                # Too much data since last read
+                reset = True
+                truncated = True
+                start = max(0, size - max_bytes)
+    else:
+        # Initial read - get tail
+        start = max(0, size - max_bytes)
+        truncated = start > 0
+    
+    # Read file slice
+    if size == 0 or size <= start:
+        return {
+            "cursor": size,
+            "size": size,
+            "lines": [],
+            "truncated": truncated,
+            "reset": reset,
+            "file": str(log_file)
+        }
+    
     lines = []
-    if log_file.exists():
-        with open(log_file) as f:
-            lines = f.readlines()[-limit:]
-    return {"lines": [l.rstrip() for l in lines]}
+    try:
+        with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+            # Check if we need to skip partial line at start
+            prefix = ""
+            if start > 0:
+                f.seek(start - 1)
+                prefix = f.read(1)
+            
+            # Read from start position
+            f.seek(start)
+            length = size - start
+            text = f.read(length)
+            
+            # Split into lines
+            lines = text.split('\n')
+            
+            # Remove partial first line if we started mid-file
+            if start > 0 and prefix != '\n':
+                lines = lines[1:]
+            
+            # Remove trailing empty line
+            if lines and lines[-1] == '':
+                lines = lines[:-1]
+            
+            # Limit number of lines
+            if len(lines) > limit:
+                lines = lines[-limit:]
+    
+    except Exception as e:
+        raise RuntimeError(f"log read failed: {e}")
+    
+    return {
+        "cursor": size,
+        "size": size,
+        "lines": lines,
+        "truncated": truncated,
+        "reset": reset,
+        "file": str(log_file)
+    }
 
 
 @register_handler("models.list")
@@ -1762,74 +2190,155 @@ async def handle_sessions_compact(connection: Any, params: dict[str, Any]) -> di
 
 @register_handler("skills.status")
 async def handle_skills_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get skills status"""
+    """Get skills status - mirrors TS skills.status handler"""
     from openclaw.agents.skills_status import build_workspace_skill_status
-    from pathlib import Path
+    from openclaw.agents.skills.bundled_dir import resolve_bundled_skills_dir
+    from openclaw.config.loader import load_config
+    from openclaw.agents.agent_scope import (
+        resolve_agent_workspace_dir,
+        resolve_default_agent_id,
+        list_agent_ids,
+    )
+    from openclaw.routing.session_key import normalize_agent_id
     
-    agent_id = params.get("agentId", "main")
-    workspace_dir = Path.home() / ".openclaw" / "workspace"
+    # Resolve agent ID (mirrors TS logic lines 71-82)
+    cfg = load_config()
+    agent_id_raw = params.get("agentId", "").strip() if params.get("agentId") else ""
+    agent_id = normalize_agent_id(agent_id_raw) if agent_id_raw else resolve_default_agent_id(cfg)
     
-    config_dict = None
-    if hasattr(connection, 'config'):
-        if hasattr(connection.config, 'model_dump'):
-            config_dict = connection.config.model_dump()
-        elif isinstance(connection.config, dict):
-            config_dict = connection.config
+    # Validate agent exists if specified
+    if agent_id_raw:
+        known_agents = list_agent_ids(cfg)
+        if agent_id not in known_agents:
+            raise ValueError(f'unknown agent id "{agent_id_raw}"')
     
-    return build_workspace_skill_status(workspace_dir, config_dict)
+    # Resolve workspace directory for the agent (mirrors TS line 84)
+    workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
+    
+    # Build config dict for skills status
+    config_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
+    
+    # Resolve bundled skills directory (mirrors TS line 87)
+    bundled_skills_dir = resolve_bundled_skills_dir()
+    
+    # Build and return skill status report (mirrors TS lines 85-89)
+    return build_workspace_skill_status(
+        workspace_dir,
+        config=config_dict,
+        bundled_skills_dir=bundled_skills_dir
+    )
 
 
 @register_handler("skills.install")
 async def handle_skills_install(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Install a skill's dependencies (brew/npm/go/uv/download).
-
-    Mirrors TS skills install flow via syncSkillsToWorkspace + install specs.
-    """
+    """Install a skill's dependencies - mirrors TS skills.install handler"""
+    from openclaw.config.loader import load_config
+    from openclaw.agents.agent_scope import resolve_agent_workspace_dir, resolve_default_agent_id
+    from openclaw.agents.skills.workspace import load_workspace_skill_entries
+    from openclaw.agents.skills.installer import install_skill_dependencies
+    
     skill_name = params.get("name", "")
-    from pathlib import Path as _Path
-    workspace_dir = _Path.home() / ".openclaw" / "workspace"
-    errors: list[str] = []
-
+    install_id = params.get("installId", "")
+    timeout_ms = params.get("timeoutMs")
+    
     try:
-        from openclaw.agents.skills.workspace import load_workspace_skill_entries
-        from openclaw.agents.skills.installer import install_skill_dependencies
-
-        config_dict: dict = {}
-        if hasattr(connection, "config"):
-            config_dict = connection.config if isinstance(connection.config, dict) else {}
-
-        entries = load_workspace_skill_entries(str(workspace_dir), config_dict)
+        # Resolve workspace for default agent (mirrors TS line 132)
+        cfg = load_config()
+        workspace_dir_raw = resolve_agent_workspace_dir(cfg, resolve_default_agent_id(cfg))
+        
+        config_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
+        
+        entries = load_workspace_skill_entries(str(workspace_dir_raw), config_dict)
         target = next(
             (e for e in entries if e.skill.name == skill_name),
             None,
         )
         if target is None:
-            return {"name": skill_name, "installed": False, "error": f"Skill '{skill_name}' not found"}
-
+            return {
+                "ok": False,
+                "message": f"Skill '{skill_name}' not found",
+                "name": skill_name,
+                "installed": False
+            }
+        
         install_specs = getattr(getattr(target.skill, "metadata", None), "install", None) or []
         success, errors = await install_skill_dependencies(target.skill, install_specs)
-        return {"name": skill_name, "installed": success, "errors": errors}
+        
+        return {
+            "ok": success,
+            "message": "Installation complete" if success else f"Installation failed: {', '.join(errors)}",
+            "name": skill_name,
+            "installed": success,
+            "errors": errors
+        }
     except Exception as exc:
         logger.error("skills.install error: %s", exc, exc_info=True)
-        return {"name": skill_name, "installed": False, "error": str(exc)}
+        return {
+            "ok": False,
+            "message": str(exc),
+            "name": skill_name,
+            "installed": False,
+            "error": str(exc)
+        }
 
 
 @register_handler("skills.update")
 async def handle_skills_update(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Update a managed skill by re-syncing from its source.
-
-    Bumps the skills snapshot version so the next agent turn reloads skills.
-    Mirrors TS syncSkillsToWorkspace() triggered on update.
-    """
-    skill_name = params.get("name", "")
+    """Update skill configuration - mirrors TS skills.update handler"""
+    from openclaw.config.loader import load_config, write_config_file
+    import copy
+    
+    skill_key = params.get("skillKey", "")
+    enabled = params.get("enabled")
+    api_key = params.get("apiKey")
+    env = params.get("env")
+    
     try:
-        from openclaw.agents.skills.refresh import bump_skills_snapshot_version
-        bump_skills_snapshot_version()
-        logger.info("skills.update: bumped snapshot version for '%s'", skill_name)
-        return {"name": skill_name, "updated": True}
+        cfg = load_config()
+        
+        # Get current skills config (mirrors TS lines 165-167)
+        cfg_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
+        skills = copy.deepcopy(cfg_dict.get("skills", {}))
+        entries = copy.deepcopy(skills.get("entries", {}))
+        current = copy.deepcopy(entries.get(skill_key, {}))
+        
+        # Update enabled flag (mirrors TS lines 168-170)
+        if isinstance(enabled, bool):
+            current["enabled"] = enabled
+        
+        # Update apiKey (mirrors TS lines 171-177)
+        if isinstance(api_key, str):
+            trimmed = api_key.strip()
+            if trimmed:
+                current["apiKey"] = trimmed
+            elif "apiKey" in current:
+                del current["apiKey"]
+        
+        # Update env vars (mirrors TS lines 179-193)
+        if env and isinstance(env, dict):
+            next_env = copy.deepcopy(current.get("env", {}))
+            for key, value in env.items():
+                trimmed_key = key.strip()
+                if not trimmed_key:
+                    continue
+                trimmed_val = value.strip() if isinstance(value, str) else str(value)
+                if not trimmed_val:
+                    next_env.pop(trimmed_key, None)
+                else:
+                    next_env[trimmed_key] = trimmed_val
+            current["env"] = next_env
+        
+        # Write updated config (mirrors TS lines 195-201)
+        entries[skill_key] = current
+        skills["entries"] = entries
+        cfg_dict["skills"] = skills
+        
+        write_config_file(cfg_dict)
+        
+        return {"ok": True, "skillKey": skill_key, "config": current}
     except Exception as exc:
         logger.error("skills.update error: %s", exc, exc_info=True)
-        return {"name": skill_name, "updated": False, "error": str(exc)}
+        return {"ok": False, "skillKey": skill_key, "error": str(exc)}
 
 
 @register_handler("system")
@@ -2047,23 +2556,24 @@ async def handle_send(connection: Any, params: dict[str, Any]) -> dict[str, Any]
 
 @register_handler("skills.bins")
 async def handle_skills_bins(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """List known skill bins (minimal TS-compatible shape)."""
-    try:
-        from openclaw.agents.skills_status import build_workspace_skill_status
-        from pathlib import Path
-
-        workspace_dir = Path.home() / ".openclaw" / "workspace"
-        config_dict = None
-        if hasattr(connection, 'config'):
-            if hasattr(connection.config, 'model_dump'):
-                config_dict = connection.config.model_dump()
-            elif isinstance(connection.config, dict):
-                config_dict = connection.config
-        status = build_workspace_skill_status(workspace_dir, config_dict)
-        bins = status.get("bins", []) if isinstance(status, dict) else []
-        return {"bins": bins}
-    except Exception:
-        return {"bins": []}
+    """List known skill bins - mirrors TS skills.bins handler"""
+    from openclaw.config.loader import load_config
+    from openclaw.agents.agent_scope import list_agent_workspace_dirs
+    from openclaw.agents.skills.workspace import load_workspace_skill_entries
+    from openclaw.agents.skills_status import collect_skill_bins
+    
+    cfg = load_config()
+    workspace_dirs = list_agent_workspace_dirs(cfg)
+    bins = set()
+    
+    config_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
+    
+    for workspace_dir in workspace_dirs:
+        entries = load_workspace_skill_entries(str(workspace_dir), config_dict)
+        for bin_path in collect_skill_bins(entries):
+            bins.add(bin_path)
+    
+    return {"bins": sorted(list(bins))}
 
 
 @register_handler("tts.setProvider")
@@ -2147,16 +2657,22 @@ async def handle_exec_approval_wait_decision(connection: Any, params: dict[str, 
 
 @register_handler("device.pair.remove")
 async def handle_device_pair_remove(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Remove paired device (TS-compatible alias)."""
+    """Remove paired device - mirrors TS device.pair.remove"""
     from openclaw.devices.manager import get_device_manager
+    
     device_id = params.get("deviceId")
-    manager = get_device_manager()
-    removed = False
-    try:
-        removed = bool(manager.remove_device(device_id))
-    except Exception:
-        removed = False
-    return {"deviceId": device_id, "removed": removed}
+    if not device_id:
+        raise ValueError("deviceId is required")
+    
+    device_manager = get_device_manager()
+    result = device_manager.remove_device(device_id)
+    
+    if not result:
+        raise ValueError(f"unknown deviceId: {device_id}")
+    
+    logger.info(f"Device removed: {device_id}")
+    
+    return result
 
 
 @register_handler("node.pair.list")
@@ -2388,27 +2904,272 @@ async def handle_wake(connection: Any, params: dict[str, Any]) -> dict[str, Any]
 
 @register_handler("agents.create")
 async def handle_agents_create(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Create agent (minimal config-backed implementation)."""
-    agent_id = params.get("id")
-    if not agent_id:
-        raise ValueError("id is required")
-    # Keep API-compatible success shape; full persistence handled by config layer commands.
-    return {"ok": True, "agent": {"id": agent_id}}
+    """Create agent (full implementation mirroring TS agents.create)"""
+    from pathlib import Path
+    from openclaw.routing.session_key import normalize_agent_id
+    from openclaw.commands.agents_config import apply_agent_config, find_agent_entry_index
+    from openclaw.agents.agent_scope import (
+        resolve_agent_dir,
+        list_agent_entries,
+    )
+    from openclaw.agents.ensure_workspace_and_sessions import ensure_workspace_and_sessions
+    from openclaw.config.loader import write_config_file
+    
+    # Validate required params
+    raw_name = str(params.get("name", "")).strip()
+    if not raw_name:
+        raise ValueError("name is required")
+    
+    agent_id = normalize_agent_id(raw_name)
+    
+    # Check if agent already exists
+    cfg = _get_current_config()
+    agents_list = list_agent_entries(cfg)
+    if find_agent_entry_index(agents_list, agent_id) >= 0:
+        raise ValueError(f'agent "{agent_id}" already exists')
+    
+    # Reserved ID check
+    if agent_id == "main":
+        raise ValueError('"main" is reserved')
+    
+    # Resolve workspace
+    raw_workspace = str(params.get("workspace", "")).strip()
+    if raw_workspace:
+        from openclaw.config.paths import resolve_user_path
+        workspace_dir = resolve_user_path(raw_workspace)
+    else:
+        # Use default workspace pattern
+        from openclaw.agents.agent_scope import resolve_agent_workspace_dir
+        workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
+    
+    # Apply config (create entry)
+    next_config = apply_agent_config(
+        cfg,
+        agent_id=agent_id,
+        name=raw_name,
+        workspace=workspace_dir,
+    )
+    
+    # Resolve agentDir
+    agent_dir = resolve_agent_dir(next_config, agent_id)
+    next_config = apply_agent_config(
+        next_config,
+        agent_id=agent_id,
+        agent_dir=agent_dir,
+    )
+    
+    # Ensure workspace and transcripts exist BEFORE writing config
+    skip_bootstrap = False
+    if next_config.agents and next_config.agents.defaults:
+        skip_bootstrap = getattr(next_config.agents.defaults, 'skip_bootstrap', False)
+    
+    ensure_workspace_and_sessions(
+        workspace_dir=workspace_dir,
+        agent_id=agent_id,
+        skip_bootstrap=skip_bootstrap,
+    )
+    
+    # Write config file
+    write_config_file(next_config)
+    
+    # Write IDENTITY.md with name, emoji, avatar
+    identity_path = Path(workspace_dir) / "IDENTITY.md"
+    identity_lines = [""]
+    
+    safe_name = raw_name.strip().replace("\n", " ").replace("\r", " ")
+    identity_lines.append(f"- Name: {safe_name}")
+    
+    emoji = params.get("emoji")
+    if emoji and isinstance(emoji, str) and emoji.strip():
+        safe_emoji = emoji.strip().replace("\n", " ").replace("\r", " ")
+        identity_lines.append(f"- Emoji: {safe_emoji}")
+    
+    avatar = params.get("avatar")
+    if avatar and isinstance(avatar, str) and avatar.strip():
+        safe_avatar = avatar.strip().replace("\n", " ").replace("\r", " ")
+        identity_lines.append(f"- Avatar: {safe_avatar}")
+    
+    identity_lines.append("")
+    
+    # Append to IDENTITY.md
+    with open(identity_path, "a", encoding="utf-8") as f:
+        f.write("\n".join(identity_lines))
+    
+    return {"ok": True, "agentId": agent_id, "name": raw_name, "workspace": workspace_dir}
 
 
 @register_handler("agents.update")
 async def handle_agents_update(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Update agent (minimal compatibility implementation)."""
-    agent_id = params.get("id")
-    patch = params.get("patch", {})
-    return {"ok": True, "agent": {"id": agent_id, "patch": patch}}
+    """Update agent (full implementation mirroring TS agents.update)"""
+    from pathlib import Path
+    from openclaw.routing.session_key import normalize_agent_id
+    from openclaw.commands.agents_config import apply_agent_config, find_agent_entry_index
+    from openclaw.agents.agent_scope import (
+        list_agent_entries,
+        resolve_agent_workspace_dir,
+    )
+    from openclaw.agents.ensure_workspace_and_sessions import ensure_workspace_and_sessions
+    from openclaw.config.loader import write_config_file
+    
+    # Get agent ID
+    raw_agent_id = str(params.get("agentId", "")).strip()
+    if not raw_agent_id:
+        raise ValueError("agentId is required")
+    
+    agent_id = normalize_agent_id(raw_agent_id)
+    
+    # Check if agent exists
+    cfg = _get_current_config()
+    agents_list = list_agent_entries(cfg)
+    if find_agent_entry_index(agents_list, agent_id) < 0:
+        raise ValueError(f'agent "{agent_id}" not found')
+    
+    # Resolve workspace if provided
+    workspace_dir = None
+    if params.get("workspace"):
+        raw_workspace = str(params.get("workspace")).strip()
+        if raw_workspace:
+            from openclaw.config.paths import resolve_user_path
+            workspace_dir = resolve_user_path(raw_workspace)
+    
+    # Resolve model if provided
+    model = None
+    if params.get("model"):
+        raw_model = str(params.get("model")).strip()
+        if raw_model:
+            model = raw_model
+    
+    # Resolve avatar if provided
+    avatar = None
+    if params.get("avatar"):
+        raw_avatar = str(params.get("avatar")).strip()
+        if raw_avatar:
+            avatar = raw_avatar
+    
+    # Apply config updates
+    next_config = apply_agent_config(
+        cfg,
+        agent_id=agent_id,
+        name=str(params.get("name", "")).strip() or None,
+        workspace=workspace_dir,
+        model=model,
+    )
+    
+    # Write config
+    write_config_file(next_config)
+    
+    # Ensure workspace if updated
+    if workspace_dir:
+        skip_bootstrap = False
+        if next_config.agents and next_config.agents.defaults:
+            skip_bootstrap = getattr(next_config.agents.defaults, 'skip_bootstrap', False)
+        ensure_workspace_and_sessions(
+            workspace_dir=workspace_dir,
+            agent_id=agent_id,
+            skip_bootstrap=skip_bootstrap,
+        )
+    
+    # Append avatar to IDENTITY.md if provided
+    if avatar:
+        actual_workspace = workspace_dir or resolve_agent_workspace_dir(next_config, agent_id)
+        Path(actual_workspace).mkdir(parents=True, exist_ok=True)
+        identity_path = Path(actual_workspace) / "IDENTITY.md"
+        safe_avatar = avatar.strip().replace("\n", " ").replace("\r", " ")
+        with open(identity_path, "a", encoding="utf-8") as f:
+            f.write(f"\n- Avatar: {safe_avatar}\n")
+    
+    return {"ok": True, "agentId": agent_id}
 
 
 @register_handler("agents.delete")
 async def handle_agents_delete(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Delete agent (minimal compatibility implementation)."""
-    agent_id = params.get("id")
-    return {"ok": True, "deleted": bool(agent_id), "id": agent_id}
+    """Delete agent (full implementation mirroring TS agents.delete)"""
+    from pathlib import Path
+    from openclaw.routing.session_key import normalize_agent_id
+    from openclaw.commands.agents_config import prune_agent_config, find_agent_entry_index
+    from openclaw.agents.agent_scope import (
+        list_agent_entries,
+        resolve_agent_workspace_dir,
+        resolve_agent_dir,
+    )
+    from openclaw.config.loader import write_config_file
+    from openclaw.config.sessions.paths import get_default_store_path
+    
+    # Get agent ID
+    raw_agent_id = str(params.get("agentId", "")).strip()
+    if not raw_agent_id:
+        raise ValueError("agentId is required")
+    
+    agent_id = normalize_agent_id(raw_agent_id)
+    
+    # Cannot delete main agent
+    if agent_id == "main":
+        raise ValueError('"main" cannot be deleted')
+    
+    # Check if agent exists
+    cfg = _get_current_config()
+    agents_list = list_agent_entries(cfg)
+    if find_agent_entry_index(agents_list, agent_id) < 0:
+        raise ValueError(f'agent "{agent_id}" not found')
+    
+    # Get paths before deletion
+    workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
+    agent_dir = resolve_agent_dir(cfg, agent_id)
+    sessions_dir = Path(get_default_store_path(agent_id)).parent
+    
+    # Prune from config
+    result = prune_agent_config(cfg, agent_id)
+    
+    # Write updated config
+    write_config_file(result["config"])
+    
+    # Delete files if requested (default: True)
+    delete_files = params.get("deleteFiles", True)
+    if isinstance(delete_files, bool) and delete_files:
+        import shutil
+        
+        async def move_to_trash_best_effort(pathname: str) -> None:
+            """Move path to trash, best effort"""
+            p = Path(pathname)
+            if not p.exists():
+                return
+            
+            try:
+                # Try to use system trash command
+                import subprocess
+                subprocess.run(
+                    ["trash", str(p)],
+                    timeout=10,
+                    check=True,
+                    capture_output=True,
+                )
+            except Exception:
+                # Fallback: move to ~/.Trash with timestamp
+                try:
+                    trash_dir = Path.home() / ".Trash"
+                    trash_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    base = p.name
+                    import time
+                    dest = trash_dir / f"{base}-{int(time.time() * 1000)}"
+                    if dest.exists():
+                        import secrets
+                        dest = trash_dir / f"{base}-{int(time.time() * 1000)}-{secrets.token_hex(3)}"
+                    
+                    shutil.move(str(p), str(dest))
+                except Exception:
+                    pass
+        
+        # Move to trash (best effort)
+        await move_to_trash_best_effort(workspace_dir)
+        await move_to_trash_best_effort(agent_dir)
+        await move_to_trash_best_effort(str(sessions_dir))
+    
+    return {
+        "ok": True,
+        "agentId": agent_id,
+        "removedBindings": result["removedBindings"],
+    }
 
 
 # System handlers

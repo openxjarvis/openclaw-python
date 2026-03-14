@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..auth_choice_types import AuthChoice
-    from ...config.schema import ClawdbotConfig
+    from ...config.schema import OpenClawConfig
 
 from .base import ApplyAuthChoiceResult
 
@@ -196,7 +196,7 @@ async def _prompt_api_key(flow: dict, opts: dict | None = None) -> str:
 
 async def apply_auth_choice_api_providers(
     auth_choice: AuthChoice,
-    config: ClawdbotConfig,
+    config: OpenClawConfig,
     set_default_model: bool = True,
     agent_dir: str | None = None,
     agent_id: str | None = None,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from ..config.schema import ClawdbotConfig
+    from ..config.schema import OpenClawConfig
 
 # ---------------------------------------------------------------------------
 # Preset definitions
@@ -95,7 +95,7 @@ DEFAULT_PRESET = "trusted"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def detect_preset_level(config: "ClawdbotConfig") -> Optional[str]:
+def detect_preset_level(config: "OpenClawConfig") -> Optional[str]:
     """Return the preset name that best matches the current config, or None."""
     exec_cfg = config.tools.exec if (config.tools and config.tools.exec) else None
     security = exec_cfg.security if exec_cfg else "deny"
@@ -138,7 +138,7 @@ def detect_preset_level(config: "ClawdbotConfig") -> Optional[str]:
     return None
 
 
-def apply_preset(config: "ClawdbotConfig", preset_name: str) -> "ClawdbotConfig":
+def apply_preset(config: "OpenClawConfig", preset_name: str) -> "OpenClawConfig":
     """Apply a named preset to the config in-place and return it."""
     from ..config.schema import ToolsConfig, ExecToolConfig, MessageToolConfig, MessageCrossContextConfig
 

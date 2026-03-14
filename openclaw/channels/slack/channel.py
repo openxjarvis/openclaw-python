@@ -50,6 +50,10 @@ class SlackChannel(ChannelPlugin):
         # Block streaming support (P1-5)
         self._block_streaming: bool = True
         self._block_streaming_coalesce: dict[str, Any] | None = None
+        # Config storage for ackReaction and other features
+        self._config: dict[str, Any] | None = None
+        self._cfg: Any = None
+        self._account_id: str | None = None
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -72,6 +76,13 @@ class SlackChannel(ChannelPlugin):
     
     def _parse_common_config(self, config: dict[str, Any]) -> None:
         """Parse common configuration for both socket and HTTP modes"""
+        # Store full config for later use (e.g., ackReaction)
+        self._config = config
+        self._account_id = config.get("accountId") or config.get("account_id") or "default"
+        
+        # Get global config if available (for resolve functions)
+        self._cfg = config.get("_full_config")  # Passed from channel manager
+        
         # ResolvedSlackAccount field alignment
         self._reply_to_mode = (
             config.get("replyToMode") or config.get("reply_to_mode") or _DEFAULT_REPLY_MODE
@@ -232,6 +243,75 @@ class SlackChannel(ChannelPlugin):
 
         chat_type_raw = message.get("channel_type", "")
         chat_type = "direct" if chat_type_raw == "im" else "group"
+        is_dm = chat_type == "direct"
+        is_group = chat_type == "group"
+
+        # Ack reaction — send reaction while processing (mirrors TS ackReaction/ackReactionScope)
+        if self._cfg and self._app:
+            from openclaw.agents.identity import resolve_ack_reaction
+            from openclaw.channels.ack_reactions import should_ack_reaction
+            
+            # Resolve agent_id - use "main" as default (most Slack messages route to main agent)
+            agent_id = "main"
+            
+            # Resolve ack reaction emoji using cascading config
+            # Priority: account → channel → messages → identity → default "👀"
+            ack_emoji = resolve_ack_reaction(
+                self._cfg,
+                agent_id,
+                {"channel": "slack", "accountId": self._account_id}
+            )
+            
+            if ack_emoji:
+                # Resolve ack reaction scope
+                # Priority: account → channel → messages → default "group-mentions"
+                ack_scope = "group-mentions"  # default
+                
+                # Check config layers
+                try:
+                    # Global messages config
+                    if hasattr(self._cfg, "messages") and self._cfg.messages:
+                        if hasattr(self._cfg.messages, "ack_reaction_scope"):
+                            scope_val = self._cfg.messages.ack_reaction_scope
+                            if scope_val:
+                                ack_scope = scope_val
+                    
+                    # Channel-level config (if available)
+                    if self._config and "ackReactionScope" in self._config:
+                        ack_scope = self._config["ackReactionScope"]
+                except Exception:
+                    pass
+                
+                # Check if message has mentions (for group-mentions scope)
+                was_mentioned = False
+                # Slack mentions appear in message text as <@USER_ID>
+                message_text = message.get("text", "")
+                if message_text and "<@" in message_text:
+                    # Would need bot_user_id to check if it's our bot, but we'll assume any mention
+                    was_mentioned = True
+                
+                # Determine if we should send ack reaction
+                should_ack = should_ack_reaction(
+                    scope=ack_scope,
+                    is_direct=is_dm,
+                    is_group=is_group,
+                    is_mentionable_group=is_group,  # Slack groups support mentions
+                    require_mention=True,  # Slack requires explicit mentions in groups
+                    can_detect_mention=True,  # Slack supports mention detection
+                    effective_was_mentioned=was_mentioned,
+                    should_bypass_mention=False,  # No bypass for Slack
+                )
+                
+                if should_ack:
+                    # Send ack reaction via Slack API
+                    try:
+                        await self._app.client.reactions_add(
+                            channel=message.get("channel"),
+                            timestamp=message.get("ts"),
+                            name=ack_emoji.strip(":")  # Slack wants emoji name without colons
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to send ack reaction: {e}")
 
         inbound = InboundMessage(
             channel_id=self.id,

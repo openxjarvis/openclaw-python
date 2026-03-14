@@ -284,10 +284,32 @@ class CronRunLog:
     MAX_BYTES = 2_000_000   # 2 MB
     MAX_LINES = 2_000
 
-    def __init__(self, log_dir: Path, job_id: str):
+    def __init__(
+        self,
+        log_dir: Path,
+        job_id: str,
+        prune_options: dict[str, int] | None = None
+    ):
+        """Initialize CronRunLog
+        
+        Args:
+            log_dir: Directory for log files
+            job_id: Job identifier
+            prune_options: Optional pruning config with 'maxBytes' and 'keepLines'
+                          Mirrors TS resolveCronRunLogPruneOptions
+        """
         self.log_path = log_dir / f"{job_id}.jsonl"
         self.job_id = job_id
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Apply prune options if provided (mirrors TS)
+        if prune_options:
+            self.max_bytes = prune_options.get("maxBytes", self.MAX_BYTES)
+            self.max_lines = prune_options.get("keepLines", self.MAX_LINES)
+        else:
+            self.max_bytes = self.MAX_BYTES
+            self.max_lines = self.MAX_LINES
+        
         # Serialized write chain (asyncio lock per path)
         self._write_lock: asyncio.Lock | None = None
 
@@ -332,17 +354,17 @@ class CronRunLog:
             logger.error(f"cron: run log write error: {e}", exc_info=True)
 
     def _prune_if_needed(self) -> None:
-        """Prune log if it exceeds MAX_BYTES."""
+        """Prune log if it exceeds max_bytes."""
         try:
             if not self.log_path.exists():
                 return
             size = self.log_path.stat().st_size
-            if size <= self.MAX_BYTES:
+            if size <= self.max_bytes:
                 return
             with open(self.log_path, encoding="utf-8") as f:
                 raw = f.read()
             lines = [ln for ln in raw.split("\n") if ln.strip()]
-            kept = lines[-self.MAX_LINES:]  # keep newest
+            kept = lines[-self.max_lines:]  # keep newest
             tmp = self.log_path.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(kept) + "\n")
@@ -460,3 +482,38 @@ class CronRunLog:
                 self.log_path.unlink()
         except Exception as e:
             logger.error(f"Error clearing run log: {e}", exc_info=True)
+
+
+def resolve_cron_store_path(config: dict[str, Any] | None) -> Path:
+    """Resolve cron store path from config.
+    
+    Mirrors TS resolveCronStorePath() from src/cron/store.ts:13-22
+    
+    Args:
+        config: Full config dict with 'cron' key
+        
+    Returns:
+        Path to cron jobs.json file
+        
+    Example:
+        >>> resolve_cron_store_path({"cron": {"store": "~/my-cron.json"}})
+        PosixPath('/home/user/my-cron.json')
+        
+        >>> resolve_cron_store_path(None)
+        PosixPath('/home/user/.openclaw/cron/jobs.json')
+    """
+    if not config:
+        config = {}
+    
+    cron_config = config.get("cron") or {}
+    store_path_str = cron_config.get("store", "~/.openclaw/cron/jobs.json")
+    
+    # Handle ~ prefix
+    if store_path_str.startswith("~"):
+        rest = store_path_str[2:] if len(store_path_str) > 1 else ""
+        if rest.startswith("/"):
+            rest = rest[1:]
+        return Path.home() / rest if rest else Path.home()
+    
+    # Handle regular paths
+    return Path(store_path_str).expanduser().resolve()

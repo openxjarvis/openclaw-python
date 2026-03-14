@@ -28,7 +28,7 @@ from openclaw.config.paths import STATE_DIR as _STATE_DIR
 
 logger = logging.getLogger(__name__)
 
-_cached_config: Optional["ClawdbotConfig"] = None
+_cached_config: Optional["OpenClawConfig"] = None
 _cached_config_path: Optional[Path] = None
 _cached_config_mtime_ns: Optional[int] = None
 
@@ -246,20 +246,56 @@ def load_config_raw(path: Path) -> dict[str, Any]:
     return obj if isinstance(obj, dict) else {}
 
 
+def _migrate_legacy_agent_field(config_dict: dict[str, Any]) -> dict[str, Any]:
+    """Migrate legacy top-level 'agent' field to agents.defaults.
+    
+    Provides backward compatibility for old config files that used the top-level
+    'agent' field. This field has been deprecated in favor of 'agents.defaults'
+    to align with TypeScript OpenClawConfig structure.
+    
+    Args:
+        config_dict: Configuration dictionary
+        
+    Returns:
+        Modified configuration dictionary with agent field migrated
+    """
+    if "agent" in config_dict and config_dict["agent"]:
+        agent_config = config_dict.pop("agent")
+        
+        # Ensure agents structure exists
+        if "agents" not in config_dict:
+            config_dict["agents"] = {}
+        if "defaults" not in config_dict["agents"]:
+            config_dict["agents"]["defaults"] = {}
+        
+        # Migrate fields (don't override existing values in agents.defaults)
+        defaults = config_dict["agents"]["defaults"]
+        for key, value in agent_config.items():
+            if key not in defaults or defaults[key] is None:
+                defaults[key] = value
+        
+        logger.warning(
+            "Deprecated: top-level 'agent' field is deprecated, "
+            "use 'agents.defaults' instead. Config has been auto-migrated."
+        )
+    
+    return config_dict
+
+
 def load_config(
     config_path: Optional[str | Path] = None,
     as_dict: bool = False,
-) -> Union["ClawdbotConfig", dict[str, Any]]:
+) -> Union["OpenClawConfig", dict[str, Any]]:
     """Load OpenClaw configuration.
 
     Args:
         config_path: Optional path to config file.  Supports JSON5.
-        as_dict: If True, return dict instead of ClawdbotConfig object.
+        as_dict: If True, return dict instead of OpenClawConfig object.
 
     Returns:
-        Configuration object (ClawdbotConfig) or dictionary if as_dict=True.
+        Configuration object (OpenClawConfig) or dictionary if as_dict=True.
     """
-    from .schema import ClawdbotConfig
+    from .schema import OpenClawConfig
 
     global _cached_config, _cached_config_path, _cached_config_mtime_ns
 
@@ -279,16 +315,18 @@ def load_config(
     if path and path.exists():
         try:
             config_dict = load_config_raw(path)
+            # Migrate legacy agent field to agents.defaults
+            config_dict = _migrate_legacy_agent_field(config_dict)
             _append_config_audit(path, "load", f"success, keys={list(config_dict.keys())[:5]}")
         except Exception as exc:
             logger.warning(f"Failed to load config from {path}: {exc}")
             _append_config_audit(path, "load_error", str(exc))
 
     try:
-        config_obj = ClawdbotConfig(**config_dict) if config_dict else ClawdbotConfig()
+        config_obj = OpenClawConfig(**config_dict) if config_dict else OpenClawConfig()
     except Exception as exc:
         logger.warning(f"Failed to parse config: {exc}")
-        config_obj = ClawdbotConfig()
+        config_obj = OpenClawConfig()
 
     # Apply runtime in-memory overrides (matches TS applyConfigOverrides at end of loadConfig)
     try:

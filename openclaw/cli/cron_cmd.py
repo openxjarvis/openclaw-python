@@ -405,6 +405,66 @@ def run(
 
 
 # ---------------------------------------------------------------------------
+# cron runs
+# ---------------------------------------------------------------------------
+
+@cron_app.command("runs")
+def runs(
+    job_id: str = typer.Option(..., "--id", help="Job ID to show runs for"),
+    limit: int = typer.Option(20, "--limit", help="Max number of runs to show"),
+    url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
+    token: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Show run history for a cron job"""
+    try:
+        from .gateway_rpc_cli import GatewayRpcOpts, call_gateway_from_cli
+        opts = GatewayRpcOpts(url=url, token=token, timeout=10_000, json_output=json_output)
+        result = call_gateway_from_cli("cron.runs", opts, {"id": job_id, "limit": limit}, show_progress=False)
+        
+        if json_output:
+            print(json.dumps(result, indent=2))
+        else:
+            entries = result.get("entries", [])
+            if not entries:
+                console.print(f"[yellow]No run history found for job {job_id}[/yellow]")
+                return
+            
+            console.print(f"\n[cyan]Run History for Job:[/cyan] {job_id}")
+            console.print(f"[dim]Showing last {len(entries)} runs[/dim]\n")
+            
+            for entry in entries:
+                ts = entry.get("ts", "")
+                status = entry.get("status", "unknown")
+                action = entry.get("action", "")
+                
+                # Format status with color
+                if status == "ok":
+                    status_str = "[green]✓ ok[/green]"
+                elif status == "skipped":
+                    status_str = "[yellow]⊘ skipped[/yellow]"
+                elif status == "error":
+                    status_str = "[red]✗ error[/red]"
+                else:
+                    status_str = f"[dim]{status}[/dim]"
+                
+                console.print(f"  {status_str}  {action}  [dim]{ts}[/dim]")
+                
+                # Show error message if present
+                if entry.get("error"):
+                    console.print(f"    [red]Error:[/red] {entry['error']}")
+                
+                # Show reason for skips
+                if entry.get("reason"):
+                    console.print(f"    [dim]Reason:[/dim] {entry['reason']}")
+            
+            console.print("")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] Could not retrieve runs: {e}")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
 # cron status
 # ---------------------------------------------------------------------------
 

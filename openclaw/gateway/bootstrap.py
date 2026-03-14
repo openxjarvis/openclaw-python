@@ -289,14 +289,13 @@ class GatewayBootstrap:
         
         # Ensure workspace exists with bootstrap files (matching TypeScript behavior)
         try:
-            from ..agents.ensure_workspace import ensure_agent_workspace
+            from ..agents.ensure_workspace_and_sessions import ensure_workspace_and_sessions
             skip_bootstrap = False
             if self.config and hasattr(self.config, 'agent'):
                 skip_bootstrap = getattr(self.config.agent, 'skip_bootstrap', False)
             
-            workspace_paths = ensure_agent_workspace(
+            result = ensure_workspace_and_sessions(
                 workspace_dir=workspace_dir,
-                ensure_bootstrap_files=True,
                 skip_bootstrap=skip_bootstrap,
             )
             logger.info(f"Workspace initialized: {workspace_dir}")
@@ -750,6 +749,14 @@ class GatewayBootstrap:
                 logger.info("Cron service started")
             except Exception as e:
                 logger.warning(f"Cron service start failed: {e}")
+        
+        # Step 13c: Start subagent auto-archive service
+        try:
+            from openclaw.agents.subagent_archive import start_archive_service
+            start_archive_service(self.config, self)
+            logger.info("Subagent auto-archive service started")
+        except Exception as e:
+            logger.warning(f"Subagent auto-archive service failed to start: {e}")
 
         # Step 14: Start discovery service
         logger.info("Step 14: Starting discovery service")
@@ -796,6 +803,7 @@ class GatewayBootstrap:
         try:
             from ..gateway.heartbeat import HeartbeatManager, resolve_heartbeat_config
             from ..infra.heartbeat_wake import set_heartbeat_wake_handler
+            from ..agents.agent_scope import resolve_agent_workspace_dir
 
             self._heartbeat_managers: list[HeartbeatManager] = []
             self._heartbeat_wake_disposer = None
@@ -814,7 +822,10 @@ class GatewayBootstrap:
                             agent_cfg = a
                             break
 
-                    hb_config = resolve_heartbeat_config(agent_cfg, defaults_cfg)
+                    # Resolve workspace directory for empty HEARTBEAT.md check
+                    workspace_dir = resolve_agent_workspace_dir(self.config, agent.id)
+
+                    hb_config = resolve_heartbeat_config(agent_cfg, defaults_cfg, workspace_dir=workspace_dir)
                     if hb_config is None or not hb_config.enabled:
                         logger.debug("Heartbeat disabled for agent %s", agent.id)
                         continue
@@ -1333,6 +1344,14 @@ class GatewayBootstrap:
             stop_diagnostic_heartbeat()
         except Exception:
             pass
+        
+        # Stop subagent auto-archive service
+        try:
+            from openclaw.agents.subagent_archive import stop_archive_service
+            stop_archive_service()
+            logger.info("Subagent auto-archive service stopped")
+        except Exception as e:
+            logger.debug(f"Failed to stop archive service: {e}")
         
         # Release PID lock last so the new process can acquire it immediately
         if self._gateway_lock is not None:

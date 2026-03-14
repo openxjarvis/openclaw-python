@@ -63,10 +63,28 @@ async def _ensure_session_runtime_cleanup(
 
     # 1b. Stop subagents spawned by this session
     try:
-        from openclaw.auto_reply.reply.abort import stop_subagents_for_requester as _stop_subagents
-        _stop_subagents(requester_session_key=session_key)
+        from openclaw.agents.subagent_registry import get_global_registry
+        from openclaw.agents.pi_embedded import abort_embedded_pi_run
+        
+        registry = get_global_registry()
+        child_runs = registry.list_runs_for_requester(session_key)
+        
+        for run in child_runs:
+            if not run.ended_at:
+                child_session_key = run.child_session_key
+                # Get session ID and abort
+                try:
+                    entry = gateway.session_manager.get_session_entry(child_session_key) if gateway and hasattr(gateway, "session_manager") else None
+                    if isinstance(entry, dict):
+                        session_id = entry.get("sessionId")
+                        if session_id:
+                            abort_embedded_pi_run(session_id)
+                except Exception:
+                    pass
+                # Mark as terminated
+                registry.mark_subagent_run_terminated(run.run_id, reason="killed")
     except Exception as exc:
-        logger.debug(f"stop_subagents_for_requester not available: {exc}")
+        logger.debug(f"Failed to stop subagents for requester {session_key}: {exc}")
     # Also attempt legacy channel_manager path
     try:
         if gateway is not None:

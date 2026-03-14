@@ -20,7 +20,7 @@ class SessionsListTool(AgentTool):
     ):
         super().__init__()
         self.name = "sessions_list"
-        self.description = "List other sessions (incl. sub-agents) with filters/last"
+        self.description = "List other sessions (incl. sub-agents) with filters. Access control applies based on agent-to-agent policy and session visibility settings."
         self.session_manager = session_manager
         self.current_session_key = current_session_key
         self.cfg = cfg
@@ -100,7 +100,7 @@ class SessionsHistoryTool(AgentTool):
     ):
         super().__init__()
         self.name = "sessions_history"
-        self.description = "Fetch history for another session/sub-agent"
+        self.description = "Fetch history for another session/sub-agent. Use session_id to identify the target. Access control applies."
         self.session_manager = session_manager
         self.current_session_key = current_session_key
         self.cfg = cfg
@@ -194,7 +194,7 @@ class SessionsSendTool(AgentTool):
     ):
         super().__init__()
         self.name = "sessions_send"
-        self.description = "Send a message to another session/sub-agent"
+        self.description = "Send a message to another session/sub-agent. Use session_id to identify the target. Access control and agent-to-agent policy apply."
         self.session_manager = session_manager
         self.current_session_key = current_session_key
         self.cfg = cfg
@@ -331,6 +331,44 @@ class SessionsSpawnTool(AgentTool):
                     "type": "boolean",
                     "description": "Bind spawn to a thread (only for mode='session'). Default: false.",
                 },
+                "attachments": {
+                    "type": "array",
+                    "description": "Files to attach to the spawned session (inline content)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Filename for the attachment"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "File content (utf8 text or base64)"
+                            },
+                            "encoding": {
+                                "type": "string",
+                                "enum": ["utf8", "base64"],
+                                "description": "Content encoding (default: utf8)"
+                            },
+                            "mimeType": {
+                                "type": "string",
+                                "description": "MIME type of the file (optional)"
+                            }
+                        },
+                        "required": ["name", "content"]
+                    },
+                    "maxItems": 50
+                },
+                "attachAs": {
+                    "type": "object",
+                    "description": "Attachment configuration",
+                    "properties": {
+                        "mountPath": {
+                            "type": "string",
+                            "description": "Directory path where attachments will be mounted (default: /workspace/attachments)"
+                        }
+                    }
+                },
             },
             "required": ["task"],
         }
@@ -358,6 +396,11 @@ class SessionsSpawnTool(AgentTool):
                 run_timeout_seconds = max(0, float(run_timeout_seconds))
             except (TypeError, ValueError):
                 run_timeout_seconds = None
+        
+        # Parse attachments (matches TS sessions-spawn-tool.ts lines 112-119)
+        attachments = params.get("attachments", [])
+        attach_as = params.get("attachAs", {})
+        mount_path = attach_as.get("mountPath", "attachments")
 
         # Resolve hook_runner from gateway or agent runtime
         hook_runner = None

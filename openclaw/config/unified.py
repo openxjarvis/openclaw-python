@@ -256,7 +256,7 @@ class OpenClawConfig(BaseModel):
     """
     Unified OpenClaw configuration
 
-    This replaces ClawdbotConfig and provides a complete, type-safe
+    This replaces OpenClawConfig and provides a complete, type-safe
     configuration system for all OpenClaw components.
 
     Example:

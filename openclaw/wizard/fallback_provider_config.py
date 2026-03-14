@@ -9,7 +9,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..config.schema import ClawdbotConfig
+    from ..config.schema import OpenClawConfig
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ def extract_provider_from_model_id(model_id: str) -> str | None:
     return None
 
 
-def check_provider_configured(config: ClawdbotConfig, provider: str) -> bool:
+def check_provider_configured(config: OpenClawConfig, provider: str) -> bool:
     """Check if a provider has API key configured
     
     Args:
@@ -100,7 +100,7 @@ def check_provider_configured(config: ClawdbotConfig, provider: str) -> bool:
 
 
 async def configure_fallback_provider(
-    config: ClawdbotConfig,
+    config: OpenClawConfig,
     provider: str,
     interactive: bool = True
 ) -> bool:
@@ -216,7 +216,7 @@ async def configure_fallback_provider(
 
 
 async def ensure_fallback_provider_configured(
-    config: ClawdbotConfig,
+    config: OpenClawConfig,
     model_id: str,
     interactive: bool = True
 ) -> bool:

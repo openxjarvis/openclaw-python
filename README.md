@@ -1,6 +1,8 @@
 # OpenClaw Python
 
 > Python implementation of [OpenClaw](https://github.com/badlogic/pi-mono) — a self-hosted personal AI assistant gateway.
+>
+> **[中文 README →](README_CN.md)**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -63,27 +65,83 @@ Full parity with TypeScript version, supporting multiple authentication methods:
 
 ## Quick Start
 
-**Prerequisites:** Python 3.11+ · [uv](https://docs.astral.sh/uv/) · LLM API key
+### Prerequisites
+
+- **Python 3.11+** — Check with `python3 --version`
+- **[uv](https://docs.astral.sh/uv/)** — Fast Python package manager
+- **LLM API key** — Gemini (recommended), Claude, or OpenAI
+
+Install `uv` if you don't have it:
 
 ```bash
-# Clone both repos as siblings (pi-mono-python is required)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Installation
+
+Clone both repositories as siblings (required structure):
+
+```bash
+# Create a workspace folder (any name works)
 mkdir my-workspace && cd my-workspace
+
+# Clone both repos
 git clone https://github.com/openxjarvis/pi-mono-python.git
 git clone https://github.com/openxjarvis/openclaw-python.git
 
+# Install dependencies
 cd openclaw-python
 uv sync
+```
 
-# One-time setup wizard
+Your folder structure should look like:
+
+```
+my-workspace/
+├── openclaw-python/       ← main application
+└── pi-mono-python/        ← required sibling (agent core)
+```
+
+### First-Time Setup
+
+Run the interactive setup wizard:
+
+```bash
 uv run openclaw onboard
+```
 
-# Start
+The wizard will guide you through:
+
+1. **LLM Provider** — Choose Gemini, Claude, OpenAI, etc.
+2. **API Keys** — Enter your API key (saved to `.env`)
+3. **Channel Setup** — Configure Telegram, Feishu, or skip
+4. **Gateway Port** — Default is 18789
+5. **Workspace** — Agent working directory
+
+### Start the Gateway
+
+```bash
 uv run openclaw start
 ```
 
-Open **http://localhost:18789** for the Web UI, or message your Telegram/Feishu bot directly.
+OpenClaw is now running:
 
-**Update:** `git pull && uv sync` in both repos, then restart.
+- **Web UI:** http://localhost:18789
+- **Telegram:** Send a message to your bot
+- **Feishu:** Message your Feishu bot directly
+
+### Update to Latest Version
+
+```bash
+cd openclaw-python
+git pull && uv sync
+
+cd ../pi-mono-python
+git pull && uv sync
+
+# Restart the gateway
+uv run openclaw restart
+```
 
 ---
 
@@ -141,31 +199,65 @@ my-workspace/
 
 ## Configuration
 
-Run the interactive setup wizard (once per environment):
+### Quick Configuration
+
+The easiest way to configure OpenClaw is through the interactive wizard:
 
 ```bash
 uv run openclaw onboard
 ```
 
-The wizard walks you through LLM provider selection, channel setup, gateway port, and workspace initialization. It saves keys to `.env` automatically.
+### Manual Configuration
 
-Or edit `~/.openclaw/openclaw.json` directly:
+Edit `~/.openclaw/openclaw.json` for advanced settings:
 
 ```json
 {
   "channels": {
     "telegram": {
       "enabled": true,
-      "botToken": "YOUR_BOT_TOKEN"
+      "botToken": "YOUR_BOT_TOKEN",
+      "dmPolicy": "pairing"
     },
     "feishu": {
       "appId": "YOUR_APP_ID",
       "appSecret": "YOUR_APP_SECRET",
       "useWebSocket": true
     }
+  },
+  "tools": {
+    "exec": {
+      "security": "full",
+      "ask": "on-miss"
+    }
   }
 }
 ```
+
+### Essential CLI Commands
+
+```bash
+# Gateway management
+uv run openclaw start         # Start the gateway
+uv run openclaw stop          # Stop the gateway
+uv run openclaw restart       # Restart the gateway
+uv run openclaw status        # Check gateway status
+
+# User management (for pairing mode)
+uv run openclaw pairing list              # List pairing requests
+uv run openclaw pairing approve <user_id> # Approve a user
+uv run openclaw pairing deny <user_id>    # Deny a user
+
+# Security presets
+uv run openclaw security preset           # View/switch permission levels
+uv run openclaw security preset trusted   # Set to trusted mode
+
+# Configuration
+uv run openclaw onboard                   # Run setup wizard again
+uv run openclaw config show               # Show current config
+```
+
+For complete CLI reference and detailed configuration, see **[GUIDE.md](GUIDE.md)**.
 
 ---
 
@@ -177,28 +269,42 @@ OpenClaw has several independent permission layers. Check these before debugging
 
 ### 1. Channel Access — Who can talk to the bot
 
-Configured per channel in `~/.openclaw/openclaw.json`:
+Controls who can send direct messages to your bot. Configured per channel in `~/.openclaw/openclaw.json`:
 
-| Policy | Behavior |
-|---|---|
-| `pairing` (default) | New users must request and be approved via CLI |
-| `allowlist` | Only pre-approved users can interact |
-| `open` | Any user can interact — use with caution |
-| `disabled` | No DM access |
+| Policy | Behavior | Use Case |
+|---|---|---|
+| `pairing` (default) | New users must request access and be approved via CLI | Recommended for personal bots |
+| `allowlist` | Only pre-approved users can interact | Team/group usage |
+| `open` | Any user can interact immediately | Public bots (use with caution) |
+| `disabled` | No DM access allowed | Channel-only mode |
+
+**Example:**
 
 ```json
-{ "channels": { "telegram": { "dmPolicy": "open" } } }
+{ "channels": { "telegram": { "dmPolicy": "pairing" } } }
+```
+
+**Approve users in pairing mode:**
+
+```bash
+# List pending requests
+uv run openclaw pairing list
+
+# Approve a user
+uv run openclaw pairing approve <user_id>
 ```
 
 ### 2. Bash Execution — What shell commands the agent can run
 
-Controlled by `tools.exec.security` in `~/.openclaw/openclaw.json`:
+Controls whether the agent can execute shell commands. Configured in `~/.openclaw/openclaw.json`:
 
-| Setting | Effect |
-|---------|--------|
-| `deny` | Agent **cannot run any shell commands**. File writing still works. |
-| `allowlist` | Only binaries listed in `tools.exec.safe_bins` are allowed |
-| `full` | Agent can run any command (recommended for trusted environments) |
+| Setting | Effect | Example Commands |
+|---------|--------|------------------|
+| `deny` | **Cannot run any shell commands** | Agent can only read/write files |
+| `allowlist` | Only whitelisted binaries allowed | `python`, `git`, `ffmpeg`, etc. |
+| `full` | Can run any command | Recommended for trusted environments |
+
+**Example configuration:**
 
 ```json
 {
@@ -206,15 +312,25 @@ Controlled by `tools.exec.security` in `~/.openclaw/openclaw.json`:
     "exec": {
       "security": "full",
       "ask": "on-miss",
-      "safe_bins": ["python", "ffmpeg", "git", "node"]
+      "safe_bins": ["python", "ffmpeg", "git", "node", "npm"]
     }
   }
 }
 ```
 
-> **Note:** `exec.security` only affects the `bash` tool. File read/write tools are always available regardless of this setting.
+> **Note:** The `exec.security` setting only affects the `bash` tool. File read/write operations are always available regardless of this setting.
 
-**Quick preset switching:** Use `uv run openclaw security preset` to instantly switch between Relaxed/Trusted/Standard/Strict permission levels (covers execution + inbound + outbound settings).
+**Quick preset switching:**
+
+```bash
+# View current permission level
+uv run openclaw security preset
+
+# Switch to trusted mode (recommended for personal use)
+uv run openclaw security preset trusted
+```
+
+Available presets: `relaxed` · `trusted` · `standard` · `strict`
 
 ### 3. Feishu App Scopes — What Feishu API features work
 
@@ -264,15 +380,37 @@ Continuously aligned with the TypeScript [OpenClaw](https://github.com/badlogic/
 
 ### AI Providers
 
-| Provider | Status | Models |
+| Provider | Status | Models / Notes |
 |----------|--------|--------|
 | **Google Gemini** | ✅ Production | Gemini 2.5 Pro, Gemini 2.0 Flash, Gemini 1.5 Pro/Flash |
-| **Anthropic Claude** | ✅ Implemented | Claude 3.5 Sonnet, Claude 3.5 Haiku, Claude 3 Opus |
-| **OpenAI** | ✅ Implemented | GPT-4o, o1, o3-mini |
-| **DeepSeek** | ✅ Implemented | DeepSeek-V3, DeepSeek-R1 |
-| **Ollama** | ✅ Implemented | Llama 3.3, Mistral, Qwen, CodeLlama (local) |
-| **AWS Bedrock** | ✅ Implemented | Claude 3.x, Llama 3.3, Mistral |
-| xAI (Grok), Zhipu, Alibaba | 🚧 Planned | Q2–Q3 2026 |
+| **Anthropic Claude** | ✅ Production | Claude 3.5 Sonnet, Claude 3.5 Haiku, Claude 3 Opus |
+| **OpenAI** | ✅ Production | GPT-4o, o1, o3-mini |
+| **DeepSeek** | ✅ Production | DeepSeek-V3, DeepSeek-R1 |
+| **Ollama (local models)** | ✅ Production | Llama 3.3, Mistral, Qwen, CodeLlama (local) |
+| **AWS Bedrock** | ✅ Production | Claude 3.x, Llama 3.3, Mistral |
+| **Mistral AI** | ✅ Implemented | Mistral Large, Mistral Medium |
+| **xAI (Grok)** | ✅ Implemented | Grok series models |
+| **Kimi (Moonshot)** | ✅ Implemented | Kimi Coding (k2p5) |
+| **MiniMax** | ✅ Implemented | MiniMax series |
+| **Moonshot** | ✅ Implemented | Moonshot series |
+| **Zhipu AI (GLM)** | ✅ Implemented | GLM-4, ChatGLM series |
+| **Qwen (Alibaba)** | ✅ Implemented | Qwen series models |
+| **Qianfan (Baidu)** | ✅ Implemented | ERNIE (Wenxin) series |
+| **Volcengine** | ✅ Implemented | Doubao series |
+| **BytePlus** | ✅ Implemented | ByteDance international |
+| **Xiaomi AI** | ✅ Implemented | Xiaomi LLM |
+| **OpenRouter** | ✅ Implemented | Multi-provider aggregator |
+| **LiteLLM** | ✅ Implemented | Unified interface proxy |
+| **Together AI** | ✅ Implemented | Open-source model hosting |
+| **Hugging Face** | ✅ Implemented | Inference API |
+| **vLLM** | ✅ Implemented | Self-hosted inference engine |
+| **Venice AI** | ✅ Implemented | Privacy-first AI platform |
+| **Kilo Gateway** | ✅ Implemented | API gateway |
+| **Vercel AI Gateway** | ✅ Implemented | Vercel AI SDK |
+| **Cloudflare AI Gateway** | ✅ Implemented | Cloudflare Workers AI |
+| **OpenCode Zen** | ✅ Implemented | Coding-focused |
+| **Synthetic** | ✅ Implemented | Synthetic data generation |
+| **Custom endpoints** | ✅ Implemented | Any OpenAI/Anthropic-compatible endpoint |
 
 ### Core Infrastructure
 

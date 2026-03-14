@@ -1,96 +1,85 @@
 """
 Enhanced logging for ClawdBot
+
+This module provides backward compatibility with the new unified logging system.
+All logging now uses tslog-compatible JSON format matching TypeScript openclaw.
 """
 from __future__ import annotations
 
-
-import json
 import logging
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
+from datetime import datetime
+
+# Import from new unified logging system
+from openclaw.logging import (
+    setup_logging as new_setup_logging,
+    create_subsystem_logger,
+    get_logging_state,
+)
+from openclaw.logging.tslog_formatter import TslogFormatter
+from openclaw.logging.levels import LogLevel, LOG_LEVEL_NAMES
 
 
-class JSONFormatter(logging.Formatter):
-    """JSON log formatter for structured logging"""
-
-    def __init__(self, include_extras: bool = True):
+class TslogHandler(logging.Handler):
+    """Handler that outputs logs in tslog JSON format."""
+    
+    def __init__(self, log_file: str):
         super().__init__()
-        self.include_extras = include_extras
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Format log record as JSON"""
-        log_data = {
-            "timestamp": datetime.now(UTC).isoformat() + "Z",
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-            "module": record.module,
-            "function": record.funcName,
-            "line": record.lineno,
-        }
-
-        # Add exception info if present
-        if record.exc_info:
-            log_data["exception"] = self.formatException(record.exc_info)
-
-        # Add extra fields
-        if self.include_extras:
-            for key, value in record.__dict__.items():
-                if key not in (
-                    "name",
-                    "msg",
-                    "args",
-                    "created",
-                    "filename",
-                    "funcName",
-                    "levelname",
-                    "levelno",
-                    "lineno",
-                    "module",
-                    "msecs",
-                    "pathname",
-                    "process",
-                    "processName",
-                    "relativeCreated",
-                    "stack_info",
-                    "exc_info",
-                    "exc_text",
-                    "message",
-                    "taskName",
-                ):
-                    try:
-                        json.dumps(value)  # Check if serializable
-                        log_data[key] = value
-                    except (TypeError, ValueError):
-                        log_data[key] = str(value)
-
-        return json.dumps(log_data)
-
-
-class ColoredFormatter(logging.Formatter):
-    """Colored console formatter"""
-
-    COLORS = {
-        "DEBUG": "\033[36m",  # Cyan
-        "INFO": "\033[32m",  # Green
-        "WARNING": "\033[33m",  # Yellow
-        "ERROR": "\033[31m",  # Red
-        "CRITICAL": "\033[35m",  # Magenta
-    }
-    RESET = "\033[0m"
-
-    def __init__(self, fmt: str | None = None, use_colors: bool = True):
-        super().__init__(fmt or "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
-        self.use_colors = use_colors
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Format with colors"""
-        if self.use_colors and record.levelname in self.COLORS:
-            record.levelname = (
-                f"{self.COLORS[record.levelname]}" f"{record.levelname}" f"{self.RESET}"
+        self.log_file = Path(log_file)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self._file_handle = open(self.log_file, 'a', encoding='utf-8')
+        self._formatter = TslogFormatter()
+    
+    def emit(self, record: logging.LogRecord):
+        """Emit a log record in tslog format."""
+        try:
+            # Map Python log level to our LogLevel
+            level_map = {
+                logging.DEBUG: LogLevel.DEBUG,
+                logging.INFO: LogLevel.INFO,
+                logging.WARNING: LogLevel.WARN,
+                logging.ERROR: LogLevel.ERROR,
+                logging.CRITICAL: LogLevel.FATAL,
+            }
+            level = level_map.get(record.levelno, LogLevel.INFO)
+            
+            # Extract subsystem from logger name
+            # e.g., "openclaw.gateway.bootstrap" -> "gateway/bootstrap"
+            logger_name = record.name
+            if logger_name.startswith("openclaw."):
+                subsystem = logger_name[9:].replace(".", "/")
+            else:
+                subsystem = logger_name.replace(".", "/")
+            
+            # Format message
+            message = self.format(record)
+            
+            # Build metadata
+            meta = {}
+            if hasattr(record, 'extra'):
+                meta.update(record.extra)
+            
+            # Write in tslog format
+            json_line = self._formatter.format_log_entry(
+                level=level,
+                subsystem=subsystem if subsystem else None,
+                message=message,
+                meta=meta,
             )
-        return super().format(record)
+            
+            self._file_handle.write(json_line + '\n')
+            self._file_handle.flush()
+        except Exception:
+            self.handleError(record)
+    
+    def close(self):
+        """Close the file handle."""
+        try:
+            if self._file_handle:
+                self._file_handle.close()
+        finally:
+            super().close()
 
 
 def setup_logging(
@@ -100,53 +89,55 @@ def setup_logging(
     file_level: str = "DEBUG",
 ) -> None:
     """
-    Setup logging configuration
-
+    Setup logging configuration (backward compatibility wrapper).
+    
+    Now delegates to the new unified logging system which outputs
+    tslog-compatible JSON to files and formatted text to console.
+    
     Args:
         level: Console log level
-        format_type: Log format type
+        format_type: Log format type (maps to console_style)
         log_file: Optional log file path
-        file_level: File log level
+        file_level: File log level (ignored, all levels logged to file)
     """
-    # Get root logger
+    # Map format_type to console_style
+    style_map = {
+        "colored": "pretty",
+        "json": "json",
+        "simple": "compact",
+    }
+    console_style = style_map.get(format_type, "pretty")
+    
+    # Configure root logger to use tslog format for file output
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)  # Capture all levels
-
+    
     # Remove existing handlers
     root_logger.handlers.clear()
-
-    # Console handler
+    
+    # Console handler with simple formatting (colorized)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(getattr(logging, level.upper()))
-
-    if format_type == "json":
-        console_handler.setFormatter(JSONFormatter())
-    elif format_type == "colored":
-        console_handler.setFormatter(ColoredFormatter(use_colors=True))
-    else:  # simple
-        console_handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
-        )
-
+    
+    # Simple console format (tslog-style subsystem display)
+    console_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    console_handler.setFormatter(logging.Formatter(console_format))
     root_logger.addHandler(console_handler)
-
-    # File handler
+    
+    # File handler with tslog JSON format
     if log_file:
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(getattr(logging, file_level.upper()))
-        file_handler.setFormatter(JSONFormatter())
-        root_logger.addHandler(file_handler)
-        
-        # Error log file handler (TS alignment - gateway.err.log)
-        err_log_path = log_path.parent / "gateway.err.log"
-        err_handler = logging.FileHandler(err_log_path)
-        err_handler.setLevel(logging.ERROR)  # Only ERROR and above
-        err_handler.setFormatter(JSONFormatter())
-        root_logger.addHandler(err_handler)
-
+        tslog_handler = TslogHandler(log_file)
+        tslog_handler.setLevel(logging.DEBUG)  # All levels to file
+        root_logger.addHandler(tslog_handler)
+    
+    # Also setup new unified logging system
+    new_setup_logging(
+        level=level,
+        console_style=console_style,
+        log_file=log_file,
+        enable_console_capture=False,
+    )
+    
     # Reduce noise from third-party libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -154,42 +145,65 @@ def setup_logging(
     logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
-    logging.info(f"Logging configured: level={level}, format={format_type}")
 
-
-def get_logger(name: str) -> logging.Logger:
-    """Get a logger instance"""
+def get_logger(name: str):
+    """Get a logger instance (backward compatibility).
+    
+    Now returns standard library logger which will use tslog format for file output.
+    
+    Args:
+        name: Logger name
+    
+    Returns:
+        Standard logging.Logger instance
+    """
     return logging.getLogger(name)
 
 
 class LogContext:
-    """Context manager for adding context to logs"""
-
-    def __init__(self, logger: logging.Logger, **context):
+    """Context manager for adding context to logs (deprecated).
+    
+    This is kept for backward compatibility but not actively used
+    in the new tslog-based system.
+    """
+    
+    def __init__(self, logger, **context):
         self.logger = logger
         self.context = context
-        self._old_factory = None
-
+    
     def __enter__(self):
-        self._old_factory = logging.getLogRecordFactory()
-        context = self.context
-
-        def record_factory(*args, **kwargs):
-            record = self._old_factory(*args, **kwargs)
-            for key, value in context.items():
-                setattr(record, key, value)
-            return record
-
-        logging.setLogRecordFactory(record_factory)
         return self
-
+    
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._old_factory:
-            logging.setLogRecordFactory(self._old_factory)
         return False
 
 
-def log_with_context(logger: logging.Logger, **context) -> LogContext:
-    """Create a logging context"""
+def log_with_context(logger, **context) -> LogContext:
+    """Create a logging context (deprecated).
+    
+    Kept for backward compatibility.
+    """
     return LogContext(logger, **context)
+
+
+# Legacy exports (deprecated but kept for compatibility)
+class JSONFormatter(logging.Formatter):
+    """Legacy JSON formatter (deprecated)."""
+    
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+        return json.dumps({
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        })
+
+
+class ColoredFormatter(logging.Formatter):
+    """Legacy colored formatter (deprecated)."""
+    
+    def format(self, record: logging.LogRecord) -> str:
+        return f"{record.levelname} - {record.getMessage()}"

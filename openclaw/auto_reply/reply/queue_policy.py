@@ -1,89 +1,73 @@
-"""Queue policy resolution for the auto-reply dispatch flow.
+"""
+Queue policy for active run handling
 
-Mirrors TypeScript ``openclaw/src/auto-reply/reply/queue-policy.ts``.
+Matches TypeScript src/auto-reply/reply/queue-policy.ts
 
-Determines what action to take when a new message arrives while an agent
-is potentially still running.
-
-Actions:
-  - "run-now"          — no active run; start immediately
-  - "steer"            — active run is streaming; inject message via steer
-  - "enqueue-followup" — active run exists; queue for after completion
-  - "interrupt"        — queue mode is "interrupt"; abort active and re-run
-  - "drop"             — heartbeat or other drop-condition
+Determines how to handle new inbound messages when there's an active run.
 """
 from __future__ import annotations
 
-import logging
 from typing import Literal
 
-from openclaw.auto_reply.reply.queue import QueueSettings
+# Queue action types (matches TS ActiveRunQueueAction)
+QueueAction = Literal["run-now", "enqueue-followup", "drop"]
 
-logger = logging.getLogger(__name__)
-
-ActiveRunQueueAction = Literal[
-    "run-now",
+# Queue modes
+QueueMode = Literal[
     "steer",
-    "enqueue-followup",
-    "interrupt",
-    "drop",
+    "followup",
+    "collect",
+    "steer-backlog",
+    "steer+backlog",
+    "queue",
+    "interrupt"
 ]
 
 
 def resolve_active_run_queue_action(
-    session_id: str,
-    queue_settings: QueueSettings | None,
-    *,
-    is_heartbeat: bool = False,
-) -> ActiveRunQueueAction:
-    """Return the action to take for a new inbound message.
-
-    Mirrors TS ``resolveActiveRunQueueAction``.
-
-    Args:
-        session_id:      The session identifier (used to check active runs).
-        queue_settings:  Resolved queue settings for this session.
-        is_heartbeat:    True if the message is a heartbeat prompt (always drop).
+    is_active: bool,
+    is_heartbeat: bool,
+    should_followup: bool,
+    queue_mode: QueueMode,
+) -> QueueAction:
     """
-    from openclaw.agents.pi_embedded import (
-        is_embedded_pi_run_active,
-        is_embedded_pi_run_streaming,
-    )
-
-    is_active = is_embedded_pi_run_active(session_id)
-
-    # When there is no active run, run immediately (or drop heartbeats when idle).
-    # Mirrors TS: !isActive check comes first; a heartbeat with no active run
-    # returns "run-now" in TS so the turn immediately sends the heartbeat reply.
+    Determine how to handle a new message when there's an active run.
+    
+    Matches TS resolveActiveRunQueueAction() from src/auto-reply/reply/queue-policy.ts.
+    
+    Logic (lines 11-20):
+    1. If no active run → "run-now"
+    2. If heartbeat → "drop"
+    3. If should_followup OR mode is "steer" → "enqueue-followup"
+    4. Otherwise → "run-now"
+    
+    Args:
+        is_active: Whether there's an active run for this session
+        is_heartbeat: Whether this is a heartbeat message
+        should_followup: Whether message should be enqueued as followup
+        queue_mode: Current queue mode setting
+    
+    Returns:
+        Queue action: "run-now", "enqueue-followup", or "drop"
+    """
+    # No active run - run immediately
     if not is_active:
-        if is_heartbeat:
-            return "drop"
         return "run-now"
-
-    # Active run: heartbeat is always silently dropped
+    
+    # Heartbeat messages are always dropped when active
     if is_heartbeat:
         return "drop"
-
-    mode = (queue_settings.mode if queue_settings else None) or "followup"
-
-    # Interrupt mode: abort current run and start fresh
-    if mode == "interrupt":
-        return "interrupt"
-
-    # Steer mode: try to inject directly into the active streaming session
-    if mode in ("steer", "steer-backlog", "steer+backlog"):
-        if is_embedded_pi_run_streaming(session_id):
-            return "steer"
-        # Active but not streaming (e.g. compacting) → fall through to followup
-        if mode == "steer":
-            # Pure steer — enqueue as followup for after run finishes
-            return "enqueue-followup"
-
-    # Default: enqueue as followup when agent is busy
-    if mode in ("followup", "collect", "steer-backlog", "steer+backlog", "queue"):
+    
+    # Followup or steer mode - enqueue for later
+    if should_followup or queue_mode == "steer":
         return "enqueue-followup"
+    
+    # Default: run now (will trigger interrupt if needed)
+    return "run-now"
 
-    return "enqueue-followup"
 
-
-__all__ = ["ActiveRunQueueAction", "resolve_active_run_queue_action"]
+__all__ = [
+    "QueueAction",
+    "QueueMode",
+    "resolve_active_run_queue_action",
+]

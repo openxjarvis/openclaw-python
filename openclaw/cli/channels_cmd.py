@@ -64,12 +64,68 @@ def list_channels(
 @channels_app.command("status")
 def status(
     probe: bool = typer.Option(False, "--probe", help="Probe channel credentials"),
+    deep: bool = typer.Option(False, "--deep", help="Deep probe (includes connectivity tests)"),
     timeout: int = typer.Option(10000, "--timeout", help="Timeout in ms"),
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+    url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
+    token_opt: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
 ):
     """Show channel connection status"""
-    console.print("[yellow]⚠[/yellow]  Channel status probe not yet fully implemented")
-    list_channels(json_output=json_output)
+    if not probe:
+        # No probe, just list configured channels
+        list_channels(json_output=json_output)
+        return
+    
+    # Probe via gateway RPC
+    try:
+        from .gateway_rpc_cli import GatewayRpcOpts, call_gateway_from_cli
+        
+        opts = GatewayRpcOpts(url=url, token=token_opt, timeout=timeout, json_output=json_output)
+        result = call_gateway_from_cli("channels.status", opts, {"probe": True, "deep": deep}, show_progress=False)
+        
+        if json_output:
+            console.print(json.dumps(result, indent=2))
+            return
+        
+        # Display probe results
+        channels = result.get("channels", {})
+        if not channels:
+            console.print("[yellow]No channel status available[/yellow]")
+            return
+        
+        table = Table(title="Channel Status (Probed)")
+        table.add_column("Channel", style="cyan")
+        table.add_column("Status", style="green")
+        table.add_column("Connected", style="yellow")
+        table.add_column("Details", style="dim")
+        
+        for channel_id, info in channels.items():
+            status = info.get("status", "unknown")
+            connected = info.get("connected", False)
+            error = info.get("error", "")
+            
+            # Format status
+            if status == "enabled" and connected:
+                status_str = "[green]✓ Active[/green]"
+            elif status == "enabled":
+                status_str = "[yellow]⚠ Enabled[/yellow]"
+            else:
+                status_str = "[dim]✗ Disabled[/dim]"
+            
+            # Format connected
+            conn_str = "[green]Yes[/green]" if connected else "[red]No[/red]"
+            
+            # Details
+            details = error if error else ""
+            
+            table.add_row(channel_id.capitalize(), status_str, conn_str, details)
+        
+        console.print(table)
+    
+    except Exception as e:
+        console.print(f"[red]Error probing channels:[/red] {e}")
+        console.print("[dim]Hint: Make sure the gateway is running (openclaw start)[/dim]")
+        raise typer.Exit(1)
 
 
 @channels_app.command("add")

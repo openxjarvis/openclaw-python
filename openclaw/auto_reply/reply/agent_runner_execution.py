@@ -387,28 +387,6 @@ def normalize_streaming_text(
     return {"text": sanitized, "skip": False}
 
 
-async def run_cli_agent(*args: Any, **kwargs: Any) -> tuple[str, bool, bool]:
-    """Stub for CLI-backed agent execution (Claude Code, Codex CLI, Gemini CLI, etc.).
-
-    CLI provider routing mirrors TS ``runCliAgent`` called from agent-runner-execution.ts
-    when ``isCliProvider(provider, config)`` is True.
-
-    Full CLI backend integration is out of scope for this port; this stub ensures
-    the routing branch exists so providers that declare a CLI type do not fall
-    through to the embedded Pi runner silently.
-    """
-    provider = kwargs.get("provider") or (args[0] if args else "cli")
-    logger.warning(
-        "run_cli_agent: CLI provider '%s' is not fully implemented in the Python runtime. "
-        "Returning empty result. Set provider to an embedded model to get AI responses.",
-        provider,
-    )
-    raise NotImplementedError(
-        f"CLI provider '{provider}' is not supported in the Python runtime. "
-        "Use an embedded model provider (e.g. anthropic, openai, gemini) instead."
-    )
-
-
 async def run_agent_turn_with_fallback(
     runtime: Any,
     session: Any,
@@ -454,11 +432,51 @@ async def run_agent_turn_with_fallback(
         try:
             from openclaw.agents.model_selection import is_cli_provider
             if is_cli_provider(provider, cfg):
-                return await run_cli_agent(provider=provider, session_key=session_key, run_id=run_id)
+                from openclaw.agents.cli_runner import run_cli_agent as real_run_cli_agent
+                from openclaw.agents.agent_scope import resolve_agent_workspace_dir
+                
+                # Get session information
+                session_id = getattr(session, "session_id", "") or getattr(session, "id", "") or ""
+                agent_id = getattr(session, "agent_id", None) or "main"
+                
+                # Resolve workspace directory
+                workspace_dir = resolve_agent_workspace_dir(cfg, agent_id) if cfg else None
+                if workspace_dir is None:
+                    raise ValueError("Could not resolve workspace directory for CLI agent")
+                
+                # Resolve session file
+                session_file = getattr(session, "session_file", None) or f"/tmp/{session_id}.jsonl"
+                
+                # Call real run_cli_agent with all required parameters
+                result = await real_run_cli_agent(
+                    session_id=session_id,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    session_file=session_file,
+                    workspace_dir=str(workspace_dir),
+                    config=cfg,
+                    prompt=message,
+                    provider=provider,
+                    model=model,
+                    timeout_ms=None,  # Use default
+                    run_id=run_id or session_id,
+                    extra_system_prompt=system_prompt,
+                    cli_session_id=None,  # Will be resolved from session
+                    images=None,  # TODO: Convert images format if needed
+                )
+                
+                # Extract text from result
+                response_text = ""
+                for payload in result.payloads:
+                    if payload.text:
+                        response_text += payload.text
+                
+                return (response_text, False, False)
         except NotImplementedError:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"CLI agent execution failed: {e}", exc_info=True)
+            raise
 
     # ------------------------------------------------------------------
     # Register run context — mirrors TS registerAgentRunContext() called
@@ -733,7 +751,6 @@ async def run_agent_turn_with_fallback(
 __all__ = [
     "run_agent_turn_with_fallback",
     "run_with_model_fallback",
-    "run_cli_agent",
     "reset_session_after_compaction_failure",
     "reset_session_after_role_ordering_conflict",
     "normalize_streaming_text",

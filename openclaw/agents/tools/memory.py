@@ -45,7 +45,8 @@ class MemorySearchTool(AgentTool):
             "Mandatory recall step: semantically search MEMORY.md + memory/*.md "
             "(and optional session transcripts) before answering questions about "
             "prior work, decisions, dates, people, preferences, or todos; "
-            "returns top snippets with path + lines."
+            "returns top snippets with path + lines. "
+            "If response has disabled=true, memory retrieval is unavailable and should be surfaced to the user."
         )
         self.workspace_dir = workspace_dir
         self.config = config

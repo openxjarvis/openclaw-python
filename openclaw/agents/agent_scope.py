@@ -28,11 +28,11 @@ logger = logging.getLogger(__name__)
 _default_agent_warned = False
 
 
-def list_agents(cfg: Any) -> list[Any]:
+def list_agent_entries(cfg: Any) -> list[Any]:
     """
     List all configured agents from config.
     
-    Mirrors TS listAgents() from agent-scope.ts lines 35-41
+    Mirrors TS listAgentEntries() from agent-scope.ts lines 45-51
     
     Args:
         cfg: Configuration object
@@ -55,11 +55,15 @@ def list_agents(cfg: Any) -> list[Any]:
     return [entry for entry in agent_list if entry is not None and hasattr(entry, 'id')]
 
 
+# Alias for compatibility
+list_agents = list_agent_entries
+
+
 def list_agent_ids(cfg: Any) -> list[str]:
     """
     List all configured agent IDs.
     
-    Mirrors TS listAgentIds() from agent-scope.ts lines 43-59
+    Mirrors TS listAgentIds() from agent-scope.ts lines 53-69
     
     Args:
         cfg: Configuration object
@@ -67,7 +71,7 @@ def list_agent_ids(cfg: Any) -> list[str]:
     Returns:
         List of normalized agent IDs (defaults to ["main"] if none configured)
     """
-    agents = list_agents(cfg)
+    agents = list_agent_entries(cfg)
     
     if not agents:
         return [DEFAULT_AGENT_ID]
@@ -121,6 +125,32 @@ def resolve_default_agent_id(cfg: Any) -> str:
     chosen_id = getattr(chosen, 'id', '').strip() if chosen else ''
     
     return normalize_agent_id(chosen_id or DEFAULT_AGENT_ID)
+
+
+def list_agent_workspace_dirs(cfg: Any) -> list[str]:
+    """
+    List all agent workspace directories.
+    
+    Mirrors TS listAgentWorkspaceDirs() from workspace-dirs.ts
+    
+    Args:
+        cfg: Configuration object
+    
+    Returns:
+        List of workspace directory paths for all configured agents
+    """
+    dirs: set[str] = set()
+    
+    # Add all configured agents' workspaces
+    agents = list_agent_entries(cfg)
+    for entry in agents:
+        if entry and hasattr(entry, 'id'):
+            dirs.add(resolve_agent_workspace_dir(cfg, entry.id))
+    
+    # Always include default agent workspace
+    dirs.add(resolve_agent_workspace_dir(cfg, resolve_default_agent_id(cfg)))
+    
+    return list(dirs)
 
 
 def resolve_session_agent_ids(
@@ -445,3 +475,29 @@ def resolve_effective_model_fallbacks(
                     default_fallbacks = model.fallbacks
     
     return agent_fallbacks_override if agent_fallbacks_override is not None else default_fallbacks
+
+
+def list_agent_workspace_dirs(cfg: Any) -> list[str]:
+    """
+    List all agent workspace directories.
+    
+    Mirrors TS listAgentWorkspaceDirs() from workspace-dirs.ts
+    
+    Args:
+        cfg: Configuration object
+    
+    Returns:
+        List of workspace directory paths for all configured agents
+    """
+    dirs: set[str] = set()
+    
+    # Add all configured agents' workspaces
+    agents = list_agent_entries(cfg)
+    for entry in agents:
+        if entry and hasattr(entry, 'id'):
+            dirs.add(resolve_agent_workspace_dir(cfg, entry.id))
+    
+    # Always include default agent workspace
+    dirs.add(resolve_agent_workspace_dir(cfg, resolve_default_agent_id(cfg)))
+    
+    return list(dirs)

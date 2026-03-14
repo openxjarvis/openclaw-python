@@ -10,35 +10,37 @@ logger = logging.getLogger(__name__)
 
 
 class TTSTool(AgentTool):
-    """Convert text to speech using OpenAI or ElevenLabs"""
+    """
+    Convert text to speech using configured TTS providers.
+    
+    Aligned with TypeScript openclaw/src/agents/tools/tts-tool.ts.
+    
+    Supports providers: openai, elevenlabs, google, azure, etc.
+    Audio is delivered automatically from the tool result.
+    """
 
-    def __init__(self, workspace_root: Path | None = None):
+    def __init__(self, workspace_root: Path | None = None, config: dict[str, Any] | None = None):
         super().__init__()
         self.name = "tts"
-        self.description = "Convert text to speech and save as audio file"
+        # Matches TS tts-tool.ts:24 description with SILENT_REPLY_TOKEN hint
+        self.description = (
+            "Convert text to speech. Audio is delivered automatically from the tool result — "
+            "reply with [[SILENT_REPLY]] after a successful call to avoid duplicate messages."
+        )
         self.workspace_root = workspace_root
+        self.config = config or {}
 
     def get_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "Text to convert to speech"},
-                "output_path": {
+                "text": {
                     "type": "string",
-                    "description": "Output file path (relative to workspace)",
-                    "default": "output.mp3",
+                    "description": "Text to convert to speech."
                 },
-                "provider": {
+                "channel": {
                     "type": "string",
-                    "enum": ["openai", "elevenlabs"],
-                    "description": "TTS provider",
-                    "default": "openai",
-                },
-                "voice": {"type": "string", "description": "Voice ID or name", "default": "alloy"},
-                "model": {
-                    "type": "string",
-                    "description": "Model to use (provider-specific)",
-                    "default": "tts-1",
+                    "description": "Optional channel id to pick output format (e.g. telegram)."
                 },
             },
             "required": ["text"],

@@ -356,15 +356,16 @@ def build_workspace_files_note_section() -> list[str]:
 
 
 def build_reply_tags_section(is_minimal: bool) -> list[str]:
-    """Build the Reply Tags section (matches TS lines 82-94)."""
+    """Build the Reply Tags section (matches TS lines 103-117)."""
     if is_minimal:
         return []
 
     return [
         "## Reply Tags",
         "To request a native reply/quote on supported surfaces, include one tag in your reply:",
+        "- Reply tags must be the very first token in the message (no leading text/newlines): [[reply_to_current]] your reply.",
         "- [[reply_to_current]] replies to the triggering message.",
-        "- [[reply_to:<id>]] replies to a specific message id when you have it.",
+        "- Prefer [[reply_to_current]]. Use [[reply_to:<id>]] only when an id was explicitly provided (e.g. by the user or a tool).",
         "Whitespace inside the tag is allowed (e.g. [[ reply_to_current ]] / [[ reply_to: 123 ]]).",
         "Tags are stripped before sending; support depends on the current channel config.",
         "",
@@ -379,28 +380,17 @@ def build_messaging_section(
     runtime_channel: str | None = None,
     message_tool_hints: list[str] | None = None,
 ) -> list[str]:
-    """Build the Messaging section (matches TS lines 97-133)."""
+    """Build the Messaging section (matches TS lines 119-157)."""
     if is_minimal:
         return []
 
     lines = [
         "## Messaging",
-        "- Reply in current session → automatically routes to the source channel "
-        "(Signal, Telegram, etc.)",
+        "- Reply in current session → automatically routes to the source channel (Signal, Telegram, etc.)",
         "- Cross-session messaging → use sessions_send(sessionKey, message)",
-        "- Never use bash/curl for provider messaging; OpenClaw handles all routing internally.",
-        "",
-        "### Sending Files / Media",
-        "To deliver a file (image, document, audio, video) to the user via Telegram, include a",
-        "`MEDIA:` token on its own line anywhere in your reply:",
-        "```",
-        "MEDIA:/absolute/path/to/file.pptx",
-        "MEDIA:~/documents/report.pdf",
-        "MEDIA:https://example.com/photo.jpg",
-        "```",
-        "- The `MEDIA:` line is **stripped from the text** before sending; only the file is attached.",
-        "- You can include multiple `MEDIA:` lines to send multiple files.",
-        "- **Without a `MEDIA:` line the file is never sent** — do NOT say 'I sent the file' without it.",
+        "- Sub-agent orchestration → use subagents(action=list|steer|kill)",
+        f"- Runtime-generated completion events may ask for a user update. Rewrite those in your normal assistant voice and send the update (do not forward raw internal metadata or default to {SILENT_REPLY_TOKEN}).",
+        "- Never use exec/curl for provider messaging; OpenClaw handles all routing internally.",
     ]
 
     if "message" in available_tools:
@@ -419,7 +409,7 @@ def build_messaging_section(
         if inline_buttons_enabled:
             lines.append(
                 "- Inline buttons supported. Use `action=send` with "
-                '`buttons=[[{text,callback_data}]]` (callback_data routes back as a user message).'
+                '`buttons=[[{text,callback_data,style?}]]`; `style` can be `primary`, `success`, or `danger`.'
             )
         elif runtime_channel:
             lines.append(

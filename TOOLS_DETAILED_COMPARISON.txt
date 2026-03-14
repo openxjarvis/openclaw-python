@@ -1,0 +1,150 @@
+# 工具详细对比
+
+## 1. 错误处理机制
+
+### TypeScript
+- ToolInputError (status: 400) - 参数错误
+- ToolAuthorizationError (status: 403) - 权限错误
+- OWNER_ONLY_TOOL_ERROR - 仅所有者工具
+
+### Python  
+- ❌ 无专门的错误类
+- 使用 ToolResult(success=False, error="...")
+- 无法区分 400 vs 403 错误
+
+## 2. 工具参数验证
+
+### TypeScript
+```typescript
+// 使用 TypeBox 进行强类型验证
+parameters: Type.Object({
+  task: Type.String(),
+  timeout: Type.Number({ minimum: 0 }),
+  ...
+})
+
+// 运行时验证
+readStringParam(params, "task", { required: true });
+readNumberParam(params, "timeout", { min: 0 });
+```
+
+### Python
+```python
+# 使用 JSON Schema
+{
+    "type": "object",
+    "properties": {
+        "task": {"type": "string"},
+        "timeout": {"type": "number", "minimum": 0},
+    },
+    "required": ["task"]
+}
+
+# 运行时手动验证
+task = params.get("task")
+if not task:
+    return ToolResult(success=False, ...)
+```
+
+## 3. Sessions Spawn 工具对比
+
+### 参数对齐度: 95%
+
+| 参数 | TS | Python | 对齐 |
+|------|----|---------| -----|
+| task | ✅ | ✅ | ✅ |
+| label | ✅ | ✅ | ✅ |
+| runtime | ✅ | ❌ | ⚠️ |
+| agentId | ✅ | ✅ | ✅ |
+| model | ✅ | ✅ | ✅ |
+| thinking | ✅ | ✅ | ✅ |
+| cwd | ✅ | ❌ | ⚠️ |
+| runTimeoutSeconds | ✅ | ✅ | ✅ |
+| timeoutSeconds | ✅ (兼容) | ❌ | ⚠️ |
+| thread | ✅ | ✅ | ✅ |
+| mode | ✅ | ✅ | ✅ |
+| cleanup | ✅ | ✅ | ✅ |
+| sandbox | ✅ | ✅ | ✅ |
+| attachments | ✅ | ❌ | ⚠️ |
+| attachAs | ✅ | ❌ | ⚠️ |
+
+**缺失参数**:
+- runtime (subagent/acp 选择)
+- cwd (工作目录覆盖)
+- timeoutSeconds (向后兼容)
+- attachments (内联附件)
+- attachAs (附件挂载)
+
+## 4. Subagents 工具对比
+
+### 参数对齐度: 100% ✅
+
+| 参数 | TS | Python | 对齐 |
+|------|----|---------| -----|
+| action | ✅ | ✅ | ✅ |
+| target | ✅ | ✅ | ✅ |
+| message | ✅ | ✅ | ✅ |
+| recentMinutes | ✅ | ✅ | ✅ |
+
+**对齐**: 完全一致
+
+## 5. Image 工具对比
+
+### TypeScript 参数
+```typescript
+{
+  prompt?: string,
+  image?: string,     // 单个图像
+  images?: string[],  // 多个图像（最多 20）
+  model?: string,
+  maxBytesMb?: number,
+  maxImages?: number,
+}
+```
+
+### Python 参数
+```python
+{
+  "image": string,     # 必需
+  "prompt": string,    # 必需
+  "model": string,
+}
+```
+
+**差异**:
+- ❌ Python 缺少 `images` 数组参数（多图像支持）
+- ❌ Python 缺少 `maxBytesMb` 参数
+- ❌ Python 缺少 `maxImages` 参数
+- ⚠️ Python 将 prompt 设为必需，TS 为可选
+
+## 6. Memory 工具对比
+
+### 对齐度: 100% ✅
+
+| 参数 | TS | Python | 对齐 |
+|------|----|---------| -----|
+| query | ✅ | ✅ | ✅ |
+| maxResults | ✅ | ✅ | ✅ |
+| minScore | ✅ | ✅ | ✅ |
+
+**对齐**: 完全一致
+
+## 7. Web 工具对比
+
+### Web Search
+- ✅ 参数对齐
+- ✅ 功能对齐
+
+### Web Fetch
+- ✅ 参数对齐
+- ✅ 功能对齐
+
+## 8. Gateway 工具对比
+
+### 对齐度: 100% ✅
+
+两个版本均支持：
+- method (gateway 方法调用)
+- params (方法参数)
+- raw (原始响应)
+

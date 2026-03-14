@@ -311,6 +311,27 @@ def get_subagent_depth_from_session_store(
     return fallback_depth
 
 
+def resolve_spawn_mode(
+    requested_mode: SpawnSubagentMode | None,
+    thread_requested: bool,
+) -> SpawnSubagentMode:
+    """
+    Resolve spawn mode based on requested mode and thread setting.
+    
+    Mirrors TS resolveSpawnMode (subagent-spawn.ts:164-171).
+    
+    Args:
+        requested_mode: Explicitly requested mode ("run" or "session")
+        thread_requested: Whether thread binding is requested
+    
+    Returns:
+        Resolved spawn mode
+    """
+    if requested_mode in ("run", "session"):
+        return requested_mode
+    return "session" if thread_requested else "run"
+
+
 async def spawn_subagent_direct(
     params: SpawnSubagentParams,
     ctx: SpawnSubagentContext,
@@ -335,10 +356,23 @@ async def spawn_subagent_direct(
     """
     from openclaw.config.unified import load_config
     from openclaw.auto_reply.reply.thinking import normalize_think_level, format_thinking_levels
+    import base64
+    import hashlib
     
     # Load config if not provided
     if cfg is None:
         cfg = load_config()
+    
+    # Resolve spawn mode (mirrors TS lines 268-274)
+    mode = resolve_spawn_mode(params.mode, params.thread)
+    
+    # Validate mode + thread combination (TS lines 268-274)
+    # mode="session" REQUIRES thread=true
+    if mode == "session" and not params.thread:
+        return SpawnSubagentResult(
+            status="error",
+            error="mode 'session' requires thread=true for binding",
+        )
     
     # Validate parameters
     task = params.task
@@ -347,6 +381,11 @@ async def spawn_subagent_direct(
     model_override = params.model
     thinking_override_raw = params.thinking
     cleanup = params.cleanup if params.cleanup in ("keep", "delete") else "keep"
+    
+    # Parse attachments (matches TS lines 504-537)
+    attachments = params.attachments or []
+    attachments_enabled = cfg.get("tools", {}).get("sessions_spawn", {}).get("attachments", {}).get("enabled", False)
+    mount_path_hint = params.attachMountPath or "attachments"
     
     # Normalize delivery context (mirrors TS lines 81-86)
     requester_origin = normalize_delivery_context(
@@ -432,20 +471,30 @@ async def spawn_subagent_direct(
     
     # Active children limit (mirrors TS lines 118-125)
     max_children = 5  # Default
+    archive_after_minutes = 60  # Default
     if hasattr(cfg, "agents") and hasattr(cfg.agents, "defaults"):
         defaults = cfg.agents.defaults
         if hasattr(defaults, "subagents"):
             subagents_cfg = defaults.subagents
             if isinstance(subagents_cfg, dict):
                 max_children = subagents_cfg.get("maxChildrenPerAgent", 5)
+                archive_after_minutes = subagents_cfg.get("archiveAfterMinutes", 60)
             elif hasattr(subagents_cfg, "maxChildrenPerAgent"):
                 max_children = subagents_cfg.maxChildrenPerAgent or 5
+                if hasattr(subagents_cfg, "archiveAfterMinutes"):
+                    archive_after_minutes = subagents_cfg.archiveAfterMinutes or 60
     elif isinstance(cfg, dict):
         max_children = (
             cfg.get("agents", {})
             .get("defaults", {})
             .get("subagents", {})
             .get("maxChildrenPerAgent", 5)
+        )
+        archive_after_minutes = (
+            cfg.get("agents", {})
+            .get("defaults", {})
+            .get("subagents", {})
+            .get("archiveAfterMinutes", 60)
         )
     
     # Count active children (requires registry)
@@ -505,8 +554,8 @@ async def spawn_subagent_direct(
                 error=f"agentId is not allowed for sessions_spawn (allowed: {allowed_text})",
             )
     
-    # Validate mode (mirrors TS lines ~148-155)
-    mode = params.mode if params.mode in SUBAGENT_SPAWN_MODES else "run"
+    # Validate mode (already resolved earlier via resolve_spawn_mode)
+    # mode = params.mode if params.mode in SUBAGENT_SPAWN_MODES else "run"  # REMOVED: already done
     sandbox_mode: SpawnSubagentSandboxMode = "require" if params.sandbox == "require" else "inherit"
 
     # Generate child session key (mirrors TS line 148)
@@ -698,7 +747,7 @@ async def spawn_subagent_direct(
         # Resolve workspace dir for target agent
         workspace_dir = os.path.expanduser("~")
         try:
-            from openclaw.agents.workspace import resolve_agent_workspace_dir
+            from openclaw.agents.agent_scope import resolve_agent_workspace_dir
             workspace_dir = resolve_agent_workspace_dir(cfg, target_agent_id) or workspace_dir
         except ImportError:
             pass
@@ -805,13 +854,15 @@ async def spawn_subagent_direct(
     from openclaw.agents.subagent_announce import build_subagent_system_prompt
 
     child_system_prompt = build_subagent_system_prompt(
+        task=task,
+        child_depth=child_depth,
+        mode=mode,
+        max_spawn_depth=max_spawn_depth,
         requester_session_key=requester_session_key,
         requester_origin=requester_origin,
         child_session_key=child_session_key,
         label=label or None,
-        task=task,
-        child_depth=child_depth,
-        max_spawn_depth=max_spawn_depth,
+        acp_enabled=cfg.acp.enabled if hasattr(cfg, 'acp') and hasattr(cfg.acp, 'enabled') else False,
     )
     
     # Append attachment hint to system prompt (mirrors TS lines 669-673)
@@ -920,6 +971,7 @@ async def spawn_subagent_direct(
         model=resolved_model,
         run_timeout_seconds=run_timeout_seconds if run_timeout_seconds > 0 else None,
         expects_completion_message=params.expectsCompletionMessage,
+        archive_after_minutes=archive_after_minutes,
     )
     
     # Fire subagent_spawned plugin hook (mirrors TS subagentSpawnedHook)

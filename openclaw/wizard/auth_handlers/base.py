@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from ..auth_choice_types import AuthChoice
-    from ...config.schema import ClawdbotConfig
+    from ...config.schema import OpenClawConfig
 
 
 @dataclass
@@ -21,7 +21,7 @@ class ApplyAuthChoiceResult:
         config: Updated configuration
         agent_model_override: Optional model override for specific agent
     """
-    config: "ClawdbotConfig"
+    config: "OpenClawConfig"
     agent_model_override: str | None = None
 
 
@@ -40,7 +40,7 @@ class AuthChoiceHandler(Protocol):
     async def __call__(
         self,
         auth_choice: AuthChoice,
-        config: ClawdbotConfig,
+        config: OpenClawConfig,
         set_default_model: bool = True,
         agent_dir: str | None = None,
         agent_id: str | None = None,
@@ -65,7 +65,7 @@ class AuthChoiceHandler(Protocol):
 async def apply_auth_choice_chain(
     handlers: list[AuthChoiceHandler],
     auth_choice: AuthChoice,
-    config: ClawdbotConfig,
+    config: OpenClawConfig,
     set_default_model: bool = True,
     agent_dir: str | None = None,
     agent_id: str | None = None,

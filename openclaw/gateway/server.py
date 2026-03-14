@@ -59,7 +59,7 @@ from openclaw.gateway.error_codes import (
 )
 from openclaw.gateway.protocol.validators import validate_method_params
 
-from ..config import ClawdbotConfig
+from ..config import OpenClawConfig
 from ..events import Event
 from .channel_manager import ChannelManager, discover_channel_plugins
 from .handlers import get_method_handler
@@ -78,7 +78,7 @@ class GatewayConnection:
     def __init__(
         self,
         websocket: web.WebSocketResponse,
-        config: ClawdbotConfig,
+        config: OpenClawConfig,
         gateway: "GatewayServer" = None,
         remote_addr: str = "",
         headers: dict[str, str] | None = None,
@@ -465,7 +465,7 @@ class GatewayServer:
     - WebSocket is for external clients only
 
     Example:
-        config = ClawdbotConfig(...)
+        config = OpenClawConfig(...)
         gateway = GatewayServer(config, agent_runtime, session_manager)
 
         # Register channels
@@ -478,7 +478,7 @@ class GatewayServer:
 
     def __init__(
         self,
-        config: ClawdbotConfig,
+        config: OpenClawConfig,
         agent_runtime=None,
         session_manager=None,
         tools=None,
@@ -803,12 +803,12 @@ class GatewayServer:
 
     async def serve_control_ui(self, request: web.Request) -> web.Response:
         """Serve Control UI index.html"""
-        ui_dir = Path(__file__).parent.parent / "web" / "dist" / "control-ui"
+        ui_dir = Path(__file__).parent.parent.parent / "ui" / "dist"
         index_path = ui_dir / "index.html"
         
         if not index_path.exists():
             return web.Response(
-                text="Control UI not built. Run: cd openclaw/web/ui-src && npm run build",
+                text="Control UI not built. Run: cd ui && npm install && npm run build",
                 status=503,
                 content_type="text/plain"
             )
@@ -822,7 +822,7 @@ class GatewayServer:
 
     async def serve_control_ui_spa(self, request: web.Request) -> web.Response:
         """SPA fallback: serve static files or index.html"""
-        ui_dir = Path(__file__).parent.parent / "web" / "dist" / "control-ui"
+        ui_dir = Path(__file__).parent.parent.parent / "ui" / "dist"
         path = request.match_info.get('path', '')
         
         # Check if static file exists
@@ -1075,7 +1075,10 @@ class GatewayServer:
         app = web.Application()
         
         # Register routes (matches openclaw-ts architecture)
-        ui_enabled = getattr(self.config.gateway, 'enable_web_ui', True)
+        # enable_web_ui defaults to True if not explicitly set to False
+        ui_enabled = getattr(self.config.gateway, 'enable_web_ui', None)
+        if ui_enabled is None:
+            ui_enabled = True
         
         # ------------------------------------------------------------------
         # OpenAI-compatible HTTP endpoints

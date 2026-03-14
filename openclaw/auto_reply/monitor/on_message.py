@@ -167,7 +167,7 @@ def create_message_handler(
         # TS line 68: cfg: loadConfig() — reloads on every message for dynamic binding updates.
         # TS line 70: accountId: msg.accountId — reads account from message, not closure.
         # ------------------------------------------------------------------
-        from openclaw.config.config import load_config
+        from openclaw.config.loader import load_config
         fresh_cfg = load_config()
         
         peer_id = _resolve_peer_id(msg)

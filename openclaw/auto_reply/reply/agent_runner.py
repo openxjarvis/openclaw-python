@@ -97,59 +97,96 @@ async def run_prepared_reply(ctx: ReplyContext) -> None:
     in background tasks via the session command lane.
 
     Mirrors TS ``runPreparedReply`` / ``runReplyAgent``.
+    
+    Flow matches TS get-reply-run.ts lines 436-547:
+    1. Interrupt preprocessing (if mode is "interrupt")
+    2. Steer preprocessing (if mode is "steer" or "steer-backlog")
+    3. Queue policy decision (run-now, enqueue-followup, drop)
+    4. Execute action
     """
     from openclaw.auto_reply.reply.queue_policy import resolve_active_run_queue_action
     from openclaw.auto_reply.reply.queue import QueueSettings, enqueue_followup_run, FollowupRun
+    from openclaw.agents.active_runs import (
+        is_embedded_pi_run_active,
+        is_embedded_pi_run_streaming,
+        abort_embedded_pi_run,
+        queue_embedded_pi_message,
+    )
 
     queue_settings: Any = ctx.queue_settings or QueueSettings()
-    action = resolve_active_run_queue_action(
-        ctx.session_id,
-        queue_settings,
-    )
-
-    logger.debug(
-        "run_prepared_reply: session=%s action=%s", ctx.session_id[:8], action
-    )
-
-    if action == "drop":
-        logger.debug("run_prepared_reply: dropping message (heartbeat or explicit drop)")
-        if ctx.typing_ctrl:
-            ctx.typing_ctrl.mark_run_complete()
-            ctx.typing_ctrl.mark_dispatch_idle()
-        return
-
-    if action == "steer":
-        from openclaw.agents.pi_embedded import queue_embedded_pi_message
+    mode = getattr(queue_settings, 'mode', 'followup')
+    
+    # Check active state
+    is_active = is_embedded_pi_run_active(ctx.session_id)
+    is_streaming = is_embedded_pi_run_streaming(ctx.session_id)
+    
+    # ---------------------------------------------------------------------------
+    # STEP 1: Interrupt preprocessing (matches TS lines 438-442)
+    # ---------------------------------------------------------------------------
+    if mode == "interrupt":
+        from openclaw.auto_reply.reply.queue import clear_session_queues
+        # Abort active run and clear queue
+        aborted = abort_embedded_pi_run(ctx.session_id)
+        cleared_keys = clear_session_queues([ctx.session_key])
+        logger.info(
+            "run_prepared_reply: interrupted session=%s (aborted=%s, cleared=%d queues)",
+            ctx.session_id[:8],
+            aborted,
+            len(cleared_keys),
+        )
+        # After interrupt, continue to run-now (don't return early)
+        is_active = False  # Reset state after abort
+    
+    # ---------------------------------------------------------------------------
+    # STEP 2: Steer preprocessing (matches TS lines 446-450, 191-198)
+    # ---------------------------------------------------------------------------
+    should_steer = mode in ("steer", "steer-backlog", "steer+backlog")
+    should_followup = mode in ("followup", "collect", "steer-backlog", "steer+backlog")
+    
+    if should_steer and is_streaming:
+        # Try to inject steering message into active run
         steered = queue_embedded_pi_message(ctx.session_id, ctx.message_text)
         if steered:
             logger.info(
                 "run_prepared_reply: steered message into active run for %s",
                 ctx.session_id[:8],
             )
-            # steer-backlog dual action: mirrors TS shouldSteer && shouldFollowup.
-            # When mode is "steer-backlog", steer the active run AND also enqueue
-            # the message as a followup so it is re-processed after the run ends.
-            mode = (ctx.queue_settings.mode if ctx.queue_settings else None) or "followup"
-            if mode not in ("steer-backlog", "steer+backlog"):
+            # steer-backlog: steer AND enqueue for later reprocessing
+            if not should_followup:
                 if ctx.typing_ctrl:
                     ctx.typing_ctrl.mark_run_complete()
                     ctx.typing_ctrl.mark_dispatch_idle()
                 return
-            # Fall through to enqueue-followup for steer-backlog modes
-        # Steer failed (not streaming) — fall through to enqueue
-        action = "enqueue-followup"
+            # Fall through to enqueue for steer-backlog modes
+    
+    # ---------------------------------------------------------------------------
+    # STEP 3: Queue policy decision (matches TS lines 200-206)
+    # ---------------------------------------------------------------------------
+    is_heartbeat = False  # TODO: detect heartbeat messages
+    
+    action = resolve_active_run_queue_action(
+        is_active=is_active,
+        is_heartbeat=is_heartbeat,
+        should_followup=should_followup,
+        queue_mode=mode,
+    )
 
-    if action == "interrupt":
-        from openclaw.agents.pi_embedded import abort_embedded_pi_run
-        from openclaw.auto_reply.reply.queue import clear_session_queues
-        abort_embedded_pi_run(ctx.session_id)
-        clear_session_queues([ctx.session_key])
-        logger.info(
-            "run_prepared_reply: interrupted active run for %s",
-            ctx.session_id[:8],
-        )
-        # After abort, run immediately (fall through to "run-now")
-        action = "run-now"
+    logger.debug(
+        "run_prepared_reply: session=%s mode=%s action=%s", 
+        ctx.session_id[:8], 
+        mode,
+        action
+    )
+
+    # ---------------------------------------------------------------------------
+    # STEP 4: Execute action
+    # ---------------------------------------------------------------------------
+    if action == "drop":
+        logger.debug("run_prepared_reply: dropping message (heartbeat or explicit drop)")
+        if ctx.typing_ctrl:
+            ctx.typing_ctrl.mark_run_complete()
+            ctx.typing_ctrl.mark_dispatch_idle()
+        return
 
     if action == "enqueue-followup":
         run = FollowupRun(

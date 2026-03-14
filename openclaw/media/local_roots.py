@@ -1,159 +1,148 @@
-"""Media local roots configuration.
-
-Mirrors TypeScript src/media/local-roots.ts
-Provides functions to resolve allowed local directories for media access.
-"""
-
-from __future__ import annotations
+"""Media local roots resolution (mirrors TS local-roots.ts)."""
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
-
-_cached_preferred_tmp_dir: Optional[str] = None
-
-
-def _resolve_cached_preferred_tmp_dir() -> str:
-    """Resolve and cache preferred OpenClaw temp directory.
-    
-    Mirrors TS resolveCachedPreferredTmpDir() lines 13-18.
-    """
-    global _cached_preferred_tmp_dir
-    if _cached_preferred_tmp_dir is None:
-        from openclaw.config.paths import resolve_preferred_openclaw_tmp_dir
-        _cached_preferred_tmp_dir = resolve_preferred_openclaw_tmp_dir()
-    return _cached_preferred_tmp_dir
+from openclaw.agents.agent_scope import resolve_agent_workspace_dir
 
 
 def build_media_local_roots(
-    state_dir: str,
-    preferred_tmp_dir: Optional[str] = None,
+    state_dir: str | Path,
+    preferred_tmp_dir: str | Path | None = None,
 ) -> list[str]:
-    """Build standard media local roots list.
+    """
+    Build list of media local roots.
     
-    Mirrors TS buildMediaLocalRoots() from lines 20-33.
+    Mirrors TS buildMediaLocalRoots from src/media/local-roots.ts:20-33
     
     Args:
-        state_dir: State directory path (typically ~/.openclaw)
-        preferred_tmp_dir: Optional preferred temp dir override
+        state_dir: The state directory (e.g., ~/.openclaw)
+        preferred_tmp_dir: Optional preferred temp directory
     
     Returns:
-        List of allowed root directories for media access
+        List of root directory paths as strings
     """
-    resolved_state_dir = os.path.abspath(state_dir)
-    tmp_dir = preferred_tmp_dir if preferred_tmp_dir is not None else _resolve_cached_preferred_tmp_dir()
+    resolved_state_dir = Path(state_dir).resolve()
+    
+    if preferred_tmp_dir is None:
+        # Use system temp directory
+        preferred_tmp_dir = Path(os.environ.get("TMPDIR", "/tmp")).resolve()
+    else:
+        preferred_tmp_dir = Path(preferred_tmp_dir).resolve()
     
     return [
-        tmp_dir,
-        os.path.join(resolved_state_dir, "media"),
-        os.path.join(resolved_state_dir, "agents"),
-        os.path.join(resolved_state_dir, "workspace"),
-        os.path.join(resolved_state_dir, "sandboxes"),
+        str(preferred_tmp_dir),
+        str(resolved_state_dir / "media"),
+        str(resolved_state_dir / "agents"),
+        str(resolved_state_dir / "workspace"),
+        str(resolved_state_dir / "sandboxes"),
     ]
 
 
 def get_default_media_local_roots() -> list[str]:
-    """Get default media local roots (no agent-specific workspace).
-    
-    Mirrors TS getDefaultMediaLocalRoots() lines 35-37.
     """
-    from openclaw.config.paths import resolve_state_dir
-    return build_media_local_roots(resolve_state_dir())
+    Get default media local roots.
+    
+    Mirrors TS getDefaultMediaLocalRoots from src/media/local-roots.ts:35-37
+    
+    Returns:
+        List of default root directory paths as strings
+    """
+    state_dir = Path.home() / ".openclaw"
+    return build_media_local_roots(state_dir)
 
 
 def get_agent_scoped_media_local_roots(
-    cfg: dict | None,
-    agent_id: Optional[str] = None,
+    cfg: Any,
+    agent_id: str | None = None,
 ) -> list[str]:
-    """Get media local roots including agent-specific workspace.
+    """
+    Get agent-scoped media local roots.
     
-    Mirrors TS getAgentScopedMediaLocalRoots() from lines 39-56.
+    Mirrors TS getAgentScopedMediaLocalRoots from src/media/local-roots.ts:39-56
     
-    When agent_id is provided, includes the agent's workspace directory
-    in the allowed roots list (if not already included).
+    Returns list of root directory paths as strings representing allowed media roots:
+    - System tmp directory
+    - ~/.openclaw/media
+    - ~/.openclaw/agents
+    - ~/.openclaw/workspace
+    - ~/.openclaw/sandboxes
+    - Agent-specific workspace (if agent_id provided)
     
     Args:
-        cfg: OpenClaw config dict
-        agent_id: Agent identifier (optional)
+        cfg: Configuration object (OpenClawConfig)
+        agent_id: Optional agent identifier to include agent-specific workspace
     
     Returns:
-        List of allowed root directories for media access
+        List of root directory paths as strings
+    
+    Examples:
+        >>> cfg = load_config()
+        >>> roots = get_agent_scoped_media_local_roots(cfg, "main")
+        >>> for root in roots:
+        ...     print(root)
+        /tmp
+        /Users/user/.openclaw/media
+        /Users/user/.openclaw/agents
+        /Users/user/.openclaw/workspace
+        /Users/user/.openclaw/sandboxes
+        /Users/user/.openclaw/workspaces/main
     """
-    from openclaw.config.paths import resolve_state_dir
+    state_dir = Path.home() / ".openclaw"
     
-    roots = build_media_local_roots(resolve_state_dir())
+    # Build base roots using build_media_local_roots
+    roots_list = build_media_local_roots(state_dir)
     
-    if not agent_id or not agent_id.strip():
-        return roots
+    # Add agent-specific workspace if provided
+    if agent_id and agent_id.strip():
+        try:
+            workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
+            if workspace_dir:
+                normalized_workspace_dir = str(Path(workspace_dir).resolve())
+                # Only add if not already in roots
+                if normalized_workspace_dir not in roots_list:
+                    roots_list.append(normalized_workspace_dir)
+        except Exception:
+            # If workspace resolution fails, continue with base roots
+            pass
     
-    # Resolve agent workspace directory
-    workspace_dir = _resolve_agent_workspace_dir(cfg, agent_id)
-    if not workspace_dir:
-        return roots
-    
-    # Normalize and add if not already present
-    normalized_workspace_dir = os.path.abspath(workspace_dir)
-    if normalized_workspace_dir not in roots:
-        roots.append(normalized_workspace_dir)
-    
-    return roots
+    return roots_list
 
 
-def _resolve_agent_workspace_dir(cfg: dict | None, agent_id: str) -> Optional[str]:
-    """Resolve agent workspace directory.
+def is_path_in_allowed_roots(
+    path: Path,
+    allowed_roots: list[Path],
+) -> bool:
+    """
+    Check if a path is within any of the allowed roots.
     
-    Mirrors TS resolveAgentWorkspaceDir() from agent-scope.ts lines 255-271.
-    
-    Resolution order:
-    1. Agent-specific config: cfg.agents[agent_id].workspace
-    2. Default agent fallback: cfg.agents.defaults.workspace
-    3. State dir fallback: {state_dir}/workspace-{agent_id}
+    Mirrors TS assertLocalMediaAllowed logic.
     
     Args:
-        cfg: OpenClaw config dict
-        agent_id: Agent identifier
+        path: The path to check (must be absolute and resolved)
+        allowed_roots: List of allowed root directories
     
     Returns:
-        Absolute workspace directory path, or None if cannot be resolved
+        True if path is within any allowed root, False otherwise
     """
-    from openclaw.config.paths import resolve_state_dir, resolve_user_path
-    from openclaw.routing.session_key import normalize_agent_id
+    try:
+        path_resolved = path.resolve()
+    except Exception:
+        return False
     
-    if not cfg or not agent_id:
-        return None
+    path_str = str(path_resolved)
     
-    normalized_id = normalize_agent_id(agent_id)
-    
-    # 1. Check agent-specific config
-    agents = cfg.get("agents", {})
-    agent_config = agents.get(normalized_id, {})
-    configured = agent_config.get("workspace", "").strip()
-    if configured:
-        return resolve_user_path(configured)
-    
-    # 2. Check if this is the default agent
-    default_agent_id = cfg.get("agent", "").strip() or "default"
-    if normalized_id == normalize_agent_id(default_agent_id):
-        fallback = agents.get("defaults", {}).get("workspace", "").strip()
-        if fallback:
-            return resolve_user_path(fallback)
+    for root in allowed_roots:
+        try:
+            root_resolved = root.resolve()
+        except Exception:
+            continue
         
-        # Use environment-based default workspace
-        default_workspace = os.environ.get("OPENCLAW_WORKSPACE")
-        if default_workspace:
-            return os.path.abspath(default_workspace)
+        root_str = str(root_resolved)
         
-        # Final fallback to ~/.openclaw/workspace
-        return os.path.join(resolve_state_dir(), "workspace")
+        # Path must be strictly under (or equal to) an allowed root
+        if path_str == root_str or path_str.startswith(root_str + os.sep):
+            return True
     
-    # 3. Per-agent workspace in state dir
-    state_dir = resolve_state_dir()
-    return os.path.join(state_dir, f"workspace-{normalized_id}")
-
-
-__all__ = [
-    "build_media_local_roots",
-    "get_default_media_local_roots",
-    "get_agent_scoped_media_local_roots",
-]
+    return False

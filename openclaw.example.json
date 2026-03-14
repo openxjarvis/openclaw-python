@@ -1,0 +1,120 @@
+{
+  "$schema": "./schema.json",
+  "meta": {
+    "lastTouchedVersion": "0.1.0",
+    "lastTouchedAt": "2026-03-14T12:00:00Z"
+  },
+  
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace",
+      "model": "anthropic/claude-opus-4-5-20250514",
+      "models": {
+        "fast": {
+          "alias": "anthropic/claude-sonnet-3-5-20241022",
+          "params": {
+            "cacheRetention": "ephemeral"
+          },
+          "streaming": true
+        },
+        "smart": {
+          "alias": "anthropic/claude-opus-4-5-20250514",
+          "streaming": true
+        }
+      },
+      "maxConcurrent": 4
+    },
+    "list": [
+      {
+        "id": "main",
+        "default": true,
+        "name": "Main Agent"
+      }
+    ]
+  },
+  
+  "cron": {
+    "enabled": true,
+    "store": "~/.openclaw/cron/jobs.json",
+    "maxConcurrentRuns": 2,
+    "retry": {
+      "maxAttempts": 3,
+      "backoffMs": [30000, 60000, 300000],
+      "retryOn": ["rate_limit", "network", "timeout"]
+    },
+    "sessionRetention": "24h",
+    "runLog": {
+      "maxBytes": "2mb",
+      "keepLines": 2000
+    },
+    "failureAlert": {
+      "enabled": true,
+      "after": 2,
+      "cooldownMs": 3600000,
+      "mode": "announce"
+    },
+    "failureDestination": {
+      "channel": "telegram",
+      "mode": "announce"
+    }
+  },
+  
+  "ui": {
+    "seamColor": "#0066cc",
+    "assistant": {
+      "name": "OpenClaw Assistant",
+      "avatar": "🤖"
+    }
+  },
+  
+  "update": {
+    "channel": "stable",
+    "checkOnStart": true,
+    "auto": {
+      "enabled": false,
+      "stableDelayHours": 6,
+      "stableJitterHours": 12,
+      "betaCheckIntervalHours": 1
+    }
+  },
+  
+  "env": {
+    "shellEnv": {
+      "enabled": false,
+      "timeoutMs": 15000
+    },
+    "vars": {
+      "EXAMPLE_VAR": "example_value"
+    }
+  },
+  
+  "messages": {
+    "messagePrefix": "> ",
+    "responsePrefix": "auto",
+    "ackReaction": "👀",
+    "ackReactionScope": "group-mentions",
+    "removeAckAfterReply": true,
+    "suppressToolErrors": false
+  },
+  
+  "session": {
+    "dmScope": "per-channel-peer",
+    "mainKey": "main",
+    "parentForkMaxTokens": 100000
+  },
+  
+  "gateway": {
+    "port": 18789,
+    "bind": "loopback",
+    "mode": "local",
+    "controlUi": {
+      "enabled": true,
+      "dangerouslyDisableDeviceAuth": false
+    }
+  },
+  
+  "logging": {
+    "level": "INFO",
+    "format": "colored"
+  }
+}

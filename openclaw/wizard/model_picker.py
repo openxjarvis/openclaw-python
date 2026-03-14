@@ -7,7 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ..config.schema import ClawdbotConfig
+    from ..config.schema import OpenClawConfig
 
 from . import prompter
 
@@ -20,7 +20,7 @@ VLLM_VALUE = "__vllm__"
 
 
 async def prompt_default_model(
-    config: ClawdbotConfig,
+    config: OpenClawConfig,
     allow_keep: bool = True,
     include_manual: bool = True,
     include_vllm: bool = False,
@@ -242,7 +242,7 @@ async def prompt_default_model(
 
 
 async def prompt_model_allowlist(
-    config: ClawdbotConfig,
+    config: OpenClawConfig,
     message: str | None = None,
 ) -> dict[str, Any]:
     """Multi-select model whitelist for /model picker

@@ -3122,16 +3122,67 @@ class TelegramChannel(ChannelPlugin):
                 return
 
         # Ack reaction — send 👀 while processing (mirrors TS ackReaction/ackReactionScope)
-        if self._config:
-            ack_reaction_scope = self._config.get("ackReactionScope") or self._config.get("ackReaction")
-            ack_emoji = self._config.get("ackReactionEmoji") or "👀"
-            should_ack = (
-                ack_reaction_scope == "all"
-                or (ack_reaction_scope == "dm" and is_dm)
-                or (ack_reaction_scope in ("group", "groups") and is_group)
+        if self._cfg:
+            from openclaw.agents.identity import resolve_ack_reaction
+            from openclaw.channels.ack_reactions import should_ack_reaction
+            
+            # Resolve agent_id - use "main" as default (most Telegram messages route to main agent)
+            agent_id = "main"
+            
+            # Resolve ack reaction emoji using cascading config
+            # Priority: account → channel → messages → identity → default "👀"
+            ack_emoji = resolve_ack_reaction(
+                self._cfg,
+                agent_id,
+                {"channel": "telegram", "accountId": self._account_id}
             )
-            if should_ack:
-                asyncio.create_task(self._send_ack_reaction(chat.id, message.message_id, ack_emoji))
+            
+            if ack_emoji:
+                # Resolve ack reaction scope
+                # Priority: account → channel → messages → default "group-mentions"
+                ack_scope = "group-mentions"  # default
+                
+                # Check config layers
+                try:
+                    # Global messages config
+                    if hasattr(self._cfg, "messages") and self._cfg.messages:
+                        if hasattr(self._cfg.messages, "ack_reaction_scope"):
+                            scope_val = self._cfg.messages.ack_reaction_scope
+                            if scope_val:
+                                ack_scope = scope_val
+                    
+                    # Channel-level config (if available)
+                    if self._config and "ackReactionScope" in self._config:
+                        ack_scope = self._config["ackReactionScope"]
+                except Exception:
+                    pass
+                
+                # Check if message has mentions (for group-mentions scope)
+                was_mentioned = False
+                if message.entities:
+                    # Check if bot was mentioned
+                    for entity in message.entities:
+                        if entity.type == "mention":
+                            # Extract mention text
+                            mention_text = message.text[entity.offset:entity.offset + entity.length]
+                            # Check if it's our bot (would need bot username to verify fully)
+                            was_mentioned = True
+                            break
+                
+                # Determine if we should send ack reaction
+                should_ack = should_ack_reaction(
+                    scope=ack_scope,
+                    is_direct=is_dm,
+                    is_group=is_group,
+                    is_mentionable_group=is_group,  # Telegram groups support mentions
+                    require_mention=True,  # Telegram requires explicit mentions in groups
+                    can_detect_mention=True,  # Telegram supports mention detection
+                    effective_was_mentioned=was_mentioned,
+                    should_bypass_mention=False,  # No bypass for Telegram
+                )
+                
+                if should_ack:
+                    asyncio.create_task(self._send_ack_reaction(chat.id, message.message_id, ack_emoji))
 
         # Check for chat commands
         if self._command_parser:

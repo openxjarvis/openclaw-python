@@ -219,25 +219,31 @@ def parse_agent_session_key(session_key: str | None) -> ParsedAgentSessionKey | 
     
     Format: agent:<agentId>:<rest>
     
+    Normalizes to lowercase during parsing to ensure consistent key format.
+    
     Examples:
         "agent:main:main" → ParsedAgentSessionKey("main", "main", ...)
+        "AGENT:Main:Main" → ParsedAgentSessionKey("main", "main", ...)
         "agent:myagent:telegram:group:123" → ParsedAgentSessionKey("myagent", "telegram:group:123", ...)
         "invalid" → None
     """
-    raw = (session_key or "").strip()
+    raw = (session_key or "").strip().lower()  # Normalize to lowercase like TS
     if not raw:
         return None
     
     if not raw.startswith("agent:"):
         return None
     
-    # Split: agent:<agentId>:<rest>
-    parts = raw.split(":", 2)
+    # Split: agent:<agentId>:<rest> - filter empty parts like TS
+    parts = [p for p in raw.split(":") if p]
     if len(parts) < 3:
         return None
     
-    agent_id = parts[1]
-    rest = parts[2]
+    agent_id = parts[1].strip()
+    rest = ":".join(parts[2:])
+    
+    if not agent_id or not rest:
+        return None
     
     return ParsedAgentSessionKey(
         agent_id=agent_id,
@@ -258,7 +264,7 @@ def to_agent_store_session_key(
     main_key: str | None = None,
 ) -> str:
     """
-    Convert request key to store key (matches TS toAgentStoreSessionKey lines 37-53).
+    Convert request key to store key (matches TS toAgentStoreSessionKey lines 53-71).
     
     Args:
         agent_id: Agent identifier
@@ -267,20 +273,32 @@ def to_agent_store_session_key(
     
     Returns:
         Full agent store session key
+    
+    Examples:
+        >>> to_agent_store_session_key("main", "main")
+        "agent:main:main"
+        >>> to_agent_store_session_key("main", "cron:job-1")
+        "agent:main:cron:job-1"
+        >>> to_agent_store_session_key("main", "agent:main:main")
+        "agent:main:main"
     """
     raw = (request_key or "").strip()
     
-    if not raw or raw == DEFAULT_MAIN_KEY:
+    # Step 1: Empty or "main" → build main session key
+    if not raw or raw.lower() == DEFAULT_MAIN_KEY:
         return build_agent_main_session_key(agent_id, main_key)
     
-    lowered = raw.lower()
+    # Step 2: Try to parse as agent session key - if valid, normalize it
+    parsed = parse_agent_session_key(raw)
+    if parsed:
+        return f"agent:{parsed.agent_id}:{parsed.rest}"
     
+    # Step 3: Starts with "agent:" but not valid → use as-is (lowercase)
+    lowered = raw.lower()
     if lowered.startswith("agent:"):
         return lowered
     
-    if lowered.startswith("subagent:"):
-        return f"agent:{normalize_agent_id(agent_id)}:{lowered}"
-    
+    # Step 4: Other keys → prefix with agent scope
     return f"agent:{normalize_agent_id(agent_id)}:{lowered}"
 
 

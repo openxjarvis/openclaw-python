@@ -619,6 +619,144 @@ def parse_group_key(
     return None
 
 
+def list_existing_agent_ids_from_disk() -> list[str]:
+    """
+    List agent IDs from disk (state directory).
+    Mirrors TS listExistingAgentIdsFromDisk().
+    """
+    try:
+        from openclaw.config.paths import resolve_state_dir
+        state_dir = Path(resolve_state_dir())
+        agents_dir = state_dir / "agents"
+        if not agents_dir.is_dir():
+            return []
+        
+        agent_ids = []
+        for entry in agents_dir.iterdir():
+            if entry.is_dir():
+                normalized = normalize_agent_id(entry.name)
+                if normalized:
+                    agent_ids.append(normalized)
+        return agent_ids
+    except Exception:
+        return []
+
+
+def list_configured_agent_ids(cfg: Any) -> list[str]:
+    """
+    List all configured agent IDs from config and disk.
+    Mirrors TS listConfiguredAgentIds().
+    """
+    from openclaw.agents.agent_scope import resolve_default_agent_id
+    
+    # Extract agents list from config
+    agents_list = []
+    if hasattr(cfg, 'agents') and cfg.agents:
+        agents_list = cfg.agents.list or []
+    elif isinstance(cfg, dict):
+        agents_section = cfg.get("agents") or {}
+        agents_list = agents_section.get("list") or []
+    
+    if agents_list:
+        ids = set()
+        for entry in agents_list:
+            entry_dict = entry.__dict__ if hasattr(entry, '__dict__') else entry
+            if isinstance(entry_dict, dict) and entry_dict.get("id"):
+                ids.add(normalize_agent_id(str(entry_dict["id"])))
+        
+        default_id = normalize_agent_id(resolve_default_agent_id(cfg))
+        ids.add(default_id)
+        
+        sorted_ids = sorted(ids)
+        # Ensure default comes first
+        if default_id in sorted_ids:
+            return [default_id] + [id_ for id_ in sorted_ids if id_ != default_id]
+        return sorted_ids
+    
+    # No configured agents - scan disk and include default
+    ids = set()
+    default_id = normalize_agent_id(resolve_default_agent_id(cfg))
+    ids.add(default_id)
+    
+    for disk_id in list_existing_agent_ids_from_disk():
+        ids.add(disk_id)
+    
+    sorted_ids = sorted(ids)
+    if default_id in sorted_ids:
+        return [default_id] + [id_ for id_ in sorted_ids if id_ != default_id]
+    return sorted_ids
+
+
+def resolve_identity_avatar_url(
+    cfg: Any,
+    agent_id: str,
+    avatar: str | None,
+) -> str | None:
+    """
+    Resolve avatar URL for identity.
+    Mirrors TS resolveIdentityAvatarUrl().
+    """
+    if not avatar:
+        return None
+    
+    trimmed = avatar.strip()
+    if not trimmed:
+        return None
+    
+    # Check if it's a data URL or HTTP URL
+    from openclaw.shared.avatar_policy import (
+        is_avatar_data_url,
+        is_avatar_http_url,
+        is_workspace_relative_avatar_path,
+    )
+    
+    if is_avatar_data_url(trimmed) or is_avatar_http_url(trimmed):
+        return trimmed
+    
+    if not is_workspace_relative_avatar_path(trimmed):
+        return None
+    
+    # Resolve workspace-relative path
+    from openclaw.agents.agent_scope import resolve_agent_workspace_dir
+    workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
+    
+    try:
+        workspace_root = Path(workspace_dir).resolve()
+    except Exception:
+        workspace_root = Path(workspace_dir).absolute()
+    
+    try:
+        resolved_candidate = (workspace_root / trimmed).resolve()
+        
+        # Security: ensure path is within workspace
+        from openclaw.shared.avatar_policy import is_path_within_root
+        if not is_path_within_root(str(resolved_candidate), str(workspace_root)):
+            return None
+        
+        # Check if file exists and is a file
+        if not resolved_candidate.is_file():
+            return None
+        
+        # Check file size
+        from openclaw.shared.avatar_policy import AVATAR_MAX_BYTES
+        if resolved_candidate.stat().st_size > AVATAR_MAX_BYTES:
+            return None
+        
+        # Resolve MIME type
+        from openclaw.shared.avatar_policy import resolve_avatar_mime
+        mime = resolve_avatar_mime(str(resolved_candidate))
+        if not mime:
+            return None
+        
+        # Read and encode as data URL
+        with open(resolved_candidate, "rb") as f:
+            import base64
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+            return f"data:{mime};base64,{encoded}"
+    except Exception:
+        return None
+
+
 def list_agents_for_gateway(cfg: Any) -> Dict[str, Any]:
     """
     List agents configured for the gateway with identity info.
@@ -627,79 +765,91 @@ def list_agents_for_gateway(cfg: Any) -> Dict[str, Any]:
     Returns:
         {"defaultId": str, "mainKey": str, "scope": str, "agents": list}
     """
-    from openclaw.routing.session_key import normalize_agent_id as _norm_agent_id
-
-    agents_section = (cfg or {}).get("agents") or {}
-    session_section = (cfg or {}).get("session") or {}
-
-    default_id = _norm_agent_id(agents_section.get("defaultAgent") or "main")
-    main_key = session_section.get("mainKey") or "main"
-    scope = session_section.get("scope") or "per-sender"
-
-    agents_list: list = agents_section.get("agents") or agents_section.get("list") or []
-
-    configured_by_id: Dict[str, Dict[str, Any]] = {}
+    from openclaw.agents.agent_scope import resolve_default_agent_id
+    from openclaw.routing.session_key import normalize_main_key
+    
+    default_id = normalize_agent_id(resolve_default_agent_id(cfg))
+    
+    # Resolve main key and scope
+    main_key = "main"
+    scope = "per-sender"
+    if hasattr(cfg, 'session') and cfg.session:
+        main_key = normalize_main_key(cfg.session.main_key if hasattr(cfg.session, 'main_key') else "main")
+        scope = cfg.session.scope if hasattr(cfg.session, 'scope') else "per-sender"
+    elif isinstance(cfg, dict):
+        session_section = cfg.get("session") or {}
+        main_key = normalize_main_key(session_section.get("mainKey") or "main")
+        scope = session_section.get("scope") or "per-sender"
+    
+    # Build map of configured agents
+    configured_by_id: dict[str, dict[str, Any]] = {}
+    
+    agents_list = []
+    if hasattr(cfg, 'agents') and cfg.agents:
+        agents_list = cfg.agents.list or []
+    elif isinstance(cfg, dict):
+        agents_section = cfg.get("agents") or {}
+        agents_list = agents_section.get("list") or []
+    
     for entry in agents_list:
-        if not isinstance(entry, dict) or not entry.get("id"):
+        entry_dict = entry.__dict__ if hasattr(entry, '__dict__') else entry
+        if not isinstance(entry_dict, dict) or not entry_dict.get("id"):
             continue
-        agent_id = _norm_agent_id(str(entry["id"]))
-        identity_raw = entry.get("identity")
+        
+        agent_id = normalize_agent_id(str(entry_dict["id"]))
+        identity_raw = entry_dict.get("identity")
         identity = None
-        if isinstance(identity_raw, dict):
-            identity = {
-                "name": (identity_raw.get("name") or "").strip() or None,
-                "theme": (identity_raw.get("theme") or "").strip() or None,
-                "emoji": (identity_raw.get("emoji") or "").strip() or None,
-                "avatar": (identity_raw.get("avatar") or "").strip() or None,
-            }
-        name_raw = entry.get("name")
+        
+        if identity_raw:
+            identity_dict = identity_raw.__dict__ if hasattr(identity_raw, '__dict__') else identity_raw
+            if isinstance(identity_dict, dict):
+                identity = {
+                    "name": (identity_dict.get("name") or "").strip() or None,
+                    "theme": (identity_dict.get("theme") or "").strip() or None,
+                    "emoji": (identity_dict.get("emoji") or "").strip() or None,
+                    "avatar": (identity_dict.get("avatar") or "").strip() or None,
+                    "avatarUrl": resolve_identity_avatar_url(
+                        cfg,
+                        agent_id,
+                        (identity_dict.get("avatar") or "").strip() or None,
+                    ),
+                }
+        
+        name_raw = entry_dict.get("name")
         configured_by_id[agent_id] = {
             "name": name_raw.strip() if isinstance(name_raw, str) and name_raw.strip() else None,
             "identity": identity,
         }
-
-    explicit_ids = {
-        _norm_agent_id(str(e["id"]))
-        for e in agents_list
-        if isinstance(e, dict) and e.get("id")
-    }
-    allowed_ids = (explicit_ids | {default_id}) if explicit_ids else None
-
-    # Collect agent ids: from config, plus disk scan, plus default
-    agent_ids_set: set[str] = {default_id}
-    for e in agents_list:
-        if isinstance(e, dict) and e.get("id"):
-            agent_ids_set.add(_norm_agent_id(str(e["id"])))
-
-    # Disk scan
-    try:
-        from openclaw.config.paths import resolve_state_dir
-        state_dir = Path(resolve_state_dir())
-        agents_dir = state_dir / "agents"
-        if agents_dir.is_dir():
-            for d in agents_dir.iterdir():
-                if d.is_dir():
-                    agent_ids_set.add(_norm_agent_id(d.name))
-    except Exception:
-        pass
-
-    agent_ids = sorted(
-        aid for aid in agent_ids_set
-        if aid and (allowed_ids is None or aid in allowed_ids)
-    )
-    # Ensure default comes first
-    if default_id in agent_ids:
-        agent_ids = [default_id] + [aid for aid in agent_ids if aid != default_id]
-
-    agents = [
-        {
-            "id": aid,
-            "name": configured_by_id.get(aid, {}).get("name"),
-            "identity": configured_by_id.get(aid, {}).get("identity"),
-        }
-        for aid in agent_ids
+    
+    # Build explicit IDs set
+    explicit_ids = set()
+    for entry in agents_list:
+        entry_dict = entry.__dict__ if hasattr(entry, '__dict__') else entry
+        if isinstance(entry_dict, dict) and entry_dict.get("id"):
+            explicit_ids.add(normalize_agent_id(str(entry_dict["id"])))
+    
+    allowed_ids = explicit_ids | {default_id} if explicit_ids else None
+    
+    # Get all agent IDs
+    agent_ids = [
+        id_ for id_ in list_configured_agent_ids(cfg)
+        if not allowed_ids or id_ in allowed_ids
     ]
-
+    
+    # Add main_key if it's not in the list and allowed
+    if main_key and main_key not in agent_ids and (not allowed_ids or main_key in allowed_ids):
+        agent_ids.append(main_key)
+    
+    # Build agent rows
+    agents = []
+    for agent_id in agent_ids:
+        meta = configured_by_id.get(agent_id, {})
+        agents.append({
+            "id": agent_id,
+            "name": meta.get("name"),
+            "identity": meta.get("identity"),
+        })
+    
     return {"defaultId": default_id, "mainKey": main_key, "scope": scope, "agents": agents}
 
 

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
 from ..inbound_context import MsgContext
-from ..inbound_dedupe import InboundDedupe
+from .inbound_dedupe import should_skip_duplicate_inbound
 from .get_reply import (
     ReplyPayload,
     get_reply_from_config,
@@ -32,10 +32,17 @@ from .reply_dispatcher import ReplyDispatcher
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Global deduplication store
+# Dedupe module wrapper (for backward compatibility with tests)
 # ---------------------------------------------------------------------------
 
-_dedupe = InboundDedupe(max_size=1000, ttl=300.0)
+class _DedupeModule:
+    """Wrapper for dedupe functionality to match test expectations."""
+    def __init__(self):
+        # Import the actual cache from inbound_dedupe
+        from .inbound_dedupe import INBOUND_DEDUPE_CACHE
+        self._cache = INBOUND_DEDUPE_CACHE
+
+_dedupe = _DedupeModule()
 
 # ---------------------------------------------------------------------------
 # Return type
@@ -327,28 +334,12 @@ async def dispatch_reply_from_config(
     # ------------------------------------------------------------------
     # 1. Duplicate check (mirrors shouldSkipDuplicateInbound)
     # ------------------------------------------------------------------
-    try:
-        msg_id = (
-            getattr(ctx, "MessageSidFull", None)
-            or getattr(ctx, "MessageSid", None)
-            or getattr(ctx, "MessageSidFirst", None)
-            or ""
-        )
-        body_for_hash = (
-            getattr(ctx, "Body", None)
-            or getattr(ctx, "RawBody", None)
-            or ""
-        )
-        import hashlib as _hashlib
-        dedupe_key = f"{channel}:{session_key}:{msg_id or _hashlib.sha256(body_for_hash.encode()).hexdigest()[:16]}"
-        if _dedupe.is_duplicate_key(dedupe_key):
-            logger.debug(f"dispatch_from_config: skipping duplicate [{channel}]")
-            result.skipped = True
-            result.skip_reason = "duplicate"
-            return result
-        _dedupe.mark_seen_key(dedupe_key)
-    except Exception:
-        pass
+    # Matches TS dispatch-from-config.ts line 162
+    if should_skip_duplicate_inbound(ctx):
+        logger.debug(f"dispatch_from_config: skipping duplicate message")
+        result.skipped = True
+        result.skip_reason = "duplicate"
+        return result
 
     # ------------------------------------------------------------------
     # 2. Hook firing (fire-and-forget)
