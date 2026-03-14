@@ -26,6 +26,10 @@ uv.lock
 .env
 .env.local
 
+# Temp comparison files
+*_comparison.txt
+*_COMPARISON.txt
+
 # Tests
 .pytest_cache/
 .coverage
