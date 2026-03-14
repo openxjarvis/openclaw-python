@@ -49,3 +49,4 @@ docs/archive/
 # Tests (don't push to remote)
 tests/
 test_*.py
+fix_*.py
