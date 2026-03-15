@@ -9,10 +9,13 @@ Mirrors TypeScript:
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -721,12 +724,19 @@ def normalize_cron_job_input(
         )
         has_delivery = "delivery" in nxt and nxt["delivery"] is not None
         has_legacy_delivery = _has_legacy_delivery_hints(payload) if isinstance(payload, dict) else False
+        
+        # Debug logging
+        logger.info(f"[normalize] auto-delivery check: session_target={session_target}, payload_kind={payload_kind}")
+        logger.info(f"[normalize] is_isolated_agent_turn={is_isolated_agent_turn}, has_delivery={has_delivery}, has_legacy={has_legacy_delivery}")
+        
         if not has_delivery and is_isolated_agent_turn and payload_kind == "agentTurn":
             if isinstance(payload, dict) and has_legacy_delivery:
                 nxt["delivery"] = _build_delivery_from_legacy_payload(payload)
                 _strip_legacy_delivery_fields(payload)
+                logger.info(f"[normalize] Set delivery from legacy: {nxt['delivery']}")
             else:
                 nxt["delivery"] = {"mode": "announce"}
+                logger.info(f"[normalize] Set auto-delivery: announce")
 
     return nxt
 

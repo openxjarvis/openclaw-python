@@ -127,11 +127,14 @@ def resolve_heartbeat_ack_max_chars(
 
     Mirrors TS resolveHeartbeatAckMaxChars.
     """
-    raw = (
-        (agent_cfg or {})
-        .get("heartbeat", {})
-        .get("ackMaxChars", DEFAULT_HEARTBEAT_ACK_MAX_CHARS)
-    )
+    if not agent_cfg or not isinstance(agent_cfg, dict):
+        return DEFAULT_HEARTBEAT_ACK_MAX_CHARS
+    
+    heartbeat_cfg = agent_cfg.get("heartbeat")
+    if not isinstance(heartbeat_cfg, dict):
+        return DEFAULT_HEARTBEAT_ACK_MAX_CHARS
+    
+    raw = heartbeat_cfg.get("ackMaxChars", DEFAULT_HEARTBEAT_ACK_MAX_CHARS)
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):

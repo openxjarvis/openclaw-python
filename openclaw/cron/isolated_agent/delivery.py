@@ -207,24 +207,49 @@ def _load_session_entry(
 ) -> dict[str, Any] | None:
     """Load a session entry from the store, preferring thread-specific over main."""
     try:
-        from openclaw.config.sessions import load_session_store, resolve_store_path, resolve_agent_main_session_key
+        # 修复导入：使用正确的从文件加载的函数
+        from openclaw.config.sessions.paths import resolve_store_path
+        from openclaw.config.sessions.store_utils import load_session_store_from_path
+        from openclaw.routing.session_key import resolve_agent_main_session_key
+        
         aid = (agent_id or "").strip() or "default"
-        store_path = resolve_store_path(
-            getattr(cfg, "session", {}).get("store") if isinstance(cfg, dict) else None,
-            agent_id=aid,
-        )
-        store = load_session_store(store_path)
-        if not store:
+        
+        # 修复 cfg 访问逻辑
+        if isinstance(cfg, dict):
+            session_cfg = cfg.get("session", {})
+            store_config = session_cfg.get("store") if isinstance(session_cfg, dict) else None
+        else:
+            session_cfg = getattr(cfg, "session", None)
+            store_config = getattr(session_cfg, "store", None) if session_cfg else None
+        
+        store_path = resolve_store_path(store_config, agent_id=aid)
+        
+        # 使用 load_session_store_from_path 从文件加载（镜像 TS loadSessionStore）
+        store_dict = load_session_store_from_path(str(store_path))
+        
+        if not store_dict:
+            logger.debug(f"cron delivery: session store is empty at {store_path}")
             return None
 
         # Prefer thread-specific session key, fallback to agent main
         main_key = resolve_agent_main_session_key(cfg=cfg, agent_id=aid)
-        if thread_session_key and thread_session_key in store:
-            return store[thread_session_key]
-        if main_key in store:
-            return store[main_key]
-    except Exception:
-        pass
+        
+        if thread_session_key and thread_session_key in store_dict:
+            entry = store_dict[thread_session_key]
+            logger.debug(f"cron delivery: found thread session {thread_session_key}")
+            # 如果是 SessionEntry 对象，转为 dict
+            return entry.model_dump() if hasattr(entry, "model_dump") else entry
+        
+        if main_key in store_dict:
+            entry = store_dict[main_key]
+            logger.debug(f"cron delivery: found main session {main_key}")
+            return entry.model_dump() if hasattr(entry, "model_dump") else entry
+        
+        logger.debug(f"cron delivery: no matching session in store (tried {thread_session_key}, {main_key})")
+        
+    except Exception as e:
+        logger.warning(f"cron delivery: failed to load session entry: {e}", exc_info=True)
+    
     return None
 
 

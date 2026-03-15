@@ -94,10 +94,11 @@ WAKE MODES (for wake action):
 Use jobId as the canonical identifier; id is accepted for compatibility. Use contextMessages (0-10) to add previous messages as context to the job text.
     """
 
-    def __init__(self, cron_service=None, channel_registry=None, session_manager=None):
+    def __init__(self, cron_service=None, channel_registry=None, session_manager=None, agent_session_key=None):
         self._cron_service = cron_service
         self._channel_registry = channel_registry
         self._session_manager = session_manager
+        self._agent_session_key = agent_session_key  # 新增：保存当前 session key
         self._current_chat_info: dict[str, str] | None = None
         logger.info("CronTool initialized")
 
@@ -131,6 +132,10 @@ Use jobId as the canonical identifier; id is accepted for compatibility. Use con
 
     def set_session_manager(self, manager: Any) -> None:
         self._session_manager = manager
+
+    def set_agent_session_key(self, session_key: str) -> None:
+        """Set the current agent session key (mirrors TS agentSessionKey)."""
+        self._agent_session_key = session_key
 
     def set_chat_context(self, channel: str, chat_id: str) -> None:
         self._current_chat_info = {"channel": channel, "chat_id": chat_id}
@@ -404,112 +409,133 @@ Use jobId as the canonical identifier; id is accepted for compatibility. Use con
             CronFailureDestination,
             CronJob,
         )
+        from openclaw.cron.normalize import normalize_cron_job_create
+
+        # --- 注入 session_key（镜像 TS 逻辑）---
+        # 如果 job_config 中没有 session_key，尝试从多个来源获取
+        if "session_key" not in job_config:
+            session_key_to_inject = None
+            
+            # 优先使用 _agent_session_key（由 Pi runtime 设置）
+            if self._agent_session_key:
+                session_key_to_inject = self._agent_session_key
+            
+            # 次优：从当前 chat 上下文构造 session_key
+            # 格式：agent:main:channel:direct:chatId（镜像 TS 的 resolveAgentSessionKey）
+            elif self._current_chat_info:
+                channel = self._current_chat_info.get("channel")
+                chat_id = self._current_chat_info.get("chat_id")
+                if channel and chat_id:
+                    # 构造基本 session_key（假设 agent_id 是 "main"）
+                    session_key_to_inject = f"agent:main:{channel}:direct:{chat_id}"
+                    logger.debug(f"[cron tool] constructed session_key from chat context: {session_key_to_inject}")
+            
+            if session_key_to_inject:
+                job_config["session_key"] = session_key_to_inject
+                logger.debug(f"[cron tool] injected session_key: {session_key_to_inject}")
+            else:
+                logger.warning("[cron tool] no session_key available for injection, delivery may fail")
 
         job_id = f"cron-{uuid.uuid4().hex[:8]}"
 
+        # --- Apply normalization (including auto-delivery) ---
+        # This matches TypeScript behavior where normalizeCronJobCreate automatically
+        # adds delivery: {mode: "announce"} for isolated agentTurn jobs
+        normalized_config = normalize_cron_job_create(job_config)
+        if not normalized_config:
+            return _err("Invalid job configuration")
+
+        logger.info(f"[cron tool] normalized_config: {normalized_config}")
+
         # --- Normalize schedule ---
-        schedule_config = job_config.get("schedule", {})
+        schedule_config = normalized_config.get("schedule", {})
         schedule = _normalize_schedule(schedule_config)
         if schedule is None:
             return _err(f"Unknown schedule type: {schedule_config.get('type')}")
 
         # --- Normalize payload ---
-        payload_config = job_config.get("payload", {})
+        payload_config = normalized_config.get("payload", {})
         payload = _normalize_payload(payload_config)
         if payload is None:
             return _err(f"Unknown payload kind: {payload_config.get('kind')}")
 
-        # --- Session target ---
-        session_target = job_config.get("sessionTarget", job_config.get("session_target", "main"))
+        # --- Session target (already normalized) ---
+        session_target = normalized_config.get("session_target", "main")
         
-        # Auto-fix: If payload is agentTurn but session_target is "main", 
-        # and we have delivery config or current chat context, switch to "isolated"
-        # This matches TypeScript behavior where agentTurn with delivery implies isolated
-        if session_target == "main" and isinstance(payload, AgentTurnPayload):
-            delivery_config = job_config.get("delivery")
-            has_delivery_or_context = (
-                delivery_config is not None or 
-                self._current_chat_info is not None
-            )
-            if has_delivery_or_context:
-                session_target = "isolated"
-                logger.info(f"Auto-switching session_target from 'main' to 'isolated' for agentTurn payload with delivery context")
-
-        # --- Delivery (auto-fill from context for isolated jobs) ---
+        # --- 提取 session_key 和 agent_id（镜像 TS） ---
+        session_key = normalized_config.get("session_key")
+        agent_id = normalized_config.get("agent_id")
+        
+        # 如果 agent_id 未设置但有 session_key，从 session_key 中提取
+        if not agent_id and session_key:
+            from openclaw.routing.session_key import parse_agent_session_key
+            parsed = parse_agent_session_key(session_key)
+            if parsed:
+                agent_id = parsed.agent_id
+                logger.debug(f"[cron tool] extracted agent_id from session_key: {agent_id}")
+        
+        # --- Delivery (already normalized, but still apply context fallback) ---
         delivery = None
-        delivery_config = job_config.get("delivery")
+        delivery_config = normalized_config.get("delivery")
 
-        if session_target == "isolated" and isinstance(payload, AgentTurnPayload):
-            if delivery_config is None:
-                delivery_config = {}
-            channel = delivery_config.get("channel", "")
-            target = delivery_config.get("to") or delivery_config.get("target", "")
-            if not channel and self._current_chat_info:
-                channel = self._current_chat_info.get("channel", "")
-            if not target and self._current_chat_info:
-                target = self._current_chat_info.get("chat_id", "")
-            if channel:
-                delivery = CronDelivery(
-                    mode=delivery_config.get("mode", "announce"),
-                    channel=channel,
-                    to=target or None,
-                    best_effort=delivery_config.get("best_effort", delivery_config.get("bestEffort", False)),
-                    account_id=delivery_config.get("accountId") or delivery_config.get("account_id"),
-                    failure_destination=_parse_failure_destination(
-                        delivery_config.get("failureDestination") or delivery_config.get("failure_destination")
-                    ),
-                )
-        elif delivery_config:
+        if delivery_config:
+            mode = delivery_config.get("mode", "announce")
             channel = delivery_config.get("channel", "")
             target = delivery_config.get("to") or delivery_config.get("target")
+            
+            # Fallback to current chat context if not explicitly set
             if not channel and self._current_chat_info:
                 channel = self._current_chat_info.get("channel", "")
             if not target and self._current_chat_info:
                 target = self._current_chat_info.get("chat_id")
-            if channel:
-                delivery = CronDelivery(
-                    mode=delivery_config.get("mode", "announce"),
-                    channel=channel,
-                    to=target,
-                    best_effort=delivery_config.get("best_effort", delivery_config.get("bestEffort", False)),
-                    account_id=delivery_config.get("accountId") or delivery_config.get("account_id"),
-                    failure_destination=_parse_failure_destination(
-                        delivery_config.get("failureDestination") or delivery_config.get("failure_destination")
-                    ),
-                )
+            
+            # Create delivery even if channel is empty (for announce mode without target)
+            # The delivery resolver will handle finding the appropriate channel at runtime
+            delivery = CronDelivery(
+                mode=mode,
+                channel=channel or None,  # None if empty, will be resolved at delivery time
+                to=target or None,
+                best_effort=delivery_config.get("best_effort", delivery_config.get("bestEffort", False)),
+                account_id=delivery_config.get("accountId") or delivery_config.get("account_id"),
+                failure_destination=_parse_failure_destination(
+                    delivery_config.get("failureDestination") or delivery_config.get("failure_destination")
+                ),
+            )
 
-        # --- Failure alert ---
+        # --- Failure alert (from normalized config) ---
         failure_alert: CronFailureAlert | None = None
-        fa_config = job_config.get("failureAlert") or job_config.get("failure_alert")
+        fa_config = normalized_config.get("failure_alert") or normalized_config.get("failureAlert")
         if isinstance(fa_config, dict):
             failure_alert = CronFailureAlert(
-                after_n_errors=int(fa_config.get("afterNErrors") or fa_config.get("after_n_errors") or 3),
-                cooldown_ms=int(fa_config.get("cooldownMs") or fa_config.get("cooldown_ms") or 3_600_000),
+                after_n_errors=int(fa_config.get("after_n_errors") or fa_config.get("afterNErrors") or 3),
+                cooldown_ms=int(fa_config.get("cooldown_ms") or fa_config.get("cooldownMs") or 3_600_000),
                 message=fa_config.get("message"),
             )
 
-        # --- Wake mode ---
-        wake_mode = job_config.get("wakeMode", job_config.get("wake_mode", "next-heartbeat"))
+        # --- Wake mode (from normalized config) ---
+        wake_mode = normalized_config.get("wake_mode", "next-heartbeat")
 
-        # --- Create job ---
+        # --- Create job (use normalized values, 包括 session_key 和 agent_id) ---
         job = CronJob(
             id=job_id,
-            name=job_config.get("name", "Unnamed Job"),
-            description=job_config.get("description"),
-            enabled=job_config.get("enabled", True),
+            name=normalized_config.get("name", "Unnamed Job"),
+            description=normalized_config.get("description"),
+            enabled=normalized_config.get("enabled", True),
             schedule=schedule,
             session_target=session_target,
             wake_mode=wake_mode,
             payload=payload,
             delivery=delivery,
             failure_alert=failure_alert,
+            session_key=session_key,  # 新增：传入 session_key
+            agent_id=agent_id,  # 新增：传入 agent_id
         )
 
         added_job = await self._cron_service.add_job(job)
 
         text = f"Created cron job: {added_job.name}\n"
         text += f"  ID: {job_id}\n"
-        text += f"  Schedule: {self._format_schedule(job_config.get('schedule', {}))}\n"
+        text += f"  Schedule: {self._format_schedule(normalized_config.get('schedule', {}))}\n"
         text += f"  Type: {'Isolated Agent' if session_target == 'isolated' else 'System Event'}"
         if delivery:
             mode_str = f" [{delivery.mode}]" if delivery.mode != "announce" else ""

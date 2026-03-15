@@ -247,6 +247,25 @@ async def run_cron_isolated_agent_turn(
         }
 
     # ------------------------------------------------------------------
+    # Validate result (defensive check for None or non-dict)
+    # ------------------------------------------------------------------
+    if not isinstance(result, dict):
+        error_msg = f"run_agent_fn returned invalid result type: {type(result)}"
+        logger.error("cron: %s", error_msg)
+        return {
+            "status": "error",
+            "error": error_msg,
+            "summary": None,
+            "output_text": None,
+            "delivered": False,
+            "session_id": None,
+            "session_key": effective_session_key,
+            "model": None,
+            "provider": None,
+            "usage": None,
+        }
+
+    # ------------------------------------------------------------------
     # Normalize result keys (support both snake_case and camelCase)
     # ------------------------------------------------------------------
     status = result.get("status") or ("ok" if result.get("success") else "error")

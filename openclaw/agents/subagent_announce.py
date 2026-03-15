@@ -331,9 +331,9 @@ async def run_subagent_announce_flow(
             # Load config for channel plugins
             cfg = load_config()
             
-            # Extract agent ID from session key
+            # Extract agent ID from session key (NamedTuple access, not dict)
             parsed = parse_agent_session_key(requester_session_key)
-            agent_id = parsed.get("agent_id") if parsed else None
+            agent_id = parsed.agent_id if parsed else None
             
             # Build payloads
             payloads = [{"text": announce_text}]

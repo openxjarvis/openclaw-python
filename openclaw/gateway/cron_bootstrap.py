@@ -145,10 +145,10 @@ async def build_gateway_cron_service(
         # Resolve job-level identifiers once so _agent_run can use them
         job_agent_id = getattr(job, "agent_id", None) or "default"
         
-        # Resolve session key - mirrors TS run.ts:146-147
-        base_session_key = (
-            getattr(job, "session_key", None) or f"cron:{job.id}"
-        ).strip()
+        # Resolve session key - mirrors TS server-cron.ts:294
+        # Always use `cron:${job.id}` for isolated session, NOT job.session_key
+        # (job.session_key stores the *delivery* target, not the execution session)
+        base_session_key = f"cron:{job.id}"
         job_session_key = resolve_cron_agent_session_key(
             session_key=base_session_key,
             agent_id=job_agent_id,
@@ -319,21 +319,76 @@ async def build_gateway_cron_service(
                         "role": "assistant",
                     })
 
-                # Resolve delivery target (mirrors TS delivery resolution)
+                # Resolve delivery target using complete resolver (mirrors TS)
+                # This replaces the simplified _extract_delivery_targets with the full
+                # resolve_delivery_target which includes proper fallback chains
                 resolved_delivery: dict[str, Any] = {}
                 try:
+                    from openclaw.cron.isolated_agent.delivery import (
+                        resolve_delivery_target,
+                        DEFAULT_CHAT_CHANNEL,
+                    )
+                    from openclaw.routing.session_key import parse_agent_session_key
+                    
+                    # CRITICAL FIX: Use job.session_key (original creator session) for delivery resolution,
+                    # not the constructed cron session key. This mirrors TS version behavior.
+                    # The original session key is where we'll find the real delivery target in session store.
+                    original_session_key = getattr(job, "session_key", None)
+                    lookup_agent_id = job_agent_id
+                    
+                    # Extract agent_id using standardized parser (mirrors TS normalizeAgentId)
+                    if original_session_key:
+                        parsed = parse_agent_session_key(original_session_key)
+                        if parsed:
+                            # Successfully parsed agent: format → use extracted agent_id
+                            lookup_agent_id = parsed.agent_id
+                        else:
+                            # Non-agent: format (e.g., "cron:job-1", "main") → keep job_agent_id
+                            logger.debug(
+                                f"cron: job.session_key={original_session_key!r} is not an agent session key, "
+                                f"using job_agent_id={job_agent_id!r}"
+                            )
+                    
+                    logger.info(f"cron: resolving delivery with original_session_key={original_session_key}, lookup_agent_id={lookup_agent_id}")
+                    
+                    # Use full delivery resolver with fallback chain:
+                    # 1. Session store (thread + main session) - using ORIGINAL agent/session
+                    # 2. Session history
+                    # 3. Config-driven channel selection
+                    # 4. DEFAULT_CHAT_CHANNEL fallback
+                    resolved_delivery_target = await resolve_delivery_target(
+                        job=job,
+                        session_history=None,
+                        cfg=config_dict,
+                        agent_id=lookup_agent_id,  # Use extracted agent_id from original session
+                    )
+                    
+                    # Build resolved_delivery dict for subagent_announce
+                    resolved_delivery = {
+                        "channel": resolved_delivery_target.channel,
+                        "to": resolved_delivery_target.to,
+                    }
+                    
+                    if resolved_delivery_target.account_id:
+                        resolved_delivery["accountId"] = resolved_delivery_target.account_id
+                    if resolved_delivery_target.thread_id is not None:
+                        resolved_delivery["threadId"] = resolved_delivery_target.thread_id
+                    
+                    logger.info(f"cron: resolved delivery target: {resolved_delivery}")
+                    
+                except ImportError:
+                    # Fallback to old implementation if imports fail
+                    logger.warning("cron: resolve_delivery_target import failed, using fallback")
                     delivery_config = getattr(job, "delivery", None)
                     if delivery_config and getattr(delivery_config, "mode", "none") != "none":
                         channel_mode = getattr(delivery_config, "channel", "last")
                         if channel_mode == "last":
-                            # Find last-used channel from session store
                             running_channels = cm.list_running() if hasattr(cm, "list_running") else []
                             all_keys = _list_all_session_keys(cm)
                             agent_part = _extract_agent_part(job_session_key)
                             targets = _extract_delivery_targets(all_keys, agent_part, running_channels)
                             
                             if targets:
-                                # Use first target
                                 channel_id, chat_id, thread_id = targets[0]
                                 resolved_delivery = {
                                     "channel": channel_id,
@@ -341,9 +396,6 @@ async def build_gateway_cron_service(
                                 }
                                 if thread_id is not None:
                                     resolved_delivery["threadId"] = thread_id
-                                logger.info(f"cron: resolved delivery target: {resolved_delivery}")
-                            else:
-                                logger.warning(f"cron: no delivery targets found for agent={agent_part}")
                 except Exception as e:
                     logger.warning(f"cron: delivery resolution error: {e}", exc_info=True)
 

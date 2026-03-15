@@ -2093,6 +2093,19 @@ class ChannelManager:
                 # Mirrors TS createMessageTool({ currentChannelProvider, currentChannelId })
                 # called fresh per-dispatch in attempt.ts.
                 _dispatch_tools = self.tools
+                
+                # CRITICAL FIX: Inject session_key into CronTool for this dispatch
+                # This ensures new cron jobs created during this session have the correct session_key
+                try:
+                    from openclaw.agents.tools.cron import CronTool as _CronTool
+                    _existing_cron_tool = next((t for t in self.tools if isinstance(t, _CronTool)), None)
+                    if _existing_cron_tool is not None:
+                        logger.debug(f"[{channel_id}] Injecting session_key={session_key} into CronTool")
+                        _existing_cron_tool.set_agent_session_key(session_key)
+                        _existing_cron_tool.set_chat_context(channel_id, str(message.chat_id))
+                except Exception as _cron_inject_err:
+                    logger.warning(f"[{channel_id}] Failed to inject session_key into CronTool: {_cron_inject_err}")
+                
                 try:
                     from openclaw.agents.tools.channel_actions import create_message_tool as _cmt, MessageTool as _MT
                     _existing_msg_tool = next((t for t in self.tools if isinstance(t, _MT)), None)

@@ -123,6 +123,48 @@ def build_agent_main_session_key(
     return f"agent:{normalized_agent}:{normalized_main}"
 
 
+def resolve_agent_main_session_key(cfg: Any = None, agent_id: str | None = None) -> str:
+    """
+    Resolve the main session key for an agent (mirrors TS resolveAgentMainSessionKey).
+    
+    This is used to locate an agent's main session entry in the session store,
+    which contains delivery target information (lastChannel, lastTo, lastAccountId).
+    
+    Args:
+        cfg: OpenClaw config (may contain custom mainKey)
+        agent_id: Agent identifier (normalized internally)
+    
+    Returns:
+        Main session key, e.g., "agent:main:main" or "agent:main:<customKey>"
+    
+    Examples:
+        >>> resolve_agent_main_session_key(None, "main")
+        'agent:main:main'
+        >>> resolve_agent_main_session_key(cfg_with_custom_key, "jarvis")
+        'agent:jarvis:custom'
+    """
+    aid = normalize_agent_id(agent_id)
+    
+    # Extract custom mainKey from config if present
+    main_key = "main"
+    if cfg:
+        # Try dict-style access first (for dict configs)
+        if isinstance(cfg, dict):
+            session_cfg = cfg.get("session", {})
+            if isinstance(session_cfg, dict):
+                main_key = session_cfg.get("mainKey", "main")
+        # Try attribute access (for object configs)
+        else:
+            session_cfg = getattr(cfg, "session", None)
+            if session_cfg:
+                if isinstance(session_cfg, dict):
+                    main_key = session_cfg.get("mainKey", "main")
+                else:
+                    main_key = getattr(session_cfg, "mainKey", "main")
+    
+    return build_agent_main_session_key(agent_id=aid, main_key=main_key)
+
+
 def _resolve_linked_peer_id(
     identity_links: dict | None,
     channel: str,
