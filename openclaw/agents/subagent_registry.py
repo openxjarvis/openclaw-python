@@ -473,6 +473,69 @@ class SubagentRegistry:
         self._listener_started = False
         if persist:
             self._persist_runs()
+    
+    def list_all_runs(self) -> list[SubagentRunRecord]:
+        """
+        List all subagent runs.
+        
+        Returns all runs from the global registry, both active and terminated.
+        Used by auto-archive service to scan for expired runs.
+        
+        Returns:
+            List of all run records
+        """
+        return list(self._runs.values())
+    
+    def mark_subagent_run_for_steer_restart(self, run_id: str) -> None:
+        """
+        Mark a subagent run for steer restart.
+        
+        Sets suppressAnnounceReason to prevent duplicate announces when
+        restarting via steer command.
+        
+        Args:
+            run_id: Run ID to mark
+        """
+        record = self._runs.get(run_id)
+        if record:
+            record.suppress_announce_reason = "steer-restart"
+    
+    def replace_subagent_run_after_steer(
+        self,
+        old_run_id: str,
+        new_run_id: str,
+        new_child_session_key: str,
+    ) -> None:
+        """
+        Replace a subagent run after steer operation.
+        
+        Removes old run record and registers new one, preserving requester context.
+        
+        Args:
+            old_run_id: Old run ID to remove
+            new_run_id: New run ID (from restarted agent)
+            new_child_session_key: New child session key
+        """
+        old_record = self._runs.get(old_run_id)
+        if old_record:
+            # Create new record with updated IDs but same requester context
+            new_record = SubagentRunRecord(
+                run_id=new_run_id,
+                child_session_key=new_child_session_key,
+                requester_session_key=old_record.requester_session_key,
+                requester_display_key=old_record.requester_display_key,
+                task=old_record.task,
+                cleanup=old_record.cleanup,
+                label=old_record.label,
+                model=old_record.model,
+                requester_origin=old_record.requester_origin,
+                run_timeout_seconds=old_record.run_timeout_seconds,
+                spawn_mode=old_record.spawn_mode,
+                archive_at_ms=old_record.archive_at_ms,
+            )
+            # Remove old and add new
+            self._runs.pop(old_run_id, None)
+            self._runs[new_run_id] = new_record
 
 
 # Global singleton instance (matches TS module-level exports)
