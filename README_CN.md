@@ -11,6 +11,10 @@
 
 ---
 
+> ### 🐍 OpenClaw 虽极好，但别忘了用 Python 版！100% 对齐。
+
+---
+
 > 📖 **详细配置指南：** &nbsp; [English → GUIDE.md](GUIDE.md) &nbsp;·&nbsp; [中文 → GUIDE_CN.md](GUIDE_CN.md)
 >
 > 包含内容：安装步骤、Telegram/飞书配置、权限设置、文件发送排查、openclaw.json 完整字段说明
@@ -30,8 +34,6 @@
 ---
 
 ## 这是什么
-
-> ### 🐍 [TypeScript 版 OpenClaw](https://github.com/badlogic/pi-mono) 虽极好，但别忘了 Python 版！100% 功能对齐。
 
 OpenClaw 是一个自托管的 AI 网关，将你的消息渠道连接到大语言模型：
 

@@ -13,6 +13,10 @@
 
 ---
 
+> ### 🐍 OpenClaw is awesome — don't forget to use the Python version! 100% aligned.
+
+---
+
 > 📖 **Setup & Config Guide:** &nbsp; [English → GUIDE.md](GUIDE.md) &nbsp;·&nbsp; [中文 → GUIDE_CN.md](GUIDE_CN.md)
 >
 > 内容包括：安装、Telegram/飞书配置、权限设置、发文件排查、openclaw.json 全字段说明
@@ -34,8 +38,6 @@
 ---
 
 ## What it does
-
-> ### 🐍 [TypeScript OpenClaw](https://github.com/badlogic/pi-mono) is awesome — but don't forget the Python version! 100% feature-aligned.
 
 A self-hosted AI gateway that connects your messaging channels to LLMs:
 
