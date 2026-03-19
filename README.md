@@ -13,7 +13,8 @@
 
 ---
 
-> ### 🐍 OpenClaw is awesome — don't forget to use the Python version! 100% aligned.
+> [!NOTE]
+> ### 🐍 OpenClaw is awesome — don't forget to use the **Python version**! 100% aligned.
 
 ---
 
