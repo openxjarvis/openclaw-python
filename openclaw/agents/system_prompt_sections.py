@@ -46,11 +46,11 @@ CORE_TOOL_SUMMARIES: dict[str, str] = {
     ),
     "message": "Send messages and channel actions",
     "gateway": "Restart, apply config, or run updates on the running OpenClaw process",
-    "agents_list": "List agent ids allowed for sessions_spawn",
+    "agents_list": "List OpenClaw agent ids allowed for sessions_spawn",
     "sessions_list": "List other sessions (incl. sub-agents) with filters/last",
     "sessions_history": "Fetch history for another session/sub-agent",
     "sessions_send": "Send a message to another session/sub-agent",
-    "sessions_spawn": "Spawn a sub-agent session",
+    "sessions_spawn": "Spawn an isolated sub-agent session",
     "subagents": "List, steer, or kill sub-agent runs for this requester session",
     "session_status": (
         'Show a /status-equivalent status card (usage + time + Reasoning/Verbose/Elevated); '
@@ -151,13 +151,20 @@ def build_tooling_section(
         else:
             lines.append(f"- {tool_name}")
 
+    # Directly copied from TypeScript system-prompt.ts lines 446-457
     lines.append(
         "TOOLS.md does not control tool availability; it is user guidance for how to use external tools."
     )
+    exec_tool_name = "bash" if "bash" in available_set else "exec"
+    process_tool_name = "process"
     lines.append(
-        "If a task is more complex or takes longer, spawn a sub-agent. "
-        "It will do the work for you and ping you when it's done. "
-        "You can always check up on it."
+        f"For long waits, avoid rapid poll loops: use {exec_tool_name} with enough yieldMs or {process_tool_name}(action=poll, timeout=<ms>)."
+    )
+    lines.append(
+        "If a task is more complex or takes longer, spawn a sub-agent. Completion is push-based: it will auto-announce when done."
+    )
+    lines.append(
+        "Do not poll `subagents list` / `sessions_list` in a loop; only check status on-demand (for intervention, debugging, or when explicitly asked)."
     )
     lines.append("")
 

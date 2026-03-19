@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -374,7 +375,7 @@ def read_post_compaction_context(
     try:
         import os
         from pathlib import Path
-        sessions_dir = Path.home() / ".openclaw" / "sessions"
+        sessions_dir = resolve_state_dir() / "sessions"
         # Try to find a post-compaction context file for this session
         candidates = [
             sessions_dir / session_key / "post-compact.md",

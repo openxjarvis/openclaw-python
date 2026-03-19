@@ -7,6 +7,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from ..config.paths import resolve_state_dir
 
 console = Console()
 reset_app = typer.Typer(help="Reset local config/state (keeps the CLI installed)")
@@ -85,10 +86,10 @@ def reset_main(
     from ..config.paths import resolve_config_path, resolve_state_dir
     
     state_dir = resolve_state_dir()
-    config_path = resolve_config_path() or Path.home() / ".openclaw" / "openclaw.json"
+    config_path = resolve_config_path() or resolve_state_dir() / "openclaw.json"
     oauth_dir = state_dir / "credentials"
     sessions_dir = state_dir / "agents"
-    workspace_dir = Path.home() / ".openclaw" / "workspace"
+    workspace_dir = resolve_state_dir() / "workspace"
     
     console.print(f"\n[cyan]Reset scope:[/cyan] {reset_scope}")
     if dry_run:

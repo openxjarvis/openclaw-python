@@ -30,6 +30,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,9 @@ def resolve_state_dir() -> Path:
     )
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".openclaw"
+    # Use the imported resolve_state_dir from paths module
+    from openclaw.config.paths import resolve_state_dir as _resolve
+    return _resolve()
 
 
 def resolve_agent_dir(agent_id: str | None = None) -> Path:

@@ -18,6 +18,8 @@ else:
     UTC = timezone.utc
 from typing import Any
 
+from openclaw.config.paths import resolve_state_dir
+
 # Import store-based session methods
 from openclaw.gateway.api.sessions_methods import (
     SessionsListMethod,
@@ -621,16 +623,22 @@ async def _run_agent_turn(
     async def _emit(stream: str, data: dict[str, Any]) -> None:
         nonlocal seq
         seq += 1
-        await connection.send_event(
-            "agent",
-            {
-                "runId": run_id,
-                "seq": seq,
-                "stream": stream,
-                "ts": int(datetime.now(UTC).timestamp() * 1000),
-                "data": data,
-            },
-        )
+        try:
+            await connection.send_event(
+                "agent",
+                {
+                    "runId": run_id,
+                    "seq": seq,
+                    "stream": stream,
+                    "ts": int(datetime.now(UTC).timestamp() * 1000),
+                    "data": data,
+                },
+            )
+        except Exception as e:
+            # Connection closed (e.g., internal RPC calls close immediately)
+            # This is expected for fire-and-forget internal calls
+            if "closing transport" not in str(e).lower():
+                raise
 
     try:
         await _emit("lifecycle", {"phase": "start"})
@@ -759,7 +767,8 @@ async def handle_agent_identity_get(connection: Any, params: dict[str, Any]) -> 
         
         # Read workspace identity.md file (mirrors TS resolveAssistantIdentity)
         # Priority: workspace identity > agents config > ui.assistant config
-        workspace_dir = Path.home() / ".openclaw" / "agents" / agent_id
+        state_dir = resolve_state_dir()
+        workspace_dir = state_dir / "agents" / agent_id
         workspace_identity_path = workspace_dir / "identity.md"
         
         if workspace_identity_path.exists():
@@ -1393,11 +1402,11 @@ async def handle_cron_runs(connection: Any, params: dict[str, Any]) -> dict[str,
     
     try:
         from openclaw.cron.store import CronRunLog
-        from pathlib import Path
         
         # Read run log for the job (arg order: log_dir, job_id)
         # CronService uses _store_path internally, not store.store_path
-        cron_dir = Path.home() / ".openclaw" / "cron"
+        state_dir = resolve_state_dir()
+        cron_dir = state_dir / "cron"
         run_log_dir = cron_dir / "runs"
         run_log = CronRunLog(run_log_dir, job_id)
         entries = run_log.read(limit=limit)
@@ -1735,7 +1744,6 @@ def resolve_log_file(file_path: Path) -> Path:
 
 
 @register_handler("logs.tail")
-@register_handler("logs.tail")
 async def handle_logs_tail(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Tail gateway logs - mirrors TS logs.tail handler
     
@@ -1764,9 +1772,11 @@ async def handle_logs_tail(connection: Any, params: dict[str, Any]) -> dict[str,
     max_bytes = min(params.get("maxBytes", DEFAULT_MAX_BYTES), MAX_BYTES)
     
     # Resolve log file with rolling log support
-    # Use daily log files in ~/.openclaw/tmp/ (matches CLI setup_logging)
+    # Use daily rolling log files in ~/.openclaw/tmp/openclaw-YYYY-MM-DD.log (matches TS)
     date_str = datetime.now().strftime("%Y-%m-%d")
-    log_file = Path.home() / ".openclaw" / "tmp" / f"openclaw-{date_str}.log"
+    state_dir = resolve_state_dir()
+    log_dir = state_dir / "tmp"
+    log_file = log_dir / f"openclaw-{date_str}.log"
     log_file = resolve_log_file(log_file)
     
     # Check if file exists

@@ -1,6 +1,7 @@
 """LLM Provider utilities for accessing API keys"""
 import os
 from pathlib import Path
+from ..config.paths import resolve_state_dir
 
 
 def get_api_key(provider: str) -> str | None:
@@ -32,7 +33,7 @@ def get_api_key(provider: str) -> str | None:
     # Check .env file in agent directory
     try:
         from dotenv import load_dotenv
-        agent_dir = Path.home() / ".openclaw" / "agents"
+        agent_dir = resolve_state_dir() / "agents"
         env_file = agent_dir / ".env"
         if env_file.exists():
             load_dotenv(env_file)

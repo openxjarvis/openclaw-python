@@ -364,7 +364,7 @@ def get_openclaw_data_dir() -> Path:
     override = os.environ.get("OPENCLAW_DATA_DIR")
     if override:
         return Path(override)
-    return Path.home() / ".openclaw" / "data"
+    return resolve_state_dir() / "data"
 
 
 def get_openclaw_config_dir() -> Path:
@@ -372,4 +372,4 @@ def get_openclaw_config_dir() -> Path:
     override = os.environ.get("OPENCLAW_CONFIG_DIR")
     if override:
         return Path(override)
-    return Path.home() / ".openclaw"
+    return resolve_state_dir()

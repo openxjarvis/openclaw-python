@@ -1,84 +1,105 @@
-"""Heartbeat event system (matches TypeScript infra/heartbeat-events.ts)"""
+"""Heartbeat event system — mirrors src/infra/heartbeat-events.ts"""
 from __future__ import annotations
 
-
-import asyncio
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from typing import Any, Callable
-
-logger = logging.getLogger(__name__)
+from typing import Any, Callable, Literal, TypedDict
 
 
-class HeartbeatEventType(str, Enum):
-    SENT = "sent"
-    OK_EMPTY = "ok-empty"
-    OK_TOKEN = "ok-token"
-    SKIPPED = "skipped"
-    FAILED = "failed"
+HeartbeatIndicatorType = Literal["ok", "alert", "error"]
 
 
-class IndicatorType(str, Enum):
-    HEARTBEAT = "heartbeat"
-    ALERT = "alert"
-    OK = "ok"
-    NONE = "none"
+class HeartbeatEventPayload(TypedDict, total=False):
+    """Heartbeat event payload"""
+    ts: float
+    status: Literal["sent", "ok-empty", "ok-token", "skipped", "failed"]
+    to: str
+    account_id: str
+    preview: str
+    duration_ms: float
+    has_media: bool
+    reason: str
+    channel: str
+    silent: bool
+    indicator_type: HeartbeatIndicatorType
 
 
-@dataclass
-class HeartbeatEvent:
-    """A single heartbeat event"""
-    event_type: HeartbeatEventType
-    agent_id: str
-    timestamp: datetime = field(default_factory=datetime.now)
-    reason: str | None = None
-    metadata: dict[str, Any] | None = None
-
-
-# Global event storage
-_last_events: dict[str, HeartbeatEvent] = {}
-_listeners: list[Callable[[HeartbeatEvent], Any]] = []
-
-
-def emit_heartbeat_event(event: HeartbeatEvent) -> None:
-    """Emit a heartbeat event"""
-    _last_events[event.agent_id] = event
-    logger.debug(f"Heartbeat event: {event.event_type} for agent {event.agent_id}")
+def resolve_indicator_type(status: str) -> HeartbeatIndicatorType | None:
+    """
+    Map heartbeat status to indicator type for UI display.
     
-    for listener in _listeners:
+    Args:
+        status: Heartbeat status
+        
+    Returns:
+        Indicator type or None for skipped status
+    """
+    if status in ("ok-empty", "ok-token"):
+        return "ok"
+    if status == "sent":
+        return "alert"
+    if status == "failed":
+        return "error"
+    if status == "skipped":
+        return None
+    return None
+
+
+# Module state (singleton pattern)
+_last_heartbeat: HeartbeatEventPayload | None = None
+_listeners: set[Callable[[HeartbeatEventPayload], None]] = set()
+
+
+def emit_heartbeat_event(evt: dict[str, Any]) -> None:
+    """
+    Emit a heartbeat event.
+    
+    Args:
+        evt: Event payload (without ts, which is added automatically)
+    """
+    import time
+    
+    global _last_heartbeat
+    
+    # Enrich with timestamp
+    enriched: HeartbeatEventPayload = {
+        "ts": time.time() * 1000,  # milliseconds
+        **evt,  # type: ignore
+    }
+    
+    _last_heartbeat = enriched
+    
+    # Notify listeners
+    for listener in list(_listeners):
         try:
-            result = listener(event)
-            if asyncio.iscoroutine(result):
-                asyncio.ensure_future(result)
-        except Exception as e:
-            logger.error(f"Heartbeat listener error: {e}")
+            listener(enriched)
+        except Exception:
+            # Ignore listener errors
+            pass
 
 
-def on_heartbeat_event(listener: Callable[[HeartbeatEvent], Any]) -> Callable:
-    """Subscribe to heartbeat events. Returns unsubscribe function."""
-    _listeners.append(listener)
+def on_heartbeat_event(listener: Callable[[HeartbeatEventPayload], None]) -> Callable[[], None]:
+    """
+    Register a heartbeat event listener.
+    
+    Args:
+        listener: Callback function
+        
+    Returns:
+        Unsubscribe function
+    """
+    _listeners.add(listener)
     
     def unsubscribe():
-        if listener in _listeners:
-            _listeners.remove(listener)
+        _listeners.discard(listener)
     
     return unsubscribe
 
 
-def get_last_heartbeat_event(agent_id: str) -> HeartbeatEvent | None:
-    """Get the last heartbeat event for an agent"""
-    return _last_events.get(agent_id)
+def get_last_heartbeat_event() -> HeartbeatEventPayload | None:
+    """
+    Get the last heartbeat event.
+    
+    Returns:
+        Last heartbeat event or None
+    """
+    return _last_heartbeat
 
-
-def resolve_indicator_type(event_type: HeartbeatEventType) -> IndicatorType:
-    """Map heartbeat event type to indicator type"""
-    mapping = {
-        HeartbeatEventType.SENT: IndicatorType.HEARTBEAT,
-        HeartbeatEventType.OK_EMPTY: IndicatorType.OK,
-        HeartbeatEventType.OK_TOKEN: IndicatorType.OK,
-        HeartbeatEventType.SKIPPED: IndicatorType.NONE,
-        HeartbeatEventType.FAILED: IndicatorType.ALERT,
-    }
-    return mapping.get(event_type, IndicatorType.NONE)

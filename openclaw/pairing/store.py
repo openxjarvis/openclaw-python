@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .codes import generate_pairing_code
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ class PairingStore:
     
     def _resolve_store_path(self) -> Path:
         """Resolve store file path for channel"""
-        credentials_dir = Path.home() / ".openclaw" / "credentials"
+        credentials_dir = resolve_state_dir() / "credentials"
         safe_channel = self._safe_channel_key(self.channel)
         return credentials_dir / f"{safe_channel}-pairing.json"
     

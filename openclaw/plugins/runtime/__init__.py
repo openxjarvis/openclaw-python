@@ -62,6 +62,7 @@ def create_plugin_runtime(
     # --- system ---
     system = PluginRuntimeSystem(
         enqueue_system_event=_try_import("openclaw.infra.system_events", "enqueue_system_event"),
+        request_heartbeat_now=_try_import("openclaw.infra.heartbeat_wake", "request_heartbeat_now"),
         run_command_with_timeout=_try_import("openclaw.process.exec", "run_command_with_timeout"),
         format_native_dependency_hint=None,
     )
@@ -82,6 +83,10 @@ def create_plugin_runtime(
     tts = PluginRuntimeTts(
         text_to_speech_telephony=_try_import("openclaw.tts.tts", "text_to_speech_telephony"),
     )
+
+    # --- stt ---
+    from .runtime_stt import create_runtime_stt
+    stt = create_runtime_stt()
 
     # --- tools ---
     tools = PluginRuntimeTools(
@@ -202,10 +207,14 @@ def create_plugin_runtime(
         commands=channel_commands,
     )
 
+    # --- events ---
+    from .runtime_events import create_runtime_events
+    events = create_runtime_events()
+
     # --- logging ---
     logging_rt = PluginRuntimeLogging(
-        should_log_verbose=None,
-        get_child_logger=None,
+        should_log_verbose=_try_import("openclaw.globals", "should_log_verbose"),
+        get_child_logger=_try_import("openclaw.logging.subsystem", "get_child_logger"),
     )
 
     # --- state ---
@@ -219,7 +228,9 @@ def create_plugin_runtime(
         system=system,
         media=media,
         tts=tts,
+        stt=stt,
         tools=tools,
+        events=events,
         channel=channel,
         logging=logging_rt,
         state=state,

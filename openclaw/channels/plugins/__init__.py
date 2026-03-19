@@ -1,24 +1,54 @@
-"""Channel Plugins Architecture
+"""Channels plugins system
 
-This module implements the plugin architecture for channel-specific functionality,
-matching the TypeScript implementation in src/channels/plugins/
-
-Plugin Types:
-- actions: Channel-specific actions (send, react, delete, edit, etc.)
-- agent_tools: Channel-exposed tools for agent use
-- normalize: Message normalization and target ID parsing
-- onboarding: Channel onboarding and setup flows
-- outbound: Outbound message adapters
-- status_issues: Status checking and issue reporting
+Provides outbound handling, onboarding, actions, and adapters.
 """
+# Import from outbound/ directory (channel-specific adapters)
+from .outbound import (
+    TelegramOutboundAdapter,
+    DiscordOutboundAdapter,
+    SignalOutboundAdapter,
+    SlackOutboundAdapter,
+    load_outbound_adapter,
+)
+from .onboarding import (
+    OnboardingStep,
+    OnboardingFlow,
+    OnboardingManager,
+)
+from .actions import (
+    MessageAction,
+    ActionHandler,
+    MessageActionsManager,
+)
+from .adapters import (
+    ChannelAdapter,
+    AdapterRegistration,
+    ChannelAdapterRegistry,
+)
 
-from __future__ import annotations
+# Alias for compatibility with deliver.py
+get_channel_plugin = load_outbound_adapter
 
 __all__ = [
-    "actions",
-    "agent_tools",
-    "normalize",
-    "onboarding",
-    "outbound",
-    "status_issues",
+    # Outbound adapters (from outbound/ directory)
+    "TelegramOutboundAdapter",
+    "DiscordOutboundAdapter",
+    "SignalOutboundAdapter",
+    "SlackOutboundAdapter",
+    "load_outbound_adapter",
+    "get_channel_plugin",  # Alias
+    # Onboarding
+    "OnboardingStep",
+    "OnboardingFlow",
+    "OnboardingManager",
+    # Actions
+    "MessageAction",
+    "ActionHandler",
+    "MessageActionsManager",
+    # Adapters
+    "ChannelAdapter",
+    "AdapterRegistration",
+    "ChannelAdapterRegistry",
 ]
+
+

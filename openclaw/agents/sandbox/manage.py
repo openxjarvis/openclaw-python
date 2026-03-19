@@ -14,11 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from .docker import exec_docker, docker_container_state
+from ...config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
 # Registry paths (mirrors TS SANDBOX_REGISTRY_PATH)
-_STATE_DIR = str(Path.home() / ".openclaw" / "state")
+_STATE_DIR = str(resolve_state_dir() / "state")
 _SANDBOX_REGISTRY_PATH = str(Path(_STATE_DIR) / "sandbox" / "containers.json")
 _SANDBOX_BROWSER_REGISTRY_PATH = str(Path(_STATE_DIR) / "sandbox" / "browsers.json")
 

@@ -354,7 +354,7 @@ async def spawn_subagent_direct(
     Returns:
         SpawnSubagentResult with status, childSessionKey, runId, etc.
     """
-    from openclaw.config.unified import load_config
+    from openclaw.config.loader import load_config
     from openclaw.auto_reply.reply.thinking import normalize_think_level, format_thinking_levels
     import base64
     import hashlib
@@ -384,7 +384,17 @@ async def spawn_subagent_direct(
     
     # Parse attachments (matches TS lines 504-537)
     attachments = params.attachments or []
-    attachments_enabled = cfg.get("tools", {}).get("sessions_spawn", {}).get("attachments", {}).get("enabled", False)
+    # Safe config access for both dict and Pydantic object
+    attachments_enabled = False
+    if isinstance(cfg, dict):
+        attachments_enabled = cfg.get("tools", {}).get("sessions_spawn", {}).get("attachments", {}).get("enabled", False)
+    elif hasattr(cfg, "tools") and cfg.tools:
+        tools_cfg = cfg.tools
+        if hasattr(tools_cfg, "sessions_spawn") and tools_cfg.sessions_spawn:
+            ss_cfg = tools_cfg.sessions_spawn
+            if hasattr(ss_cfg, "attachments") and ss_cfg.attachments:
+                attachments_cfg = ss_cfg.attachments
+                attachments_enabled = getattr(attachments_cfg, "enabled", False) is True
     mount_path_hint = params.attachMountPath or "attachments"
     
     # Normalize delivery context (mirrors TS lines 81-86)
@@ -510,9 +520,10 @@ async def spawn_subagent_direct(
         )
     
     # Resolve requester and target agent IDs (mirrors TS lines 127-130)
+    parsed_key = parse_agent_session_key(requester_internal_key)
     requester_agent_id = normalize_agent_id(
         ctx.requesterAgentIdOverride
-        or (parse_agent_session_key(requester_internal_key) or {}).get("agent_id")
+        or (parsed_key.agent_id if parsed_key else None)
     )
     target_agent_id = (
         normalize_agent_id(requested_agent_id)
@@ -622,23 +633,20 @@ async def spawn_subagent_direct(
             )
         thinking_override = normalized_thinking
     
-    # Gateway RPC: Patch session with spawnDepth (mirrors TS lines 176-190)
+    # Gateway RPC: Patch session with spawnDepth (mirrors TS lines 426-432)
+    # TS: openclaw/src/agents/subagent-spawn.ts:426-432
     if gateway is not None:
         try:
-            # Call sessions.patch handler directly
-            from openclaw.gateway.api.sessions_methods import SessionsPatchMethod
+            from openclaw.gateway.internal_call import patch_session_internal
             
-            patch_method = SessionsPatchMethod()
-            mock_connection = type("MockConnection", (), {"gateway": gateway})()
-            
-            await patch_method.execute(
-                mock_connection,
-                {
-                    "key": child_session_key,
-                    "patch": {"spawnDepth": child_depth},
-                },
+            await patch_session_internal(
+                gateway=gateway,
+                key=child_session_key,
+                patch={"spawnDepth": child_depth},
+                timeout_ms=10_000,
             )
         except Exception as err:
+            logger.error(f"Failed to patch spawnDepth: {err}")
             message_text = str(err)
             return SpawnSubagentResult(
                 status="error",
@@ -646,23 +654,41 @@ async def spawn_subagent_direct(
                 childSessionKey=child_session_key,
             )
     
-    # Gateway RPC: Patch session with model (mirrors TS lines 192-209)
+    # Gateway RPC: Patch session with spawnedBy (required for subagent tracking)
+    if gateway is not None:
+        try:
+            from openclaw.gateway.internal_call import patch_session_internal
+            
+            await patch_session_internal(
+                gateway=gateway,
+                key=child_session_key,
+                patch={"spawnedBy": spawned_by_key},
+                timeout_ms=10_000,
+            )
+        except Exception as err:
+            logger.error(f"Failed to patch spawnedBy: {err}")
+            message_text = str(err)
+            return SpawnSubagentResult(
+                status="error",
+                error=message_text,
+                childSessionKey=child_session_key,
+            )
+    
+    # Gateway RPC: Patch session with model (mirrors TS lines 435-444)
+    # TS: openclaw/src/agents/subagent-spawn.ts:435-444
     if resolved_model and gateway is not None:
         try:
-            from openclaw.gateway.api.sessions_methods import SessionsPatchMethod
+            from openclaw.gateway.internal_call import patch_session_internal
             
-            patch_method = SessionsPatchMethod()
-            mock_connection = type("MockConnection", (), {"gateway": gateway})()
-            
-            await patch_method.execute(
-                mock_connection,
-                {
-                    "key": child_session_key,
-                    "patch": {"model": resolved_model},
-                },
+            await patch_session_internal(
+                gateway=gateway,
+                key=child_session_key,
+                patch={"model": resolved_model},
+                timeout_ms=10_000,
             )
             model_applied = True
         except Exception as err:
+            logger.error(f"Failed to patch model: {err}")
             message_text = str(err)
             return SpawnSubagentResult(
                 status="error",
@@ -670,24 +696,22 @@ async def spawn_subagent_direct(
                 childSessionKey=child_session_key,
             )
     
-    # Gateway RPC: Patch session with thinking level (mirrors TS lines 210-229)
+    # Gateway RPC: Patch session with thinking level (mirrors TS lines 446-457)
+    # TS: openclaw/src/agents/subagent-spawn.ts:446-457
     if thinking_override is not None and gateway is not None:
         try:
-            from openclaw.gateway.api.sessions_methods import SessionsPatchMethod
-            
-            patch_method = SessionsPatchMethod()
-            mock_connection = type("MockConnection", (), {"gateway": gateway})()
+            from openclaw.gateway.internal_call import patch_session_internal
             
             thinking_level_value = None if thinking_override == "off" else thinking_override
             
-            await patch_method.execute(
-                mock_connection,
-                {
-                    "key": child_session_key,
-                    "patch": {"thinkingLevel": thinking_level_value},
-                },
+            await patch_session_internal(
+                gateway=gateway,
+                key=child_session_key,
+                patch={"thinkingLevel": thinking_level_value},
+                timeout_ms=10_000,
             )
         except Exception as err:
+            logger.error(f"Failed to patch thinkingLevel: {err}")
             message_text = str(err)
             return SpawnSubagentResult(
                 status="error",
@@ -892,19 +916,17 @@ async def spawn_subagent_direct(
     child_task_message = "\n\n".join(parts)
     
     # Thread binding for session mode (mirrors TS ensureThreadBindingForSubagentSpawn)
+    # TS: openclaw/src/agents/subagent-spawn.ts lines 416-425
     if mode == "session" and params.thread and gateway is not None:
         try:
-            from openclaw.gateway.api.sessions_methods import SessionsPatchMethod
-
-            patch_method = SessionsPatchMethod()
-            mock_connection = type("MockConnection", (), {"gateway": gateway})()
+            from openclaw.gateway.internal_call import patch_session_internal
+            
             thread_id = ctx.agentThreadId or str(uuid.uuid4())
-            await patch_method.execute(
-                mock_connection,
-                {
-                    "key": child_session_key,
-                    "patch": {"threadId": str(thread_id), "threadBound": True},
-                },
+            await patch_session_internal(
+                gateway=gateway,
+                key=child_session_key,
+                patch={"threadId": str(thread_id), "threadBound": True},
+                timeout_ms=10_000,
             )
             logger.debug("Thread binding set for session-mode subagent %s", child_session_key)
         except Exception as exc:
@@ -914,47 +936,53 @@ async def spawn_subagent_direct(
     if mode == "session":
         cleanup = "keep"
 
-    # Launch agent run (mirrors TS lines 244-282)
+    # Launch agent run via internal RPC (mirrors TS lines 702-727)
+    # TS: openclaw/src/agents/subagent-spawn.ts:702-724
     child_idem = str(uuid.uuid4())
     child_run_id = child_idem
     
     if gateway is not None:
         try:
-            # Call agent handler directly
-            from openclaw.gateway.handlers import handle_agent
+            # Use internal Gateway RPC call instead of direct handler invocation
+            from openclaw.gateway.internal_call import call_agent_internal
             
-            mock_connection = type("MockConnection", (), {"gateway": gateway})()
+            response = await call_agent_internal(
+                gateway=gateway,
+                message=child_task_message,
+                session_key=child_session_key,
+                idempotency_key=child_idem,
+                deliver=False,
+                lane=AGENT_LANE_SUBAGENT,
+                extra_system_prompt=child_system_prompt,
+                thinking=thinking_override,
+                timeout=run_timeout_seconds if run_timeout_seconds > 0 else None,
+                label=label or None,
+                spawned_by=spawned_by_key,
+                group_id=ctx.agentGroupId,
+                group_channel=ctx.agentGroupChannel,
+                group_space=ctx.agentGroupSpace,
+                channel=requester_origin.get("channel") if requester_origin else None,
+                to=requester_origin.get("to") if requester_origin else None,
+                account_id=requester_origin.get("accountId") if requester_origin else None,
+                thread_id=str(requester_origin.get("threadId")) if requester_origin and requester_origin.get("threadId") is not None else None,
+                timeout_ms=10_000,
+            )
             
-            agent_params = {
-                "message": child_task_message,
-                "sessionKey": child_session_key,
-                "channel": requester_origin.get("channel") if requester_origin else None,
-                "to": requester_origin.get("to") if requester_origin else None,
-                "accountId": requester_origin.get("accountId") if requester_origin else None,
-                "threadId": str(requester_origin.get("threadId")) if requester_origin and requester_origin.get("threadId") is not None else None,
-                "idempotencyKey": child_idem,
-                "deliver": False,
-                "lane": AGENT_LANE_SUBAGENT,
-                "extraSystemPrompt": child_system_prompt,
-                "thinking": thinking_override,
-                "timeout": run_timeout_seconds if run_timeout_seconds > 0 else None,
-                "label": label or None,
-                "spawnedBy": spawned_by_key,
-                "groupId": ctx.agentGroupId,
-                "groupChannel": ctx.agentGroupChannel,
-                "groupSpace": ctx.agentGroupSpace,
-            }
-            
-            response = await handle_agent(mock_connection, agent_params)
-            
-            if isinstance(response, dict) and "runId" in response:
+            # Extract runId from response (mirrors TS line 725-727)
+            if isinstance(response, dict) and response.get("runId"):
                 child_run_id = response["runId"]
+            
+            logger.info(
+                f"Subagent spawned via internal RPC: childSessionKey={child_session_key}, "
+                f"runId={child_run_id}, mode={mode}"
+            )
         
         except Exception as err:
+            logger.error(f"Failed to spawn subagent via internal RPC: {err}", exc_info=True)
             message_text = str(err)
             return SpawnSubagentResult(
                 status="error",
-                error=message_text,
+                error=f"Failed to launch subagent: {message_text}",
                 childSessionKey=child_session_key,
                 runId=child_run_id,
             )
@@ -965,13 +993,11 @@ async def spawn_subagent_direct(
         requester_session_key=requester_internal_key,
         task=task,
         requester_origin=requester_origin,
-        requester_display_key=requester_display_key,
         cleanup=cleanup,
         label=label or None,
         model=resolved_model,
         run_timeout_seconds=run_timeout_seconds if run_timeout_seconds > 0 else None,
         expects_completion_message=params.expectsCompletionMessage,
-        archive_after_minutes=archive_after_minutes,
     )
     
     # Fire subagent_spawned plugin hook (mirrors TS subagentSpawnedHook)

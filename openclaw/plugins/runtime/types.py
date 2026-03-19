@@ -23,6 +23,7 @@ class PluginRuntimeConfig:
 class PluginRuntimeSystem:
     """runtime.system — system-level utilities."""
     enqueue_system_event: Callable[..., Any] | None = None
+    request_heartbeat_now: Callable[..., Any] | None = None
     run_command_with_timeout: Callable[..., Any] | None = None
     format_native_dependency_hint: Callable[..., Any] | None = None
 
@@ -44,6 +45,12 @@ class PluginRuntimeMedia:
 class PluginRuntimeTts:
     """runtime.tts — text-to-speech."""
     text_to_speech_telephony: Callable[..., Any] | None = None
+
+
+@dataclass
+class PluginRuntimeStt:
+    """runtime.stt — speech-to-text."""
+    transcribe_audio_file: Callable[..., Any] | None = None
 
 
 @dataclass
@@ -166,6 +173,13 @@ class PluginRuntimeLogging:
 
 
 @dataclass
+class PluginRuntimeEvents:
+    """runtime.events — event listeners."""
+    on_agent_event: Callable[..., Any] | None = None
+    on_session_transcript_update: Callable[..., Any] | None = None
+
+
+@dataclass
 class PluginRuntimeState:
     """runtime.state — state directory resolution."""
     resolve_state_dir: Callable[..., Any] | None = None
@@ -182,7 +196,9 @@ class PluginRuntime:
     system: PluginRuntimeSystem = field(default_factory=PluginRuntimeSystem)
     media: PluginRuntimeMedia = field(default_factory=PluginRuntimeMedia)
     tts: PluginRuntimeTts = field(default_factory=PluginRuntimeTts)
+    stt: PluginRuntimeStt = field(default_factory=PluginRuntimeStt)
     tools: PluginRuntimeTools = field(default_factory=PluginRuntimeTools)
+    events: PluginRuntimeEvents = field(default_factory=PluginRuntimeEvents)
     channel: PluginRuntimeChannel = field(default_factory=PluginRuntimeChannel)
     logging: PluginRuntimeLogging = field(default_factory=PluginRuntimeLogging)
     state: PluginRuntimeState = field(default_factory=PluginRuntimeState)

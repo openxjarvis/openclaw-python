@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from .base import AgentTool, ToolResult
+from ...config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +185,7 @@ class GatewayTool(AgentTool):
             from pathlib import Path
             import json as json_lib
             
-            sentinel_dir = Path.home() / ".openclaw" / "gateway"
+            sentinel_dir = resolve_state_dir() / "gateway"
             sentinel_dir.mkdir(parents=True, exist_ok=True)
             sentinel_path = sentinel_dir / "restart-sentinel.json"
             

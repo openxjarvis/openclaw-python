@@ -95,11 +95,29 @@ class ToolRegistry:
 
         # Session management (only if session manager available)
         if self._session_manager:
+            # Get current session key from session manager if available
+            current_session_key = getattr(self._session_manager, 'current_session_key', None)
+            
             for t in [
-                SessionsListTool(self._session_manager),
-                SessionsHistoryTool(self._session_manager),
-                SessionsSendTool(self._session_manager),
-                SessionsSpawnTool(self._session_manager),
+                SessionsListTool(
+                    self._session_manager,
+                    current_session_key=current_session_key,
+                    cfg=self._config  # Pass config for access control
+                ),
+                SessionsHistoryTool(
+                    self._session_manager,
+                    current_session_key=current_session_key,
+                    cfg=self._config
+                ),
+                SessionsSendTool(
+                    self._session_manager,
+                    current_session_key=current_session_key,
+                    cfg=self._config
+                ),
+                SessionsSpawnTool(
+                    self._session_manager,
+                    gateway=getattr(self._session_manager, '_gateway', None)
+                ),
             ]:
                 self._tools[t.name] = t
 

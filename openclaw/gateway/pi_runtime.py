@@ -32,6 +32,8 @@ Usage in handlers (backward-compat run_turn interface)::
 """
 from __future__ import annotations
 
+from openclaw.config.paths import resolve_state_dir
+
 import asyncio
 import inspect
 import logging
@@ -403,7 +405,7 @@ class PiAgentRuntime:
             # Load and limit history (Phase 1: Emergency fix for token overflow)
             history_messages = []
             try:
-                session_dir = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+                session_dir = resolve_state_dir() / "agents" / "main" / "sessions"
                 transcript_path = session_dir / f"{session_id}.jsonl"
                 
                 if transcript_path.exists():
@@ -1457,31 +1459,6 @@ class PiAgentRuntime:
                             if msg:
                                 msgs = [msg] + list(msgs)
                             
-                            # DEBUG: Log the full message structure to understand what pi returns
-                            if msgs:
-                                try:
-                                    logger.info("[MEDIA-DEBUG] agent_end has %d messages", len(msgs))
-                                    for idx, m in enumerate(msgs):
-                                        if isinstance(m, dict):
-                                            content_chunks = m.get("content", [])
-                                            msg_role = m.get("role", "unknown")
-                                        else:
-                                            content_chunks = getattr(m, "content", [])
-                                            msg_role = getattr(m, "role", "unknown")
-                                        
-                                        logger.info("[MEDIA-DEBUG] msg[%d] role=%s has %d content chunks", idx, msg_role, len(content_chunks) if isinstance(content_chunks, list) else 0)
-                                        
-                                        if isinstance(content_chunks, list):
-                                            for cidx, chunk in enumerate(content_chunks[:3]):  # Log first 3 chunks
-                                                if isinstance(chunk, dict):
-                                                    chunk_type = chunk.get("type")
-                                                    chunk_text = chunk.get("text", "")[:200]
-                                                else:
-                                                    chunk_type = getattr(chunk, "type", None)
-                                                    chunk_text = getattr(chunk, "text", "")[:200]
-                                                logger.info("[MEDIA-DEBUG]   chunk[%d] type=%s text=%s", cidx, chunk_type, chunk_text)
-                                except Exception as debug_err:
-                                    logger.info("[MEDIA-DEBUG] Error logging message structure: %s", debug_err)
                             
                             # Extract MEDIA: tokens from tool results in message content.
                             # pi_coding_agent embeds ToolResult.content into message content blocks,
@@ -1518,7 +1495,6 @@ class PiAgentRuntime:
                                 
                                 # Now check the concatenated text for MEDIA: tokens
                                 if full_text and "MEDIA:" in full_text.upper():
-                                    logger.info("[MEDIA-DEBUG] Found MEDIA in %s message: %s", msg_role, full_text[:150])
                                     for _line in full_text.splitlines():
                                         _stripped = _line.strip()
                                         if _stripped.upper().startswith("MEDIA:"):

@@ -17,35 +17,50 @@ from .types import (
     MemorySearchResult,
     MemorySource,
 )
-from .embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
+from .embeddings import EmbeddingProvider, OpenAIEmbeddingProvider, create_embedding_provider
 from .hybrid import apply_mmr, merge_hybrid_results, normalize_scores, SearchResult
+from .chunking import chunk_file_by_tokens, DEFAULT_CHUNK_TOKENS, DEFAULT_CHUNK_OVERLAP
+from .advanced_search import extract_keywords, apply_temporal_decay, normalize_han_bm25_query
 
 logger = logging.getLogger(__name__)
 
 
 class BuiltinMemoryManager:
-    """Manages agent memory with vector and full-text search."""
+    """Manages agent memory with vector and full-text search.
+    
+    Aligned with TS memory/manager.ts:
+    - Token-based chunking (400 tokens with 80 overlap)
+    - Vector + FTS hybrid search
+    - Embedding cache support
+    """
     
     def __init__(
         self,
         agent_id: str,
         workspace_dir: Path,
-        embedding_provider: Optional[str | EmbeddingProvider] = None
+        embedding_provider: Optional[str | EmbeddingProvider] = None,
+        chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ):
         self.agent_id = agent_id
         self.workspace_dir = workspace_dir
+        self.chunk_tokens = chunk_tokens
+        self.chunk_overlap = chunk_overlap
         # Resolved provider name (string) for status reporting
         self._embedding_provider_name: str = (
             embedding_provider if isinstance(embedding_provider, str) else "custom"
         ) if embedding_provider else "openai"
 
-        # Initialize embedding provider
+        # Initialize embedding provider using factory
         if isinstance(embedding_provider, EmbeddingProvider):
             self.embedder = embedding_provider
-        elif embedding_provider == "openai" or embedding_provider is None:
-            self.embedder = OpenAIEmbeddingProvider()
         else:
-            self.embedder = OpenAIEmbeddingProvider()  # Default
+            # Use factory to support all configured providers (openai, gemini, voyage, local)
+            provider_str = embedding_provider if isinstance(embedding_provider, str) else "openai"
+            self.embedder = create_embedding_provider(
+                provider_name=provider_str or "openai",
+                model=None,  # Use provider defaults
+            )
         
         # Set up database path
         memory_dir = workspace_dir / ".openclaw" / "memory"
@@ -60,6 +75,18 @@ class BuiltinMemoryManager:
         """Initialize database with schema."""
         self.db = sqlite3.connect(str(self.db_path))
         self.db.row_factory = sqlite3.Row
+        
+        # Try to load sqlite-vec extension for native vector operations
+        self._sqlite_vec_enabled = False
+        try:
+            import sqlite_vec
+            self.db.enable_load_extension(True)
+            sqlite_vec.load(self.db)
+            self.db.enable_load_extension(False)
+            self._sqlite_vec_enabled = True
+            logger.info("sqlite-vec extension loaded successfully")
+        except Exception as e:
+            logger.info(f"sqlite-vec not available ({e}), using fallback vector search")
         
         # Create schema
         self.db.executescript("""
@@ -132,6 +159,12 @@ class BuiltinMemoryManager:
         """
         Search memory using full-text search (and optionally vector search).
         
+        Includes advanced features from TypeScript:
+        - Query expansion (extract keywords)
+        - Chinese BM25 optimization
+        - Temporal decay
+        - MMR re-ranking
+        
         Args:
             query: Search query
             limit: Maximum number of results
@@ -146,17 +179,34 @@ class BuiltinMemoryManager:
         if not self.db:
             return []
         
-        # If vector enabled and hybrid
+        # Query expansion and Chinese optimization
+        expanded_query = query
+        keywords = extract_keywords(query)
+        if keywords:
+            expanded_query = " ".join(keywords)
+        
+        # Chinese BM25 optimization
+        normalized_query = normalize_han_bm25_query(expanded_query)
+        
+        # Search with optimized query
         if use_vector and use_hybrid:
-            return await self._hybrid_search(query, limit, sources, vector_weight)
-        
-        # If only vector
+            results = await self._hybrid_search(normalized_query, limit * 2, sources, vector_weight)
         elif use_vector:
-            return await self._vector_search(query, limit, sources)
-        
-        # Otherwise FTS only
+            results = await self._vector_search(normalized_query, limit * 2, sources)
         else:
-            return await self._fts_search(query, limit, sources)
+            results = await self._fts_search(normalized_query, limit * 2, sources)
+        
+        # Apply temporal decay
+        results = apply_temporal_decay(results)
+        
+        # MMR re-ranking for diversity (if we have enough results)
+        if len(results) > limit:
+            query_embedding = await self.embedder.embed_text(query)
+            results = apply_mmr(results, query_embedding, lambda_param=0.7, top_k=limit)
+        else:
+            results = results[:limit]
+        
+        return results
     
     async def _fts_search(
         self,
@@ -325,34 +375,26 @@ class BuiltinMemoryManager:
         self,
         content: str,
         path: str,
-        chunk_size: int = 500
+        chunk_size: int = 500  # Keep for backward compat, but unused
     ) -> list[dict]:
         """
-        Chunk text into smaller pieces.
+        Chunk text into smaller pieces using token-based chunking (aligned with TS).
         
         Args:
             content: File content
             path: File path
-            chunk_size: Target chunk size in lines
+            chunk_size: Deprecated, kept for compatibility
             
         Returns:
             List of chunk dicts
         """
-        lines = content.split('\n')
-        chunks = []
-        
-        # Simple chunking by line count
-        for i in range(0, len(lines), chunk_size):
-            chunk_lines = lines[i:i + chunk_size]
-            chunk_text = '\n'.join(chunk_lines)
-            
-            chunks.append({
-                'text': chunk_text,
-                'start_line': i + 1,
-                'end_line': min(i + chunk_size, len(lines))
-            })
-        
-        return chunks
+        # Use new token-based chunking (400 tokens + 80 overlap)
+        return chunk_file_by_tokens(
+            path,
+            content,
+            tokens=self.chunk_tokens,
+            overlap=self.chunk_overlap
+        )
     
     def _hash_content(self, content: str) -> str:
         """Hash content for change detection."""
@@ -529,6 +571,8 @@ class BuiltinMemoryManager:
         """
         Vector similarity search
         
+        Uses sqlite-vec native operations if available, otherwise falls back to Python cosine similarity.
+        
         Args:
             query: Search query
             limit: Maximum results
@@ -550,62 +594,125 @@ class BuiltinMemoryManager:
                 source_filter = f"AND chunks.source IN ({placeholders})"
                 source_values = source_names
             
-            # Vector similarity search
-            # Note: This requires sqlite-vec extension for efficient vector search
-            # For now, we'll do a simple approach (fetch all and compute in Python)
-            sql = f"""
-                SELECT 
-                    chunks.id,
-                    chunks.path,
-                    chunks.source,
-                    chunks.text,
-                    chunks.start_line,
-                    chunks.end_line,
-                    chunks.embedding
-                FROM chunks
-                WHERE chunks.embedding IS NOT NULL
-                {source_filter}
-            """
-            
-            cursor = self.db.execute(sql, source_values)
-            
-            # Compute cosine similarity
-            results = []
-            for row in cursor.fetchall():
-                # Deserialize embedding (stored as blob)
-                embedding_blob = row['embedding']
-                if not embedding_blob:
-                    continue
-                
-                # Convert blob to list of floats
-                chunk_embedding = self._deserialize_embedding(embedding_blob)
-                
-                # Compute cosine similarity
-                similarity = self._cosine_similarity(query_embedding, chunk_embedding)
-                
-                # Create snippet
-                snippet = row['text'][:200] + ('...' if len(row['text']) > 200 else '')
-                
-                results.append(MemorySearchResult(
-                    id=row['id'],
-                    path=row['path'],
-                    source=MemorySource(row['source']),
-                    text=row['text'],
-                    snippet=snippet,
-                    start_line=row['start_line'],
-                    end_line=row['end_line'],
-                    score=similarity
-                ))
-            
-            # Sort by similarity (descending)
-            results.sort(key=lambda r: r.score, reverse=True)
-            
-            # Return top N
-            return results[:limit]
+            # Use sqlite-vec native operations if available
+            if self._sqlite_vec_enabled:
+                return await self._vector_search_native(query_embedding, limit, source_filter, source_values)
+            else:
+                return await self._vector_search_fallback(query_embedding, limit, source_filter, source_values)
             
         except Exception as e:
             logger.error(f"Vector search error: {e}", exc_info=True)
             return []
+    
+    async def _vector_search_native(
+        self,
+        query_embedding: list[float],
+        limit: int,
+        source_filter: str,
+        source_values: list[str],
+    ) -> list[MemorySearchResult]:
+        """Vector search using sqlite-vec native operations.
+        
+        Mirrors TS implementation using vec_distance_cosine.
+        """
+        # Serialize query embedding for sqlite-vec
+        query_blob = self._serialize_embedding(query_embedding)
+        
+        sql = f"""
+            SELECT 
+                chunks.id,
+                chunks.path,
+                chunks.source,
+                chunks.text,
+                chunks.start_line,
+                chunks.end_line,
+                vec_distance_cosine(chunks.embedding, ?) as distance
+            FROM chunks
+            WHERE chunks.embedding IS NOT NULL
+            {source_filter}
+            ORDER BY distance ASC
+            LIMIT ?
+        """
+        
+        params = [query_blob] + source_values + [limit]
+        cursor = self.db.execute(sql, params)
+        
+        results = []
+        for row in cursor.fetchall():
+            # Convert distance to similarity (1 - distance)
+            # sqlite-vec returns cosine distance (0-2), we want similarity (0-1)
+            similarity = 1.0 - (row['distance'] / 2.0) if row['distance'] is not None else 0.0
+            
+            snippet = row['text'][:200] + ('...' if len(row['text']) > 200 else '')
+            
+            results.append(MemorySearchResult(
+                id=row['id'],
+                path=row['path'],
+                source=MemorySource(row['source']),
+                text=row['text'],
+                snippet=snippet,
+                start_line=row['start_line'],
+                end_line=row['end_line'],
+                score=similarity
+            ))
+        
+        return results
+    
+    async def _vector_search_fallback(
+        self,
+        query_embedding: list[float],
+        limit: int,
+        source_filter: str,
+        source_values: list[str],
+    ) -> list[MemorySearchResult]:
+        """Fallback vector search using Python cosine similarity.
+        
+        Used when sqlite-vec is not available.
+        """
+        sql = f"""
+            SELECT 
+                chunks.id,
+                chunks.path,
+                chunks.source,
+                chunks.text,
+                chunks.start_line,
+                chunks.end_line,
+                chunks.embedding
+            FROM chunks
+            WHERE chunks.embedding IS NOT NULL
+            {source_filter}
+        """
+        
+        cursor = self.db.execute(sql, source_values)
+        
+        # Compute cosine similarity in Python
+        results = []
+        for row in cursor.fetchall():
+            embedding_blob = row['embedding']
+            if not embedding_blob:
+                continue
+            
+            chunk_embedding = self._deserialize_embedding(embedding_blob)
+            similarity = self._cosine_similarity(query_embedding, chunk_embedding)
+            
+            snippet = row['text'][:200] + ('...' if len(row['text']) > 200 else '')
+            
+            results.append(MemorySearchResult(
+                id=row['id'],
+                path=row['path'],
+                source=MemorySource(row['source']),
+                text=row['text'],
+                snippet=snippet,
+                start_line=row['start_line'],
+                end_line=row['end_line'],
+                score=similarity
+            ))
+        
+        # Sort by similarity (descending)
+        results.sort(key=lambda r: r.score, reverse=True)
+        
+        # Return top N
+        return results[:limit]
     
     async def _hybrid_search(
         self,

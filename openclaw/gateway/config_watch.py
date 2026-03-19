@@ -12,6 +12,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Callable
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class ConfigWatcher:
     
     Usage:
         watcher = ConfigWatcher(
-            config_path=Path.home() / ".openclaw" / "openclaw.json",
+            config_path=resolve_state_dir() / "openclaw.json",
             reload_callback=gateway.reload_config
         )
         

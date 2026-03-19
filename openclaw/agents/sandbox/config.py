@@ -17,6 +17,7 @@ from .constants import (
     SANDBOX_AGENT_WORKSPACE_MOUNT,
 )
 from .context import SandboxToolPolicy
+from ...config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ _DEFAULT_SANDBOX_CONTAINER_PREFIX = "openclaw-sbx-"
 _DEFAULT_SANDBOX_WORKDIR = "/workspace"
 _DEFAULT_SANDBOX_IDLE_HOURS = 24
 _DEFAULT_SANDBOX_MAX_AGE_DAYS = 7
-_DEFAULT_SANDBOX_WORKSPACE_ROOT = str(Path.home() / ".openclaw" / "sandboxes")
+_DEFAULT_SANDBOX_WORKSPACE_ROOT = str(resolve_state_dir() / "sandboxes")
 _DEFAULT_SANDBOX_BROWSER_IMAGE = "openclaw-sandbox-browser:bookworm-slim"
 _DEFAULT_SANDBOX_BROWSER_PREFIX = "openclaw-sbx-browser-"
 _DEFAULT_SANDBOX_BROWSER_NETWORK = "openclaw-sandbox-browser"

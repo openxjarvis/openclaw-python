@@ -31,6 +31,8 @@
 
 ## 这是什么
 
+> ### 🐍 [TypeScript 版 OpenClaw](https://github.com/badlogic/pi-mono) 虽极好，但别忘了 Python 版！100% 功能对齐。
+
 OpenClaw 是一个自托管的 AI 网关，将你的消息渠道连接到大语言模型：
 
 - **飞书 (Lark)** — 完整功能支持：WebSocket 实时连接、流式卡片输出、媒体消息（图片/文件/语音）、消息反应、配对机制、多账号、多维表格、知识库、文档工具

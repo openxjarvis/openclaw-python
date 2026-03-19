@@ -1,16 +1,23 @@
-"""Gateway logs command"""
-
-import time
+"""Gateway logs commands"""
+import typer
 from pathlib import Path
 from typing import Optional
-
-import typer
 from rich.console import Console
+from datetime import datetime
+import time
+
+from openclaw.config.paths import resolve_state_dir
 
 console = Console()
+
 logs_app = typer.Typer(help="Gateway file logs", no_args_is_help=False)
 
-_DEFAULT_LOG = Path.home() / ".openclaw" / "logs" / "gateway.log"
+# Use rolling log path (matches TS)
+def _get_default_log() -> Path:
+    """Get today's rolling log file path."""
+    log_dir = resolve_state_dir() / "tmp"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    return log_dir / f"openclaw-{date_str}.log"
 
 
 def _do_tail(
@@ -58,13 +65,13 @@ def logs(
     follow: bool = typer.Option(False, "--follow", "-f", help="Follow log output (like tail -f)"),
     interval: int = typer.Option(1000, "--interval", help="Polling interval in ms (with --follow)"),
     json_output: bool = typer.Option(False, "--json", help="Emit raw log lines without formatting"),
-    log_file: Optional[str] = typer.Option(None, "--file", help="Log file path (default: ~/.openclaw/logs/gateway.log)"),
+    log_file: Optional[str] = typer.Option(None, "--file", help="Log file path (default: ~/.openclaw/tmp/openclaw-YYYY-MM-DD.log)"),
 ):
     """Show gateway file logs. Use --follow / -f to tail live output."""
     if ctx.invoked_subcommand is not None:
         return
-
-    path = Path(log_file) if log_file else _DEFAULT_LOG
+    
+    path = Path(log_file) if log_file else _get_default_log()
     try:
         _do_tail(path, limit=limit, follow=follow, interval_ms=interval, json_output=json_output)
     except Exception as e:
@@ -78,10 +85,10 @@ def logs_tail(
     follow: bool = typer.Option(False, "--follow", "-f", help="Follow log output (like tail -f)"),
     interval: int = typer.Option(1000, "--interval", help="Polling interval in ms (with --follow)"),
     json_output: bool = typer.Option(False, "--json", help="Emit raw log lines without formatting"),
-    log_file: Optional[str] = typer.Option(None, "--file", help="Log file path (default: ~/.openclaw/logs/gateway.log)"),
+    log_file: Optional[str] = typer.Option(None, "--file", help="Log file path (default: ~/.openclaw/tmp/openclaw-YYYY-MM-DD.log)"),
 ):
     """Tail gateway logs (alias for 'openclaw logs'). Use -f to follow live."""
-    path = Path(log_file) if log_file else _DEFAULT_LOG
+    path = Path(log_file) if log_file else _get_default_log()
     try:
         _do_tail(path, limit=limit, follow=follow, interval_ms=interval, json_output=json_output)
     except Exception as e:
@@ -96,7 +103,7 @@ def logs_show(
     log_file: Optional[str] = typer.Option(None, "--file", help="Log file path"),
 ):
     """Show recent gateway log lines (no follow)."""
-    path = Path(log_file) if log_file else _DEFAULT_LOG
+    path = Path(log_file) if log_file else _get_default_log()
     try:
         _do_tail(path, limit=limit, follow=False, interval_ms=1000, json_output=json_output)
     except Exception as e:

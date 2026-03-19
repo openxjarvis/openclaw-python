@@ -13,8 +13,7 @@ import logging
 from typing import Any, Callable
 
 from .heartbeat_events import (
-    HeartbeatEvent,
-    HeartbeatEventType,
+    HeartbeatEventPayload,
     emit_heartbeat_event,
 )
 
@@ -134,57 +133,50 @@ async def run_heartbeat_once(
     """Execute a single heartbeat for an agent"""
 
     if not is_heartbeat_enabled_for_agent(agent_config):
-        emit_heartbeat_event(HeartbeatEvent(
-            event_type=HeartbeatEventType.SKIPPED,
-            agent_id=agent_id,
-            reason="disabled",
-        ))
+        emit_heartbeat_event({
+            "status": "skipped",
+            "reason": "disabled",
+        })
         return
 
     if not _is_within_active_hours(agent_config):
-        emit_heartbeat_event(HeartbeatEvent(
-            event_type=HeartbeatEventType.SKIPPED,
-            agent_id=agent_id,
-            reason="outside_active_hours",
-        ))
+        emit_heartbeat_event({
+            "status": "skipped",
+            "reason": "outside_active_hours",
+        })
         return
 
     if is_busy_fn and is_busy_fn(agent_id):
-        emit_heartbeat_event(HeartbeatEvent(
-            event_type=HeartbeatEventType.SKIPPED,
-            agent_id=agent_id,
-            reason="agent_busy",
-        ))
+        emit_heartbeat_event({
+            "status": "skipped",
+            "reason": "agent_busy",
+        })
         return
 
     prompt = resolve_heartbeat_prompt(agent_config)
 
     try:
-        emit_heartbeat_event(HeartbeatEvent(
-            event_type=HeartbeatEventType.SENT,
-            agent_id=agent_id,
-        ))
+        emit_heartbeat_event({
+            "status": "sent",
+        })
 
         result = await execute_fn(agent_id, prompt)
 
         if result:
-            emit_heartbeat_event(HeartbeatEvent(
-                event_type=HeartbeatEventType.OK_TOKEN,
-                agent_id=agent_id,
-            ))
+            emit_heartbeat_event({
+                "status": "ok-token",
+            })
         else:
-            emit_heartbeat_event(HeartbeatEvent(
-                event_type=HeartbeatEventType.OK_EMPTY,
-                agent_id=agent_id,
-            ))
+            emit_heartbeat_event({
+                "status": "ok-empty",
+            })
 
     except Exception as e:
         logger.error(f"Heartbeat failed for agent {agent_id}: {e}")
-        emit_heartbeat_event(HeartbeatEvent(
-            event_type=HeartbeatEventType.FAILED,
-            agent_id=agent_id,
-            reason=str(e),
-        ))
+        emit_heartbeat_event({
+            "status": "failed",
+            "reason": str(e),
+        })
 
 
 async def _heartbeat_loop(

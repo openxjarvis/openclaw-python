@@ -14,6 +14,7 @@ import secrets
 import uuid
 from pathlib import Path
 from typing import Any, Literal
+from ..config.paths import resolve_state_dir
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Types
@@ -45,12 +46,12 @@ def resolve_exec_approvals_path() -> str:
     env_path = os.environ.get("OPENCLAW_EXEC_APPROVALS_PATH")
     if env_path:
         return env_path
-    return str(Path.home() / ".openclaw" / "exec-approvals.json")
+    return str(resolve_state_dir() / "exec-approvals.json")
 
 
 def resolve_exec_approvals_socket_path() -> str:
     """Return path to the approval UNIX socket (mirrors TS resolveExecApprovalsSocketPath)."""
-    return str(Path.home() / ".openclaw" / "exec-approvals.sock")
+    return str(resolve_state_dir() / "exec-approvals.sock")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

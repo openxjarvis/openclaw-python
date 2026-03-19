@@ -18,6 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Awaitable
+from ...config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -959,7 +960,7 @@ def _get_local_media_roots(session_workspace: str | None = None) -> list["Path"]
     import tempfile
     from pathlib import Path
 
-    state_dir = Path.home() / ".openclaw"
+    state_dir = resolve_state_dir()
     roots: list[Path] = [
         Path(tempfile.gettempdir()) / "openclaw",
         state_dir / "media",

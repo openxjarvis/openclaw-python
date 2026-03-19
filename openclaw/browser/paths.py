@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import TypedDict
+from openclaw.config.paths import resolve_state_dir
 
 
 def _resolve_openclaw_tmp_dir() -> Path:
@@ -19,7 +20,7 @@ def _resolve_openclaw_tmp_dir() -> Path:
     env_override = os.environ.get("OPENCLAW_TMP_DIR", "").strip()
     if env_override:
         return Path(env_override)
-    return Path.home() / ".openclaw" / "tmp"
+    return resolve_state_dir() / "tmp"
 
 
 _TMP_DIR = _resolve_openclaw_tmp_dir()

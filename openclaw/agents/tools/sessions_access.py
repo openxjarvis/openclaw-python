@@ -114,7 +114,7 @@ def create_agent_to_agent_policy(cfg: Any) -> AgentToAgentPolicy:
           allow: ["*"]  # or ["work*", "home"]
     
     Args:
-        cfg: Configuration object
+        cfg: Configuration object or dict
     
     Returns:
         AgentToAgentPolicy instance
@@ -122,14 +122,33 @@ def create_agent_to_agent_policy(cfg: Any) -> AgentToAgentPolicy:
     enabled = False
     allow_patterns: list[str] = []
     
-    # Parse config
-    if hasattr(cfg, 'tools') and cfg.tools:
-        routing_a2a = getattr(cfg.tools, 'agentToAgent', None)
-        if routing_a2a:
+    # Parse config - support both object attributes and dict access (mirrors TS cfg.tools?.agentToAgent)
+    routing_a2a = None
+    
+    # Try dict access first (most common case when config is loaded as dict)
+    if isinstance(cfg, dict):
+        tools = cfg.get('tools', {})
+        if isinstance(tools, dict):
+            routing_a2a = tools.get('agentToAgent')
+    # Fallback to object attribute access
+    elif hasattr(cfg, 'tools'):
+        tools = cfg.tools
+        if hasattr(tools, 'agentToAgent'):
+            routing_a2a = tools.agentToAgent
+        elif isinstance(tools, dict):
+            routing_a2a = tools.get('agentToAgent')
+    
+    if routing_a2a:
+        # Support both dict and object access
+        if isinstance(routing_a2a, dict):
+            enabled = routing_a2a.get('enabled', False) is True
+            allow_raw = routing_a2a.get('allow', [])
+        else:
             enabled = getattr(routing_a2a, 'enabled', False) is True
-            allow_raw = getattr(routing_a2a, 'allow', None)
-            if isinstance(allow_raw, list):
-                allow_patterns = allow_raw
+            allow_raw = getattr(routing_a2a, 'allow', [])
+        
+        if isinstance(allow_raw, list):
+            allow_patterns = allow_raw
     
     return AgentToAgentPolicy(
         enabled=enabled,
@@ -144,24 +163,34 @@ def resolve_session_tools_visibility(cfg: Any) -> SessionToolsVisibility:
     Mirrors TS resolveSessionToolsVisibility() from sessions-access.ts lines 23-31
     
     Args:
-        cfg: Configuration object
+        cfg: Configuration object or dict
     
     Returns:
         Visibility level (default: "tree")
     """
-    if not hasattr(cfg, 'tools') or not cfg.tools:
+    raw = None
+    
+    # Support both dict and object access (mirrors TS cfg.tools?.sessions?.visibility)
+    if isinstance(cfg, dict):
+        tools = cfg.get('tools', {})
+        if isinstance(tools, dict):
+            sessions = tools.get('sessions', {})
+            if isinstance(sessions, dict):
+                raw = sessions.get('visibility')
+    elif hasattr(cfg, 'tools'):
+        tools = cfg.tools
+        if hasattr(tools, 'sessions'):
+            sessions = tools.sessions
+            raw = getattr(sessions, 'visibility', None)
+        elif isinstance(tools, dict):
+            sessions = tools.get('sessions', {})
+            if isinstance(sessions, dict):
+                raw = sessions.get('visibility')
+    
+    if not raw:
         return "tree"
     
-    tools = cfg.tools
-    if not hasattr(tools, 'sessions') or not tools.sessions:
-        return "tree"
-    
-    sessions = tools.sessions
-    if not hasattr(sessions, 'visibility'):
-        return "tree"
-    
-    raw = sessions.visibility
-    value = str(raw).strip().lower() if raw else ""
+    value = str(raw).strip().lower()
     
     if value in ("self", "tree", "agent", "all"):
         return value  # type: ignore

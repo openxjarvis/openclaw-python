@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 from typing import Any
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ def resolve_plugin_skills(
     """
     if plugin_dirs is None:
         plugin_dirs = [
-            Path.home() / ".openclaw" / "plugins",
+            resolve_state_dir() / "plugins",
         ]
     
     plugin_skills = []

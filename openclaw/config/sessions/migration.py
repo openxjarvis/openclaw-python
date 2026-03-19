@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 
 from openclaw.routing.session_key import DEFAULT_AGENT_ID, normalize_agent_id
+from ...config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,6 @@ def get_old_session_store_path(agent_id: str | None = None) -> Path:
     Returns:
         Path to old session store file
     """
-    from openclaw.config.paths import resolve_state_dir
     
     normalized_id = normalize_agent_id(agent_id or DEFAULT_AGENT_ID)
     state_dir = resolve_state_dir()
@@ -101,7 +101,6 @@ def migrate_all_session_stores() -> dict[str, bool]:
     Returns:
         Dict mapping agent IDs to migration success status
     """
-    from openclaw.config.paths import resolve_state_dir
     
     state_dir = resolve_state_dir()
     old_sessions_dir = state_dir / "sessions"
@@ -148,7 +147,6 @@ def check_migration_needed() -> dict[str, bool]:
     Returns:
         Dict mapping agent IDs to whether migration is needed
     """
-    from openclaw.config.paths import resolve_state_dir
     from openclaw.config.sessions.paths import resolve_default_session_store_path
     
     state_dir = resolve_state_dir()

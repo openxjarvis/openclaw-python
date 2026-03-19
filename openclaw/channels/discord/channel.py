@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ..base import ChannelCapabilities, ChannelPlugin, InboundMessage
+from ...config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class DiscordChannel(ChannelPlugin):
         if persist_path:
             self._persist_dir = Path(persist_path)
         else:
-            self._persist_dir = Path.home() / ".openclaw" / "discord"
+            self._persist_dir = resolve_state_dir() / "discord"
         self._persist_dir.mkdir(parents=True, exist_ok=True)
 
         from .accounts import resolve_discord_accounts

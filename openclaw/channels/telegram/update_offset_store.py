@@ -12,10 +12,11 @@ import logging
 import os
 import stat
 from pathlib import Path
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
-_BASE_DIR = Path.home() / ".openclaw" / "telegram"
+_BASE_DIR = resolve_state_dir() / "telegram"
 
 
 def ensure_telegram_dir() -> Path:

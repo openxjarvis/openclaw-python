@@ -8,6 +8,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +203,7 @@ class SettingsManager:
         Args:
             global_config_dir: Global config directory (defaults to ~/.openclaw)
         """
-        self.global_config_dir = global_config_dir or Path.home() / ".openclaw"
+        self.global_config_dir = global_config_dir or resolve_state_dir()
         self.global_config_dir.mkdir(parents=True, exist_ok=True)
 
         self._workspace_settings: dict[Path, WorkspaceSettings] = {}

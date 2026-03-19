@@ -12,6 +12,7 @@ import platform
 import shutil
 from pathlib import Path
 from typing import Any, Callable
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +346,7 @@ def build_workspace_skill_status(
         Skill status report matching TypeScript SkillStatusReport
     """
     workspace_dir = Path(workspace_dir)
-    managed_dir = Path(managed_skills_dir) if managed_skills_dir else (Path.home() / ".openclaw" / "skills")
+    managed_dir = Path(managed_skills_dir) if managed_skills_dir else (resolve_state_dir() / "skills")
 
     if entries is None:
         from openclaw.agents.skills.workspace import load_workspace_skill_entries

@@ -2,6 +2,7 @@
 
 import typer
 from rich.console import Console
+from ..config.paths import resolve_state_dir
 
 console = Console()
 
@@ -77,7 +78,7 @@ def register_misc_commands(app: typer.Typer):
             
             console.print("[cyan]Starting onboarding wizard...[/cyan]\n")
             
-            workspace_dir = Path(workspace) if workspace else Path.home() / ".openclaw" / "workspace"
+            workspace_dir = Path(workspace) if workspace else resolve_state_dir() / "workspace"
             
             result = asyncio.run(run_onboarding_wizard(
                 workspace_dir=workspace_dir,

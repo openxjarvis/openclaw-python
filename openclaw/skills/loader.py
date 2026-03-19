@@ -25,6 +25,7 @@ import yaml
 
 from .eligibility import SkillEligibilityChecker
 from .types import Skill, SkillMetadata
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +244,7 @@ class SkillLoader:
             merged[skill.name] = skill
 
         # 3. Managed skills (~/.openclaw/skills)
-        managed_dir = Path.home() / ".openclaw" / "skills"
+        managed_dir = resolve_state_dir() / "skills"
         for skill in self.load_from_directory(
             managed_dir, "openclaw-managed",
             max_skill_file_bytes=max_file_bytes,

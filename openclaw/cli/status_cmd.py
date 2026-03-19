@@ -10,6 +10,7 @@ from typing import Any
 import typer
 from rich.console import Console
 from rich.table import Table
+from ..config.paths import resolve_state_dir
 
 console = Console()
 status_app = typer.Typer(help="Status and health checks", no_args_is_help=False)
@@ -395,7 +396,7 @@ def sessions(
 
     # Fallback: read from disk
     if not raw_sessions:
-        sessions_dir = Path(store) if store else (Path.home() / ".openclaw" / "agents" / "main" / "sessions")
+        sessions_dir = Path(store) if store else (resolve_state_dir() / "sessions")
         if sessions_dir.exists():
             for f in sorted(sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
                 try:

@@ -108,7 +108,9 @@ def prune_stale_entries(
     keys_to_delete = []
     
     for key, entry in store.items():
-        if entry.updatedAt is not None and entry.updatedAt < cutoff_ms:
+        # Support both dict and SessionEntry
+        updated_at = entry.get("updatedAt") if isinstance(entry, dict) else getattr(entry, "updatedAt", None)
+        if updated_at is not None and updated_at < cutoff_ms:
             if on_pruned:
                 on_pruned(key, entry)
             keys_to_delete.append(key)
@@ -144,9 +146,14 @@ def cap_entry_count(
         return 0
     
     # Sort by updatedAt (most recent first)
+    def get_updated_at(item):
+        entry = item[1]
+        updated_at = entry.get("updatedAt") if isinstance(entry, dict) else getattr(entry, "updatedAt", None)
+        return updated_at if updated_at is not None else 0
+    
     entries = sorted(
         store.items(),
-        key=lambda x: x[1].updatedAt if x[1].updatedAt is not None else 0,
+        key=get_updated_at,
         reverse=True
     )
     

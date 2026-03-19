@@ -10,6 +10,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +292,7 @@ def _resolve_exec_approvals_path() -> str:
     env_path = os.environ.get("OPENCLAW_EXEC_APPROVALS_PATH")
     if env_path:
         return env_path
-    return str(Path.home() / ".openclaw" / "exec-approvals.json")
+    return str(resolve_state_dir() / "exec-approvals.json")
 
 
 def _hash_file_contents(path: str) -> str:

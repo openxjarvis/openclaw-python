@@ -48,6 +48,7 @@ def load_session_store_from_path(store_path: Path | str) -> Dict[str, SessionEnt
             else:
                 logger.warning(f"Invalid entry format for {key}")
         
+        logger.debug(f"Loaded session store path={store_path}, entries={len(store)}, keys_sample={list(store.keys())[:3]}")
         return store
     
     except json.JSONDecodeError as e:
@@ -124,7 +125,7 @@ def save_session_store_to_path(
     try:
         with open(store_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, default=str)
-        logger.debug(f"Saved session store to {store_path}")
+        logger.debug(f"Saved session store path={store_path}, entries={len(data)}, keys_sample={list(data.keys())[:3]}")
     except Exception as e:
         logger.error(f"Failed to save session store {store_path}: {e}")
         raise

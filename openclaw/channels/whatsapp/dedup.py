@@ -14,6 +14,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +117,7 @@ class WhatsAppDedup:
 
     def __init__(self, account_id: str) -> None:
         self._memory = _MemoryDedup()
-        data_dir = Path.home() / ".openclaw" / "whatsapp" / "dedup"
+        data_dir = resolve_state_dir() / "dedup"
         self._persistent = _PersistentDedup(data_dir / f"{account_id}.json")
 
     def is_duplicate(self, key: str) -> bool:

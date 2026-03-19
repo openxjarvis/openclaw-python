@@ -5,6 +5,7 @@ Mirrors TypeScript path utilities from openclaw/src/infra/
 from pathlib import Path
 from typing import Union
 import os
+from openclaw.config.paths import resolve_state_dir
 
 
 def shorten_home_path(path: Union[str, Path]) -> str:
@@ -24,7 +25,7 @@ def shorten_home_path(path: Union[str, Path]) -> str:
         >>> shorten_home_path("/Users/username/.openclaw/workspace")
         "~/.openclaw/workspace"
         
-        >>> shorten_home_path(Path.home() / ".openclaw" / "agents")
+        >>> shorten_home_path(resolve_state_dir() / "agents")
         "~/.openclaw/agents"
         
         >>> shorten_home_path("/opt/openclaw")

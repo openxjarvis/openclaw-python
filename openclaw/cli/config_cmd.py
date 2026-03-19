@@ -7,6 +7,7 @@ from typing import Any
 import pyjson5
 import typer
 from rich.console import Console
+from openclaw.config.paths import resolve_state_dir
 
 console = Console()
 config_app = typer.Typer(help="Configuration management (get/set/unset)")
@@ -14,7 +15,7 @@ config_app = typer.Typer(help="Configuration management (get/set/unset)")
 
 def get_config_path() -> Path:
     """Get config file path"""
-    return Path.home() / ".openclaw" / "openclaw.json"
+    return resolve_state_dir() / "openclaw.json"
 
 
 def load_config_raw() -> dict[str, Any]:

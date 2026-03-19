@@ -5,6 +5,8 @@ Matches TypeScript openclaw/src/wizard/onboarding.ts
 """
 from __future__ import annotations
 
+from openclaw.config.paths import resolve_state_dir
+
 # Apply nest_asyncio to allow questionary to work in async contexts
 import nest_asyncio
 nest_asyncio.apply()
@@ -29,6 +31,7 @@ from .config import configure_telegram_enhanced, configure_discord_enhanced, con
 from .onboard_hooks import setup_hooks
 from .onboard_skills import setup_skills
 from .onboard_finalize import finalize_onboarding
+from . import prompter  # Import prompter module for model selection
 
 logger = logging.getLogger(__name__)
 
@@ -234,16 +237,15 @@ async def run_onboarding_wizard(
             skip_model_selection = True
         
         if not skip_model_selection:
-            from .model_picker import prompt_default_model
+            from .model_picker import prompt_model_with_fallbacks, apply_model_fallbacks_from_selection
+            from .fallback_provider_config import check_fallback_providers_configured
             
             print("\n" + "-" * 80)
             print("Model Selection")
             print("-" * 80)
-            print("\nChoose which model to use by default.")
+            print("\nChoose which model to use by default (with optional fallbacks).")
             
             # Extract provider name from auth_choice
-            # auth_choice can be like "kimi-code-api-key", "moonshot-api-key", "apiKey", etc.
-            # We need to map it to the provider name used in _PROVIDER_MODELS
             provider_name = None
             if auth_choice:
                 # Common mappings
@@ -285,109 +287,43 @@ async def run_onboarding_wizard(
                     provider_name = "ollama"
             
             try:
-                model_result = await prompt_default_model(
+                # Use new prompt_model_with_fallbacks for complete flow
+                model_fallback_result = await prompt_model_with_fallbacks(
                     config=claw_config,
-                    allow_keep=False,  # No existing model to keep in fresh onboarding
-                    include_manual=True,
-                    include_vllm=(mode == "advanced"),
+                    prompter_module=prompter,  # Use prompter module
                     preferred_provider=provider_name,
-                    message="Select default model:",
+                    allow_cross_provider=True,
+                    max_fallbacks=3,
                 )
                 
-                if model_result.get("model"):
-                    selected_model = model_result["model"]
+                if model_fallback_result.get("model"):
+                    selected_model = model_fallback_result["model"]
+                    fallback_models = model_fallback_result.get("fallbacks", [])
                     
-                    # Update config with selected model
-                    if not claw_config.agents:
-                        from openclaw.config.schema import AgentsConfig
-                        claw_config.agents = AgentsConfig()
-                    if not claw_config.agents.defaults:
-                        from openclaw.config.schema import AgentDefaults
-                        claw_config.agents.defaults = AgentDefaults()
+                    # Build selection for apply_model_fallbacks_from_selection
+                    selection = [selected_model] + fallback_models
                     
-                    claw_config.agents.defaults.model = selected_model
+                    # Apply using TS-aligned function
+                    claw_config = apply_model_fallbacks_from_selection(claw_config, selection)
                     
-                    # Also update legacy agent.model
-                    if not claw_config.agent:
-                        from openclaw.config.schema import AgentConfig
-                        claw_config.agent = AgentConfig()
-                    
-                    # Extract model name (strip provider prefix if present)
-                    model_name = selected_model.split("/")[1] if "/" in selected_model else selected_model
-                    claw_config.agent.model = model_name
-                    
-                    print(f"✓ Default model set to {selected_model}")
-                    
-                    # Step 4.6: Fallback models (optional, 循环添加)
-                    fallback_models = []
-                    max_fallbacks = 3
-                    
-                    while len(fallback_models) < max_fallbacks:
-                        try:
-                            count_msg = f" (already have {len(fallback_models)})" if fallback_models else ""
-                            add_fallback = prompter.confirm(
-                                f"Add fallback model?{count_msg}",
-                                default=False
-                            )
-                        except Exception:
-                            add_fb = input(f"\nAdd fallback model?{count_msg} [y/N]: ").strip().lower()
-                            add_fallback = (add_fb == "y")
-                        
-                        if not add_fallback:
-                            break
-                        
-                        # 选择 fallback model（不过滤 provider，允许跨 provider）
-                        try:
-                            excluded_models = [selected_model] + fallback_models
-                            fallback_result = await prompt_default_model(
-                                config=claw_config,
-                                allow_keep=False,
-                                include_manual=True,
-                                include_vllm=False,
-                                preferred_provider=None,  # 允许所有 providers
-                                message=f"Select fallback model #{len(fallback_models) + 1}:",
-                                exclude_models=excluded_models,
-                            )
-                            
-                            if fallback_result.get("model"):
-                                fb_model = fallback_result["model"]
-                                
-                                # Check if provider is configured, prompt to configure if not
-                                from .fallback_provider_config import ensure_fallback_provider_configured
-                                provider_configured = await ensure_fallback_provider_configured(
-                                    config=claw_config,
-                                    model_id=fb_model,
-                                    interactive=True
-                                )
-                                
-                                if provider_configured:
-                                    fallback_models.append(fb_model)
-                                    print(f"✓ Added fallback: {fb_model}")
-                                else:
-                                    print(f"⚠️  Skipped fallback: {fb_model} (provider not configured)")
-                            else:
-                                # User cancelled or kept current
-                                break
-                        except Exception as e:
-                            logger.warning(f"Fallback model selection failed: {e}")
-                            break
-                    
-                    # 更新配置：如果有 fallback，使用 primary + fallbacks 格式
+                    # Display summary
+                    print(f"\n✓ Model configuration:")
+                    print(f"  Primary: {selected_model}")
                     if fallback_models:
-                        from openclaw.config.schema import ModelConfig
-                        claw_config.agents.defaults.model = ModelConfig(
-                            primary=selected_model,
-                            fallbacks=fallback_models
-                        )
-                        print(f"\n✓ Model configuration:")
-                        print(f"  Primary: {selected_model}")
                         print(f"  Fallbacks: {', '.join(fallback_models)}")
-                    # 否则保持单模型字符串格式
-                    else:
-                        claw_config.agents.defaults.model = selected_model
+                    
             except Exception as e:
                 logger.error(f"Model selection failed: {e}", exc_info=True)
                 print("⚠️  Could not complete model selection. Using provider default.")
+    
+    # Step 4.7: Model config health check (NEW - aligns with TS)
+    # Warn user if model configuration looks problematic
+    if not non_interactive and claw_config.agents and claw_config.agents.defaults:
+        try:
+            from .onboard_helpers import warn_if_model_config_looks_off
+            await warn_if_model_config_looks_off(claw_config, prompter)
+        except Exception as e:
+            logger.debug(f"Model config health check failed: {e}")
     
     # Step 5: Agent configuration
     if mode == "advanced":
@@ -660,7 +596,7 @@ async def run_onboarding_wizard(
     if workspace_dir:
         mark_onboarding_complete(workspace_dir)
     else:
-        mark_onboarding_complete(Path.home() / ".openclaw" / "workspace")
+        mark_onboarding_complete(resolve_state_dir() / "workspace")
     
     # Step 9.2: Ensure root directories (identity, delivery-queue, canvas, completions, logs)
     print("\n" + "~" * 60)
@@ -671,7 +607,7 @@ async def run_onboarding_wizard(
         from ..agents.ensure_root_dirs import ensure_root_directories
         
         # Determine OpenClaw root directory (parent of workspace)
-        root_dir = workspace_dir.parent if workspace_dir else (Path.home() / ".openclaw")
+        root_dir = workspace_dir.parent if workspace_dir else (resolve_state_dir())
         
         # Ensure all root directories
         root_result = ensure_root_directories(root_dir)
@@ -702,7 +638,7 @@ async def run_onboarding_wizard(
             from ..agents.ensure_workspace_and_sessions import ensure_workspace_and_sessions
             
             # Determine workspace directory
-            ws_dir = workspace_dir or (Path.home() / ".openclaw" / "workspace")
+            ws_dir = workspace_dir or (resolve_state_dir() / "workspace")
             
             # Ensure workspace and sessions exist (unified)
             ensure_workspace_and_sessions(
@@ -732,7 +668,7 @@ async def run_onboarding_wizard(
             print(f"  You can manually edit files in: {ws_dir if 'ws_dir' in locals() else workspace_dir}")
     
     # Step 9.4: Ensure workspace exists, then configure skills and hooks (after workspace init)
-    ws_dir = workspace_dir or (Path.home() / ".openclaw" / "workspace")
+    ws_dir = workspace_dir or (resolve_state_dir() / "workspace")
     hooks_result: dict = {}
     skills_result: dict = {}
     try:
@@ -999,7 +935,7 @@ async def run_onboarding_wizard(
     print("  View logs:       uv run openclaw logs tail")
     
     # Check if BOOTSTRAP.md exists
-    ws_dir = workspace_dir or (Path.home() / ".openclaw" / "workspace")
+    ws_dir = workspace_dir or (resolve_state_dir() / "workspace")
     bootstrap_path = ws_dir / "BOOTSTRAP.md"
     if bootstrap_path.exists():
         print("\n🎯 First-time Setup:")

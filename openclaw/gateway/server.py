@@ -34,6 +34,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from openclaw.config.paths import resolve_state_dir
+
 # Use aiohttp for unified HTTP + WebSocket server (matches openclaw-ts)
 from aiohttp import web, WSMsgType
 import aiohttp
@@ -46,6 +48,7 @@ from openclaw.gateway.auth import (
     validate_auth_config,
 )
 from openclaw.gateway.authorization import AuthContext, authorize_gateway_method
+from openclaw.gateway.control_ui_security import apply_control_ui_security_headers
 from openclaw.gateway.device_auth import (
     DeviceIdentity,
     authorize_device_identity,
@@ -720,7 +723,8 @@ class GatewayServer:
                 from openclaw.memory.sync_manager import SyncManager
 
                 # Determine workspace directory
-                workspace_dir = Path.home() / ".openclaw" / "workspace"
+                state_dir = resolve_state_dir()
+                workspace_dir = state_dir / "workspace"
                 if self.agent_runtime and hasattr(self.agent_runtime, 'workspace_dir'):
                     workspace_dir = Path(self.agent_runtime.workspace_dir)
 
@@ -818,7 +822,10 @@ class GatewayServer:
         config_script = self._get_control_ui_config_script()
         html = html.replace("</head>", f"{config_script}</head>")
         
-        return web.Response(text=html, content_type="text/html")
+        response = web.Response(text=html, content_type="text/html")
+        # Apply security headers
+        apply_control_ui_security_headers(response, self.config.gateway.control_ui if self.config else None)
+        return response
 
     async def serve_control_ui_spa(self, request: web.Request) -> web.Response:
         """SPA fallback: serve static files or index.html"""
@@ -828,7 +835,10 @@ class GatewayServer:
         # Check if static file exists
         file_path = ui_dir / path
         if file_path.is_file() and file_path.exists():
-            return web.FileResponse(file_path)
+            response = web.FileResponse(file_path)
+            # Apply security headers to all Control UI responses
+            apply_control_ui_security_headers(response, self.config.gateway.control_ui if self.config else None)
+            return response
         
         # Fallback to index.html for SPA routing
         return await self.serve_control_ui(request)

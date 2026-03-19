@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+from ...config.paths import resolve_state_dir
 
 if TYPE_CHECKING:
     from .config import ResolvedWhatsAppAccount
@@ -27,7 +28,7 @@ _PAIRING_HISTORY_GRACE_MS = 30_000
 # ---------------------------------------------------------------------------
 
 def _pairing_store_path(account_id: str) -> Path:
-    return Path.home() / ".openclaw" / "whatsapp" / "pairing" / f"{account_id}.json"
+    return resolve_state_dir() / "pairing" / f"{account_id}.json"
 
 
 def _load_pairing_store(account_id: str) -> dict[str, str]:

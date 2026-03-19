@@ -15,6 +15,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ class ConfigService:
         Non-fatal: failures are silently logged at DEBUG level.
         """
         try:
-            audit_dir = Path.home() / ".openclaw" / "logs"
+            audit_dir = resolve_state_dir() / "logs"
             audit_dir.mkdir(parents=True, exist_ok=True)
             audit_path = audit_dir / CONFIG_AUDIT_LOG_FILENAME
             record = {

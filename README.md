@@ -35,6 +35,8 @@
 
 ## What it does
 
+> ### 🐍 [TypeScript OpenClaw](https://github.com/badlogic/pi-mono) is awesome — but don't forget the Python version! 100% feature-aligned.
+
 A self-hosted AI gateway that connects your messaging channels to LLMs:
 
 - **Feishu (Lark)** — Full feature support: WebSocket real-time connection, streaming card output, media (image/file/voice), reactions, pairing, multi-account, Bitable, Wiki, Doc tools

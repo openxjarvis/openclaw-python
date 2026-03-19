@@ -32,7 +32,11 @@ except ModuleNotFoundError:
     SessionManager = None  # type: ignore[assignment]
 
 from .config import Settings, get_settings
-from .config.unified import ConfigBuilder, OpenClawConfig
+from .config.loader import load_config, save_config, get_config_path
+from .config.schema import OpenClawConfig
+
+# Backward compatibility alias
+ConfigBuilder = OpenClawConfig
 
 # Refactored modules (v0.6.0+)
 from .events import Event, EventBus, EventType, get_event_bus

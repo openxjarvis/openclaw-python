@@ -183,7 +183,7 @@ class SubagentsTool(AgentToolBase[dict, dict]):
     
     async def _execute_list(self, params: dict) -> AgentToolResult[dict]:
         """List active and recent subagent runs (mirrors TS lines 410-466)"""
-        from openclaw.config.unified import load_config
+        from openclaw.config.loader import load_config
         from openclaw.agents.subagent_registry import get_global_registry
         
         cfg = load_config()
@@ -287,7 +287,7 @@ class SubagentsTool(AgentToolBase[dict, dict]):
     
     async def _execute_kill(self, params: dict) -> AgentToolResult[dict]:
         """Kill subagent run (mirrors TS lines 468-566)"""
-        from openclaw.config.unified import load_config
+        from openclaw.config.loader import load_config
         from openclaw.agents.subagent_registry import get_global_registry
         # Removed import of non-existent stop_subagents_for_requester
         
@@ -390,7 +390,7 @@ class SubagentsTool(AgentToolBase[dict, dict]):
     
     async def _execute_steer(self, params: dict) -> AgentToolResult[dict]:
         """Steer (restart) subagent with new message (mirrors TS lines 567-720)"""
-        from openclaw.config.unified import load_config
+        from openclaw.config.loader import load_config
         from openclaw.agents.subagent_registry import get_global_registry
         
         target = params.get("target")

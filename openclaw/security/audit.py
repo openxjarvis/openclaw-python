@@ -22,6 +22,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +170,7 @@ class SecurityAuditor:
             self.workspace / ".openclaw" / "config.yaml",
             self.workspace / ".openclaw" / "config.json",
             self.workspace / "openclaw.config.yaml",
-            Path.home() / ".openclaw" / "openclaw.config.yaml",
+            resolve_state_dir() / "openclaw.config.yaml",
         ]
         for config_path in config_candidates:
             if config_path.exists():
@@ -258,7 +259,7 @@ class SecurityAuditor:
                 auto_fixable=False,
             ))
         # Also check exec-approvals.json
-        approvals_path = Path.home() / ".openclaw" / "exec-approvals.json"
+        approvals_path = resolve_state_dir() / "exec-approvals.json"
         if approvals_path.exists():
             import json as _json
             try:

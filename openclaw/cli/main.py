@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from ..config.loader import load_config
+from ..config.paths import resolve_state_dir
 
 app = typer.Typer(
     name="openclaw",
@@ -49,9 +50,9 @@ def start(
     
     # Check configuration (matches TS gateway-cli/run.ts behavior)
     # Verify config exists and gateway.mode is local
-    config_path = Path.home() / ".openclaw" / "openclaw.json"
+    config_path = resolve_state_dir() / "openclaw.json"
     if not config_path.exists():
-        config_path = Path.home() / ".openclaw" / "config.json"
+        config_path = resolve_state_dir() / "config.json"
     
     if not config_path.exists():
         console.print(
@@ -86,7 +87,7 @@ def start(
     # Start server
     try:
         # Setup logging with daily log files (matching TypeScript)
-        log_dir = Path.home() / ".openclaw" / "tmp"
+        log_dir = resolve_state_dir() / "tmp"
         log_dir.mkdir(parents=True, exist_ok=True)
         from datetime import datetime
         date_str = datetime.now().strftime("%Y-%m-%d")
@@ -264,7 +265,7 @@ def doctor(
             })
 
     # Check 3: Workspace
-    workspace = Path.home() / ".openclaw" / "workspace"
+    workspace = resolve_state_dir() / "workspace"
     if not workspace.exists():
         warnings.append(f"Workspace not found at {workspace}")
         fixes.append(("create_workspace", f"mkdir -p {workspace}"))
@@ -419,7 +420,7 @@ def doctor(
             pass
 
     # Check: state directory permissions
-    state_dir = Path.home() / ".openclaw"
+    state_dir = resolve_state_dir()
     if state_dir.exists():
         import stat
         mode = state_dir.stat().st_mode
@@ -452,7 +453,7 @@ def doctor(
             check_results.append({"check": "gateway_port", "status": "warning", "port": gateway_port})
 
         # Check: skills directory
-        skills_dir = Path.home() / ".openclaw" / "skills"
+        skills_dir = resolve_state_dir() / "skills"
         if skills_dir.exists():
             skill_files = list(skills_dir.glob("*.md")) + list(skills_dir.glob("*.yaml")) + list(skills_dir.glob("*.yml"))
             console.print(f"[green]✓[/green] Skills: {len(skill_files)} file(s) in {skills_dir}")

@@ -23,6 +23,7 @@ from .outbound import FeishuOutboundAdapter, resolve_receive_id_type
 from .send import send_feishu_message
 from .streaming_card import FeishuStreamingSession, StreamingCardHeader
 from .typing import FeishuTypingIndicator
+from ...config.paths import resolve_state_dir
 
 if TYPE_CHECKING:
     from .config import ResolvedFeishuAccount
@@ -352,7 +353,7 @@ class FeishuReplyDispatcher:
                         candidates.append(Path(self._session_workspace) / url.lstrip('./'))
                     
                     # Try common workspace (/Users/long/.openclaw/workspace)
-                    common_workspace = Path.home() / ".openclaw" / "workspace"
+                    common_workspace = resolve_state_dir() / "workspace"
                     candidates.append(common_workspace / url.lstrip('./'))
                     
                     # Find first existing file

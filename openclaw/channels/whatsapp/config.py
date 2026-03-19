@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from ...config.paths import resolve_state_dir
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +197,7 @@ def parse_whatsapp_config(cfg: dict[str, Any]) -> list[ResolvedWhatsAppAccount]:
         )
         if not raw_auth_dir:
             from pathlib import Path
-            raw_auth_dir = str(Path.home() / ".openclaw" / "credentials" / "whatsapp" / account_id)
+            raw_auth_dir = str(resolve_state_dir() / "whatsapp" / account_id)
 
         dm_policy = _coalesce(
             o.get("dmPolicy") or o.get("dm_policy"),

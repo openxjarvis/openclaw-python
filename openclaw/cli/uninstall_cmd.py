@@ -105,7 +105,7 @@ def uninstall_main(
     from ..config.paths import resolve_state_dir
     
     state_dir = resolve_state_dir()
-    workspace_dir = Path.home() / ".openclaw" / "workspace"
+    workspace_dir = resolve_state_dir() / "workspace"
     mac_app = Path("/Applications/OpenClaw.app")
     
     console.print("\n[cyan]Uninstalling components...[/cyan]")

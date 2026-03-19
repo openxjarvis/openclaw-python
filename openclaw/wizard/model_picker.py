@@ -295,7 +295,264 @@ async def prompt_model_allowlist(
         return {"models": []}
 
 
+def apply_primary_model(cfg: OpenClawConfig, model: str) -> OpenClawConfig:
+    """Apply primary model while preserving existing fallbacks
+    
+    Mirrors TypeScript applyPrimaryModel() from src/commands/model-picker.ts:462-487
+    
+    Args:
+        cfg: Current configuration
+        model: Model ID (e.g., "anthropic/claude-sonnet-4-6")
+        
+    Returns:
+        Updated configuration with primary model set
+    """
+    from ..config.schema import AgentsConfig, AgentDefaults, ModelConfig
+    
+    # Get existing config
+    agents = cfg.agents or AgentsConfig()
+    defaults = agents.defaults or AgentDefaults()
+    existing_model = defaults.model
+    existing_models = defaults.models or {}
+    
+    # Extract existing fallbacks if present
+    fallbacks = None
+    if isinstance(existing_model, dict):
+        fallbacks = existing_model.get("fallbacks")
+    elif hasattr(existing_model, "fallbacks"):
+        fallbacks = existing_model.fallbacks
+    
+    # Build new model config
+    if fallbacks:
+        new_model = ModelConfig(primary=model, fallbacks=fallbacks)
+    else:
+        new_model = ModelConfig(primary=model)
+    
+    # Update models dict
+    new_models = {**existing_models}
+    if model not in new_models:
+        new_models[model] = {}
+    
+    # Create updated config
+    # Build kwargs without 'model' and 'models' to avoid duplication
+    defaults_dict = defaults.model_dump() if hasattr(defaults, "model_dump") else vars(defaults)
+    kwargs = {k: v for k, v in defaults_dict.items() if k not in ('model', 'models')}
+    kwargs['model'] = new_model
+    kwargs['models'] = new_models
+    
+    updated_defaults = AgentDefaults(**kwargs)
+    
+    # Build kwargs without 'defaults' to avoid duplication
+    agents_dict = agents.model_dump() if hasattr(agents, "model_dump") else vars(agents)
+    agents_kwargs = {k: v for k, v in agents_dict.items() if k != 'defaults'}
+    agents_kwargs['defaults'] = updated_defaults
+    
+    updated_agents = AgentsConfig(**agents_kwargs)
+    
+    # Return updated config
+    from copy import deepcopy
+    updated_cfg = deepcopy(cfg)
+    updated_cfg.agents = updated_agents
+    return updated_cfg
+
+
+def apply_model_fallbacks_from_selection(
+    cfg: OpenClawConfig,
+    selection: list[str]
+) -> OpenClawConfig:
+    """Build model config with primary + fallbacks from multi-select
+    
+    Mirrors TypeScript applyModelFallbacksFromSelection() from src/commands/model-picker.ts:524-567
+    
+    Args:
+        cfg: Current configuration
+        selection: List of model IDs, first is primary, rest are fallbacks
+        
+    Returns:
+        Updated configuration with primary + fallbacks set
+    """
+    from ..config.schema import AgentsConfig, AgentDefaults, ModelConfig
+    
+    if not selection or len(selection) == 0:
+        return cfg
+    
+    # Normalize selection (remove duplicates)
+    normalized = []
+    seen = set()
+    for model_id in selection:
+        model_str = str(model_id).strip()
+        if model_str and model_str not in seen:
+            normalized.append(model_str)
+            seen.add(model_str)
+    
+    if len(normalized) == 0:
+        return cfg
+    
+    # Get existing config
+    agents = cfg.agents or AgentsConfig()
+    defaults = agents.defaults or AgentDefaults()
+    
+    # First model is primary, rest are fallbacks
+    primary = normalized[0]
+    fallbacks = normalized[1:] if len(normalized) > 1 else None
+    
+    # Build new model config
+    if fallbacks:
+        new_model = ModelConfig(primary=primary, fallbacks=fallbacks)
+    else:
+        new_model = ModelConfig(primary=primary)
+    
+    # Create updated config
+    # Build kwargs without 'model' to avoid duplication
+    defaults_dict = defaults.model_dump() if hasattr(defaults, "model_dump") else vars(defaults)
+    kwargs = {k: v for k, v in defaults_dict.items() if k != 'model'}
+    kwargs['model'] = new_model
+    
+    updated_defaults = AgentDefaults(**kwargs)
+    
+    # Build kwargs without 'defaults' to avoid duplication
+    agents_dict = agents.model_dump() if hasattr(agents, "model_dump") else vars(agents)
+    agents_kwargs = {k: v for k, v in agents_dict.items() if k != 'defaults'}
+    agents_kwargs['defaults'] = updated_defaults
+    
+    updated_agents = AgentsConfig(**agents_kwargs)
+    
+    # Return updated config
+    from copy import deepcopy
+    updated_cfg = deepcopy(cfg)
+    updated_cfg.agents = updated_agents
+    return updated_cfg
+
+
+async def prompt_model_with_fallbacks(
+    config: OpenClawConfig,
+    prompter_module: Any,
+    preferred_provider: str | None = None,
+    allow_cross_provider: bool = True,
+    max_fallbacks: int = 3,
+) -> dict[str, Any]:
+    """Interactive model + fallback selection with provider auth check
+    
+    Flow:
+    1. Prompt primary model (using existing prompt_default_model)
+    2. Ask "Add fallback models?" (loop up to max_fallbacks)
+    3. For each fallback:
+       - Prompt model (allow all providers if allow_cross_provider)
+       - Check if provider has auth configured
+       - If not, offer to configure now
+    4. Return {model: "primary/model", fallbacks: ["fb1/model", "fb2/model"]}
+    
+    Args:
+        config: Current configuration
+        prompter_module: Prompter module (for UI)
+        preferred_provider: Filter primary by provider (e.g., "anthropic")
+        allow_cross_provider: Allow fallback models from different providers
+        max_fallbacks: Maximum number of fallbacks (default 3)
+        
+    Returns:
+        Dict with 'model' (primary), 'fallbacks' (list), 'config' (updated config)
+    """
+    from .fallback_provider_config import ensure_fallback_provider_configured
+    
+    # Step 1: Select primary model
+    primary_result = await prompt_default_model(
+        config=config,
+        allow_keep=False,
+        include_manual=True,
+        include_vllm=False,
+        preferred_provider=preferred_provider,
+        message="Select primary model:",
+        exclude_models=[],
+    )
+    
+    if not primary_result.get("model"):
+        return {}
+    
+    primary_model = primary_result["model"]
+    fallbacks = []
+    
+    # Step 2: Ask about fallbacks
+    try:
+        add_fallback = prompter_module.confirm(
+            "Add fallback models?",
+            default=False
+        )
+    except Exception:
+        add_fb_input = input("\nAdd fallback models? [y/N]: ").strip().lower()
+        add_fallback = (add_fb_input == "y")
+    
+    if not add_fallback:
+        return {
+            "model": primary_model,
+            "fallbacks": [],
+            "config": config,
+        }
+    
+    # Step 3: Loop to add fallbacks
+    excluded = [primary_model]
+    
+    while len(fallbacks) < max_fallbacks:
+        count_msg = f" (already have {len(fallbacks)})" if fallbacks else ""
+        print(f"\nFallback #{len(fallbacks) + 1}{count_msg}:")
+        
+        # Prompt fallback model
+        fallback_result = await prompt_default_model(
+            config=config,
+            allow_keep=False,
+            include_manual=True,
+            include_vllm=False,
+            preferred_provider=None if allow_cross_provider else preferred_provider,
+            message=f"Select fallback model #{len(fallbacks) + 1}:",
+            exclude_models=excluded,
+        )
+        
+        if not fallback_result.get("model"):
+            # User cancelled or skipped
+            break
+        
+        fallback_model = fallback_result["model"]
+        
+        # Check if provider is configured
+        provider_configured = await ensure_fallback_provider_configured(
+            config=config,
+            model_id=fallback_model,
+            interactive=True,
+        )
+        
+        if provider_configured:
+            fallbacks.append(fallback_model)
+            excluded.append(fallback_model)
+            print(f"✓ Added fallback: {fallback_model}")
+        else:
+            print(f"⚠️  Skipped fallback: {fallback_model} (provider not configured)")
+        
+        # Ask about another fallback
+        if len(fallbacks) >= max_fallbacks:
+            break
+        
+        try:
+            another = prompter_module.confirm(
+                "Add another fallback?",
+                default=False
+            )
+        except Exception:
+            another_input = input("Add another fallback? [y/N]: ").strip().lower()
+            another = (another_input == "y")
+        
+        if not another:
+            break
+    
+    return {
+        "model": primary_model,
+        "fallbacks": fallbacks,
+        "config": config,
+    }
+
+
 __all__ = [
     "prompt_default_model",
     "prompt_model_allowlist",
+    "apply_primary_model",
+    "apply_model_fallbacks_from_selection",
+    "prompt_model_with_fallbacks",
 ]

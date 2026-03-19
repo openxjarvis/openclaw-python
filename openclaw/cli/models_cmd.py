@@ -7,6 +7,7 @@ from typing import Optional
 import typer
 from rich.console import Console
 from rich.table import Table
+from ..config.paths import resolve_state_dir
 
 console = Console()
 models_app = typer.Typer(help="Model discovery, scanning, and configuration", no_args_is_help=True)
@@ -82,7 +83,7 @@ def _load_raw() -> dict:
     except Exception:
         pass
     # Fallback: default location
-    default = _Path.home() / ".openclaw" / "openclaw.json"
+    default = _resolve_state_dir() / "openclaw.json"
     if default.exists():
         try:
             return load_config_raw(default) or {}

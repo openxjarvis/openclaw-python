@@ -45,6 +45,13 @@ except ModuleNotFoundError:
     GatewayConnection = None  # type: ignore[assignment]
     GatewayServer = None  # type: ignore[assignment]
 
+# New modules for 100% alignment
+from .channel_health_monitor import ChannelHealthMonitor, ChannelHealthStatus
+from .channel_health_policy import ChannelHealthPolicy, ChannelHealthAction, evaluate_channel_health_policy
+from .openresponses_http import send_openresponse_http
+from .net import BindMode, resolve_bind_host, get_local_ip, is_port_available
+from .probe import ProbeResult, probe_http_endpoint, probe_websocket_endpoint
+
 __all__ = [
     # Server
     "GatewayServer",
@@ -61,4 +68,20 @@ __all__ = [
     "ResponseFrame",
     "EventFrame",
     "ErrorShape",
+    # Health monitoring
+    "ChannelHealthMonitor",
+    "ChannelHealthStatus",
+    "ChannelHealthPolicy",
+    "ChannelHealthAction",
+    "evaluate_channel_health_policy",
+    # HTTP and network
+    "send_openresponse_http",
+    "BindMode",
+    "resolve_bind_host",
+    "get_local_ip",
+    "is_port_available",
+    # Probe
+    "ProbeResult",
+    "probe_http_endpoint",
+    "probe_websocket_endpoint",
 ]

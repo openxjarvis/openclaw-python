@@ -25,25 +25,27 @@ def _get_extensions_dir() -> Path:
         state_dir = resolve_state_dir()
         return Path(state_dir) / _EXTENSIONS_DIRNAME
     except Exception:
-        return Path.home() / ".openclaw" / _EXTENSIONS_DIRNAME
+        # Fallback: still use resolve_state_dir() with default behavior
+        from ..config.paths import resolve_new_state_dir
+        return Path(resolve_new_state_dir()) / _EXTENSIONS_DIRNAME
 
 
 def _load_raw_config() -> dict:
     from pathlib import Path as _P
     from ..config.loader import load_config_raw
-    from ..config.paths import resolve_config_path
+    from ..config.paths import resolve_config_path, resolve_state_dir
     try:
         cfg_path = resolve_config_path()
         if cfg_path and _P(cfg_path).exists():
             return load_config_raw(_P(cfg_path)) or {}
     except Exception:
         pass
-    default = _P.home() / ".openclaw" / "openclaw.json"
-    if default.exists():
-        try:
+    try:
+        default = _P(resolve_state_dir()) / "openclaw.json"
+        if default.exists():
             return load_config_raw(default) or {}
-        except Exception:
-            pass
+    except Exception:
+        pass
     return {}
 
 

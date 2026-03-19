@@ -31,6 +31,16 @@ class SessionsListTool(AgentTool):
     async def execute(self, params: dict[str, Any]) -> ToolResult:
         """List sessions with visibility guard"""
         try:
+            # Dynamic config loading (mirrors TS sessions-list-tool.ts line 44)
+            # Fallback to instance cfg if dynamic load fails
+            cfg = self.cfg
+            if not cfg:
+                try:
+                    from openclaw.config.loader import load_config
+                    cfg = load_config(as_dict=True) or {}
+                except Exception:
+                    cfg = {}
+            
             # Create visibility guard
             from openclaw.agents.tools.sessions_access import (
                 create_agent_to_agent_policy,
@@ -38,8 +48,8 @@ class SessionsListTool(AgentTool):
                 resolve_session_tools_visibility,
             )
             
-            a2a_policy = create_agent_to_agent_policy(self.cfg or {})
-            visibility = resolve_session_tools_visibility(self.cfg or {})
+            a2a_policy = create_agent_to_agent_policy(cfg)
+            visibility = resolve_session_tools_visibility(cfg)
             
             guard = await create_session_visibility_guard(
                 action="list",
@@ -128,6 +138,15 @@ class SessionsHistoryTool(AgentTool):
             return ToolResult(success=False, content="", error="session_id required")
 
         try:
+            # Dynamic config loading (mirrors TS)
+            cfg = self.cfg
+            if not cfg:
+                try:
+                    from openclaw.config.loader import load_config
+                    cfg = load_config(as_dict=True) or {}
+                except Exception:
+                    cfg = {}
+            
             # Create visibility guard
             from openclaw.agents.tools.sessions_access import (
                 create_agent_to_agent_policy,
@@ -135,8 +154,8 @@ class SessionsHistoryTool(AgentTool):
                 resolve_session_tools_visibility,
             )
             
-            a2a_policy = create_agent_to_agent_policy(self.cfg or {})
-            visibility = resolve_session_tools_visibility(self.cfg or {})
+            a2a_policy = create_agent_to_agent_policy(cfg)
+            visibility = resolve_session_tools_visibility(cfg)
             
             guard = await create_session_visibility_guard(
                 action="history",
@@ -184,90 +203,370 @@ class SessionsHistoryTool(AgentTool):
 
 
 class SessionsSendTool(AgentTool):
-    """Send message to another session with access control"""
+    """Send message to another session with access control and A2A policy.
+    
+    Matches TS createSessionsSendTool in sessions-send-tool.ts.
+    Supports label/agentId resolution, timeout control, and agent-to-agent messaging.
+    """
 
     def __init__(
         self,
         session_manager: SessionManager,
         current_session_key: str | None = None,
         cfg: Any = None,
+        gateway: Any = None,
     ):
         super().__init__()
         self.name = "sessions_send"
-        self.description = "Send a message to another session/sub-agent. Use session_id to identify the target. Access control and agent-to-agent policy apply."
+        self.description = "Send a message into another session. Use sessionKey or label to identify the target."
         self.session_manager = session_manager
         self.current_session_key = current_session_key
         self.cfg = cfg
+        self.gateway = gateway
 
     def get_schema(self) -> dict[str, Any]:
+        """Schema matches TS SessionsSendToolSchema (lines 27-33)"""
         return {
             "type": "object",
             "properties": {
-                "session_id": {"type": "string", "description": "Target session ID"},
-                "message": {"type": "string", "description": "Message content to send"},
-                "from_session": {
+                "sessionKey": {
                     "type": "string",
-                    "description": "Source session ID",
-                    "default": "system",
+                    "description": "Target session key (alternative to label)",
+                },
+                "label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,  # SESSION_LABEL_MAX_LENGTH
+                    "description": "Session label to resolve (alternative to sessionKey)",
+                },
+                "agentId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Agent ID when using label resolution",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Message content to send",
+                },
+                "timeoutSeconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Wait timeout in seconds (0=fire-and-forget, default=30)",
                 },
             },
-            "required": ["session_id", "message"],
+            "required": ["message"],
         }
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Send message to session with access control"""
-        session_id = params.get("session_id", "")
-        message = params.get("message", "")
-        from_session = params.get("from_session", self.current_session_key or "system")
-
-        if not session_id or not message:
-            return ToolResult(success=False, content="", error="session_id and message required")
+        """Send message with label/agentId resolution and A2A policy (matches TS lines 46-361)"""
+        import uuid
+        
+        message = params.get("message", "").strip()
+        if not message:
+            return ToolResult(
+                success=False,
+                content="",
+                error="message is required",
+                metadata={"runId": str(uuid.uuid4()), "status": "error"},
+            )
 
         try:
-            # Create visibility guard
+            # Load config (matches TS line 49)
+            cfg = self.cfg
+            if not cfg:
+                try:
+                    from openclaw.config.loader import load_config
+                    cfg = load_config(as_dict=True) or {}
+                except Exception:
+                    cfg = {}
+            
+            # Create A2A policy and visibility (matches TS lines 57-61)
             from openclaw.agents.tools.sessions_access import (
                 create_agent_to_agent_policy,
                 create_session_visibility_guard,
                 resolve_session_tools_visibility,
             )
             
-            a2a_policy = create_agent_to_agent_policy(self.cfg or {})
-            visibility = resolve_session_tools_visibility(self.cfg or {})
+            a2a_policy = create_agent_to_agent_policy(cfg)
+            visibility = resolve_session_tools_visibility(cfg)
+            requester_key = self.current_session_key or "agent:main:main"
             
+            # Parse params (matches TS lines 63-72)
+            session_key_param = params.get("sessionKey", "").strip() or None
+            label_param = params.get("label", "").strip() or None
+            agent_id_param = params.get("agentId", "").strip() or None
+            
+            if session_key_param and label_param:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="Provide either sessionKey or label (not both).",
+                    metadata={"runId": str(uuid.uuid4()), "status": "error"},
+                )
+            
+            session_key = session_key_param
+            
+            # Label resolution (matches TS lines 75-151)
+            if not session_key and label_param:
+                # Extract requester agent ID
+                from openclaw.routing.session_key import resolve_agent_id_from_session_key, normalize_agent_id
+                requester_agent_id = resolve_agent_id_from_session_key(requester_key)
+                requested_agent_id = normalize_agent_id(agent_id_param) if agent_id_param else None
+                
+                # Check A2A policy if cross-agent (matches TS lines 89-105)
+                if requester_agent_id and requested_agent_id and requested_agent_id != requester_agent_id:
+                    if not a2a_policy.get("enabled", False):
+                        return ToolResult(
+                            success=False,
+                            content="",
+                            error="Agent-to-agent messaging is disabled. Set tools.agentToAgent.enabled=true to allow cross-agent sends.",
+                            metadata={"runId": str(uuid.uuid4()), "status": "forbidden"},
+                        )
+                    
+                    # Check allow list
+                    if not self._is_a2a_allowed(a2a_policy, requester_agent_id, requested_agent_id):
+                        return ToolResult(
+                            success=False,
+                            content="",
+                            error="Agent-to-agent messaging denied by tools.agentToAgent.allow.",
+                            metadata={"runId": str(uuid.uuid4()), "status": "forbidden"},
+                        )
+                
+                # Resolve label to session key (matches TS lines 107-150)
+                try:
+                    from openclaw.agents.internal_call import call_gateway_internal
+                    resolve_params = {"label": label_param}
+                    if requested_agent_id:
+                        resolve_params["agentId"] = requested_agent_id
+                    
+                    resolved = await call_gateway_internal(
+                        gateway=self.gateway,
+                        method="sessions.resolve",
+                        params=resolve_params,
+                        timeout_ms=10_000,
+                    )
+                    session_key = resolved.get("key", "").strip() if resolved else ""
+                    if not session_key:
+                        return ToolResult(
+                            success=False,
+                            content="",
+                            error=f"No session found with label: {label_param}",
+                            metadata={"runId": str(uuid.uuid4()), "status": "error"},
+                        )
+                except Exception as e:
+                    return ToolResult(
+                        success=False,
+                        content="",
+                        error=f"Session resolution failed: {str(e)}",
+                        metadata={"runId": str(uuid.uuid4()), "status": "error"},
+                    )
+            
+            if not session_key:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="Either sessionKey or label is required",
+                    metadata={"runId": str(uuid.uuid4()), "status": "error"},
+                )
+            
+            # Visibility check (matches TS lines 160-213)
             guard = await create_session_visibility_guard(
                 action="send",
-                requester_session_key=self.current_session_key or "main",
+                requester_session_key=requester_key,
                 visibility=visibility,
                 a2a_policy=a2a_policy,
             )
             
             check = guard["check"]
-            
-            # Check access
-            access_result = check(session_id)
+            access_result = check(session_key)
             if not access_result.allowed:
                 return ToolResult(
                     success=False,
                     content="",
                     error=access_result.error or "Access denied",
+                    metadata={
+                        "runId": str(uuid.uuid4()),
+                        "status": access_result.status or "forbidden",
+                        "sessionKey": session_key,
+                    },
                 )
             
-            # Get target session
-            session = self.session_manager.get_session(session_id)
-
-            # Add message as user message with metadata
-            prefix = f"[From {from_session}] "
-            session.add_user_message(prefix + message)
-
+            # Parse timeout (matches TS lines 191-196)
+            timeout_seconds_raw = params.get("timeoutSeconds")
+            if isinstance(timeout_seconds_raw, (int, float)) and timeout_seconds_raw >= 0:
+                timeout_seconds = max(0, int(timeout_seconds_raw))
+            else:
+                timeout_seconds = 30
+            
+            timeout_ms = timeout_seconds * 1000
+            announce_timeout_ms = 30_000 if timeout_seconds == 0 else timeout_ms
+            idempotency_key = str(uuid.uuid4())
+            run_id = idempotency_key
+            
+            # Send message via gateway (matches TS lines 220-234)
+            from openclaw.agents.internal_call import call_gateway_internal
+            send_params = {
+                "message": message,
+                "sessionKey": session_key,
+                "idempotencyKey": idempotency_key,
+                "deliver": False,
+                "channel": "internal",
+                "lane": "nested",
+                "inputProvenance": {
+                    "kind": "inter_session",
+                    "sourceSessionKey": self.current_session_key,
+                    "sourceTool": "sessions_send",
+                },
+            }
+            
+            # Fire-and-forget mode (timeout=0) (matches TS lines 253-279)
+            if timeout_seconds == 0:
+                try:
+                    response = await call_gateway_internal(
+                        gateway=self.gateway,
+                        method="agent",
+                        params=send_params,
+                        timeout_ms=10_000,
+                    )
+                    if response and isinstance(response.get("runId"), str):
+                        run_id = response["runId"]
+                    
+                    return ToolResult(
+                        success=True,
+                        content=f"Message accepted for delivery to session '{session_key}'",
+                        metadata={
+                            "runId": run_id,
+                            "status": "accepted",
+                            "sessionKey": session_key,
+                            "delivery": {"status": "pending", "mode": "announce"},
+                        },
+                    )
+                except Exception as e:
+                    return ToolResult(
+                        success=False,
+                        content="",
+                        error=str(e),
+                        metadata={"runId": run_id, "status": "error", "sessionKey": session_key},
+                    )
+            
+            # Wait mode (timeout>0) (matches TS lines 282-358)
+            try:
+                response = await call_gateway_internal(
+                    gateway=self.gateway,
+                    method="agent",
+                    params=send_params,
+                    timeout_ms=10_000,
+                )
+                if response and isinstance(response.get("runId"), str):
+                    run_id = response["runId"]
+            except Exception as e:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=str(e),
+                    metadata={"runId": run_id, "status": "error", "sessionKey": session_key},
+                )
+            
+            # Wait for completion (matches TS lines 302-324)
+            try:
+                wait_response = await call_gateway_internal(
+                    gateway=self.gateway,
+                    method="agent.wait",
+                    params={"runId": run_id, "timeoutMs": timeout_ms},
+                    timeout_ms=timeout_ms + 2000,
+                )
+                wait_status = wait_response.get("status") if wait_response else None
+                wait_error = wait_response.get("error") if wait_response else None
+            except Exception as e:
+                error_msg = str(e)
+                is_timeout = "timeout" in error_msg.lower() or "gateway timeout" in error_msg.lower()
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=error_msg,
+                    metadata={
+                        "runId": run_id,
+                        "status": "timeout" if is_timeout else "error",
+                        "sessionKey": session_key,
+                    },
+                )
+            
+            # Check wait status (matches TS lines 326-341)
+            if wait_status == "timeout":
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=wait_error or "Timeout waiting for response",
+                    metadata={"runId": run_id, "status": "timeout", "sessionKey": session_key},
+                )
+            if wait_status == "error":
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=wait_error or "agent error",
+                    metadata={"runId": run_id, "status": "error", "sessionKey": session_key},
+                )
+            
+            # Get reply from history (matches TS lines 343-350)
+            try:
+                history_response = await call_gateway_internal(
+                    gateway=self.gateway,
+                    method="chat.history",
+                    params={"sessionKey": session_key, "limit": 50},
+                    timeout_ms=10_000,
+                )
+                messages = history_response.get("messages", []) if history_response else []
+                # Extract last assistant message
+                reply = None
+                for msg in reversed(messages):
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            reply = content
+                            break
+            except Exception:
+                reply = None
+            
             return ToolResult(
                 success=True,
-                content=f"Message sent to session '{session_id}'",
-                metadata={"session_id": session_id, "from_session": from_session},
+                content=f"Message sent to session '{session_key}'. Reply: {reply or '(no reply)'}",
+                metadata={
+                    "runId": run_id,
+                    "status": "ok",
+                    "reply": reply,
+                    "sessionKey": session_key,
+                    "delivery": {"status": "pending", "mode": "announce"},
+                },
             )
 
         except Exception as e:
             logger.error(f"Sessions send error: {e}", exc_info=True)
-            return ToolResult(success=False, content="", error=str(e))
+            return ToolResult(
+                success=False,
+                content="",
+                error=str(e),
+                metadata={"runId": str(uuid.uuid4()), "status": "error"},
+            )
+    
+    def _is_a2a_allowed(self, a2a_policy: dict[str, Any], requester_agent_id: str, target_agent_id: str) -> bool:
+        """Check if A2A is allowed by policy (matches TS AgentToAgentPolicy.isAllowed)"""
+        allow_list = a2a_policy.get("allow", [])
+        if not allow_list:
+            return True  # No restrictions if allow list is empty
+        
+        # Check patterns: "agent1->agent2", "agent1->*", "*->agent2", "*->*"
+        specific = f"{requester_agent_id}->{target_agent_id}"
+        from_wildcard = f"{requester_agent_id}->*"
+        to_wildcard = f"*->{target_agent_id}"
+        all_wildcard = "*->*"
+        
+        return (
+            specific in allow_list
+            or from_wildcard in allow_list
+            or to_wildcard in allow_list
+            or all_wildcard in allow_list
+        )
 
 
 class SessionsSpawnTool(AgentTool):
@@ -374,7 +673,11 @@ class SessionsSpawnTool(AgentTool):
         }
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Spawn subagent session."""
+        """Spawn subagent session.
+        
+        Mirrors TypeScript sessions-spawn-tool.ts by directly calling spawn_subagent_direct.
+        All hooks and logic are handled inside spawn_subagent_direct.
+        """
         task = params.get("task")
         if not isinstance(task, str) or not task.strip():
             return ToolResult(success=False, content="", error="'task' is required")
@@ -400,134 +703,93 @@ class SessionsSpawnTool(AgentTool):
         # Parse attachments (matches TS sessions-spawn-tool.ts lines 112-119)
         attachments = params.get("attachments", [])
         attach_as = params.get("attachAs", {})
-        mount_path = attach_as.get("mountPath", "attachments")
-
-        # Resolve hook_runner from gateway or agent runtime
-        hook_runner = None
-        if self.gateway is not None:
-            hook_runner = getattr(self.gateway, "_hook_runner", None)
-        if hook_runner is None and self.session_manager is not None:
-            hook_runner = getattr(self.session_manager, "_hook_runner", None)
-
-        # Parent context for hooks
-        parent_agent_id = agent_id
-        parent_session_key: str | None = None
-        if self.session_manager is not None and hasattr(self.session_manager, "current_session_key"):
-            parent_session_key = self.session_manager.current_session_key
-
-        spawning_event = {
-            "task": task.strip(),
-            "label": label or None,
-            "agent_id": agent_id,
-            "model": model,
-        }
-        spawning_ctx = {
-            "agent_id": agent_id,
-            "parent_agent_id": parent_agent_id,
-            "parent_session_key": parent_session_key,
-        }
-
-        # Fire subagent_spawning hook (modifying — can block spawn)
-        if hook_runner is not None and hook_runner.has_hooks("subagent_spawning"):
-            try:
-                spawning_result = await hook_runner.run_subagent_spawning(spawning_event, spawning_ctx)
-                if isinstance(spawning_result, dict) and spawning_result.get("status") == "error":
-                    error_msg = spawning_result.get("error") or "Subagent spawn blocked by plugin"
-                    return ToolResult(success=False, content="", error=error_msg)
-            except Exception as hook_exc:
-                logger.warning("subagent_spawning hook error: %s", hook_exc)
-
-        # Fire subagent_delivery_target hook (modifying — can override delivery origin)
-        delivery_origin: dict | None = None
-        if hook_runner is not None and hook_runner.has_hooks("subagent_delivery_target"):
-            try:
-                delivery_result = await hook_runner.run_subagent_delivery_target(spawning_event, spawning_ctx)
-                if isinstance(delivery_result, dict):
-                    delivery_origin = delivery_result.get("origin")
-            except Exception as hook_exc:
-                logger.warning("subagent_delivery_target hook error: %s", hook_exc)
+        mount_path = attach_as.get("mountPath") if isinstance(attach_as, dict) else None
 
         try:
-            import time
-            session_id = (
-                label.lower().replace(" ", "-")[:32]
-                if label
-                else f"spawned-{int(time.time())}"
+            # Import spawn_subagent_direct and related types
+            from openclaw.agents.subagent_spawn import (
+                spawn_subagent_direct,
+                SpawnSubagentParams,
+                SpawnSubagentContext,
             )
-
-            if self.gateway is not None:
-                spawn_fn = getattr(self.gateway, "spawn_subagent", None)
-                if callable(spawn_fn):
-                    result = await spawn_fn(
-                        task=task.strip(),
-                        label=label or None,
-                        agent_id=agent_id,
-                        model=model,
-                        thinking=thinking,
-                        run_timeout_seconds=run_timeout_seconds,
-                        cleanup=cleanup,
-                        delivery_origin=delivery_origin,
-                    )
-                    if isinstance(result, dict):
-                        session_key = result.get("sessionKey") or result.get("session_key") or session_id
-
-                        # Fire subagent_spawned hook (void, parallel)
-                        if hook_runner is not None and hook_runner.has_hooks("subagent_spawned"):
-                            try:
-                                await hook_runner.run_subagent_spawned(
-                                    {
-                                        "session_key": session_key,
-                                        "agent_id": agent_id,
-                                        "label": label or None,
-                                        "task": task.strip(),
-                                    },
-                                    spawning_ctx,
-                                )
-                            except Exception as hook_exc:
-                                logger.warning("subagent_spawned hook error: %s", hook_exc)
-
-                        return ToolResult(
-                            success=True,
-                            content=f"Spawned subagent session '{session_key}'. Task: {task.strip()[:120]}",
-                            metadata=result,
-                        )
-
-            if self.session_manager is not None:
-                session = self.session_manager.get_session(session_id)
-                session.add_user_message(task.strip())
-
-                # Fire subagent_spawned hook (void, parallel)
-                if hook_runner is not None and hook_runner.has_hooks("subagent_spawned"):
-                    try:
-                        await hook_runner.run_subagent_spawned(
-                            {
-                                "session_key": session_id,
-                                "agent_id": agent_id,
-                                "label": label or None,
-                                "task": task.strip(),
-                            },
-                            spawning_ctx,
-                        )
-                    except Exception as hook_exc:
-                        logger.warning("subagent_spawned hook error: %s", hook_exc)
-
+            from openclaw.config.loader import load_config
+            
+            cfg = load_config()
+            
+            # Build spawn params (mirrors TS sessions-spawn-tool.ts lines 151-169)
+            spawn_params = SpawnSubagentParams(
+                task=task.strip(),
+                label=label or None,
+                agentId=agent_id,
+                model=model,
+                thinking=thinking,
+                runTimeoutSeconds=int(run_timeout_seconds) if run_timeout_seconds is not None else None,
+                cleanup=cleanup,
+                expectsCompletionMessage=True,
+                mode=mode,
+                thread=thread,
+                sandbox="inherit",  # Default sandbox mode
+                attachments=attachments if attachments else None,
+                attachMountPath=mount_path,
+            )
+            
+            # Build spawn context (mirrors TS sessions-spawn-tool.ts lines 170-180)
+            # Get current session key from session_manager if available
+            current_session_key = None
+            if self.session_manager is not None and hasattr(self.session_manager, "current_session_key"):
+                current_session_key = self.session_manager.current_session_key
+            
+            spawn_ctx = SpawnSubagentContext(
+                agentSessionKey=current_session_key,
+                agentChannel=None,  # Can be extracted from session context if needed
+                agentAccountId=None,
+                agentTo=None,
+                agentThreadId=None,
+                agentGroupId=None,
+                agentGroupChannel=None,
+                agentGroupSpace=None,
+                requesterAgentIdOverride=None,
+            )
+            
+            # Spawn subagent (mirrors TS sessions-spawn-tool.ts line 151)
+            result = await spawn_subagent_direct(
+                params=spawn_params,
+                ctx=spawn_ctx,
+                cfg=cfg,
+                gateway=self.gateway,
+            )
+            
+            # Handle result
+            if result.status == "accepted":
                 return ToolResult(
                     success=True,
-                    content=f"Spawned session '{session_id}'",
+                    content=f"Subagent spawned: {result.childSessionKey}",
                     metadata={
-                        "sessionKey": session_id,
-                        "agentId": agent_id,
-                        "model": model,
-                        "cleanup": cleanup,
-                    },
+                        "childSessionKey": result.childSessionKey,
+                        "runId": result.runId,
+                        "mode": result.mode,
+                        "note": result.note,
+                        "status": "accepted",
+                    }
                 )
-
+            elif result.status == "forbidden":
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=result.error or "Subagent spawn forbidden"
+                )
+            else:  # error
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=result.error or "Subagent spawn failed"
+                )
+                
+        except Exception as e:
+            logger.error(f"Subagent spawn error: {e}", exc_info=True)
             return ToolResult(
-                success=True,
-                content=f"Session spawn queued: {session_id}",
-                metadata={"sessionKey": session_id},
+                success=False,
+                content="",
+                error=f"Spawn failed: {str(e)}"
             )
 
-        except Exception as exc:
-            logger.error("sessions_spawn error: %s", exc, exc_info=True)
-            return ToolResult(success=False, content="", error=str(exc))

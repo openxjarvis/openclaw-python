@@ -25,9 +25,17 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 logger = logging.getLogger(__name__)
+
+# Stream type constants — mirrors TS AgentEventStream
+AGENT_STREAM_LIFECYCLE: Literal["lifecycle"] = "lifecycle"
+AGENT_STREAM_TOOL: Literal["tool"] = "tool"
+AGENT_STREAM_ASSISTANT: Literal["assistant"] = "assistant"
+AGENT_STREAM_ERROR: Literal["error"] = "error"
+
+AgentEventStream = Literal["lifecycle", "tool", "assistant", "error"] | str
 
 # Module-level listener registry — synchronous callbacks only (mirrors TS)
 _listeners: set[Callable[[dict[str, Any]], None]] = set()
@@ -163,6 +171,11 @@ def clear_all_listeners() -> None:
 
 
 __all__ = [
+    "AGENT_STREAM_LIFECYCLE",
+    "AGENT_STREAM_TOOL",
+    "AGENT_STREAM_ASSISTANT",
+    "AGENT_STREAM_ERROR",
+    "AgentEventStream",
     "emit_agent_event",
     "on_agent_event",
     "listener_count",

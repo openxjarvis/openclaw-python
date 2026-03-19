@@ -1,10 +1,23 @@
-"""Plugin loader and discovery"""
+"""Plugin loader and discovery
+
+DEPRECATED: This PluginLoader class is deprecated. 
+Use load_gateway_plugins() from openclaw.plugins.plugin_manager instead.
+
+This module is retained for backward compatibility but should not be used in new code.
+
+Migration guide:
+    OLD: from openclaw.plugins.loader import PluginLoader
+    NEW: from openclaw.plugins.plugin_manager import load_gateway_plugins
+"""
 from __future__ import annotations
+
+from openclaw.config.paths import resolve_state_dir
 
 
 import importlib.util
 import logging
 import sys
+import warnings
 from pathlib import Path
 
 from .manifest import (
@@ -19,9 +32,18 @@ logger = logging.getLogger(__name__)
 
 
 class PluginLoader:
-    """Loads and manages plugins"""
+    """Loads and manages plugins
+    
+    DEPRECATED: Use load_gateway_plugins() instead.
+    """
 
     def __init__(self):
+        warnings.warn(
+            "PluginLoader is deprecated. Use load_gateway_plugins() from "
+            "openclaw.plugins.plugin_manager instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.plugins: dict[str, Plugin] = {}
         self._plugin_apis: dict[str, PluginAPI] = {}
         # Tracks manifest / load errors by plugin dir path; mirrors TS plugin diagnostics
@@ -42,7 +64,7 @@ class PluginLoader:
                     plugin_dirs.append(item)
 
         # User plugins
-        user_dir = Path.home() / ".openclaw" / "extensions"
+        user_dir = resolve_state_dir() / "extensions"
         if user_dir.exists():
             for item in user_dir.iterdir():
                 if item.is_dir() and _has_manifest(item):

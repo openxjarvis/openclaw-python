@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.table import Table
+from ..config.paths import resolve_state_dir
 
 console = Console()
 skills_app = typer.Typer(help="List and inspect available skills")
@@ -26,8 +27,8 @@ def list_skills(
         # Load from all sources
         project_root = Path(__file__).parent.parent.parent
         bundled_skills = project_root / "skills"
-        managed_skills = Path.home() / ".openclaw" / "skills"
-        workspace_skills = Path.home() / ".openclaw" / "workspace" / "skills"
+        managed_skills = resolve_state_dir() / "skills"
+        workspace_skills = resolve_state_dir() / "skills"
         
         for skills_dir, source in [
             (bundled_skills, "bundled"),
@@ -87,8 +88,8 @@ def info(
         # Load from all sources
         project_root = Path(__file__).parent.parent.parent
         bundled_skills = project_root / "skills"
-        managed_skills = Path.home() / ".openclaw" / "skills"
-        workspace_skills = Path.home() / ".openclaw" / "workspace" / "skills"
+        managed_skills = resolve_state_dir() / "skills"
+        workspace_skills = resolve_state_dir() / "skills"
         
         all_skills = []
         for skills_dir, source in [
@@ -141,7 +142,7 @@ def check(
         from ..agents.skills_status import build_workspace_skill_status
         
         # Use workspace dir or default
-        workspace_dir = Path.home() / ".openclaw" / "workspace"
+        workspace_dir = resolve_state_dir() / "workspace"
         
         # Get bundled skills directory (project root / skills)
         project_root = Path(__file__).parent.parent.parent
@@ -223,8 +224,8 @@ def install(
         # Find the skill
         project_root = Path(__file__).parent.parent.parent
         bundled_skills = project_root / "skills"
-        managed_skills = Path.home() / ".openclaw" / "skills"
-        workspace_skills = Path.home() / ".openclaw" / "workspace" / "skills"
+        managed_skills = resolve_state_dir() / "skills"
+        workspace_skills = resolve_state_dir() / "skills"
         
         all_skills = []
         for skills_dir in [bundled_skills, managed_skills, workspace_skills]:

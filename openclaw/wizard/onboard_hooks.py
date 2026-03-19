@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ async def setup_hooks(
     from openclaw.hooks.hooks_status import build_workspace_hook_status
     from . import prompter
 
-    ws = workspace_dir or (Path.home() / ".openclaw" / "workspace")
+    ws = workspace_dir or (resolve_state_dir() / "workspace")
     cfg = dict(config) if config else {}
 
     print("\n" + "=" * 60)

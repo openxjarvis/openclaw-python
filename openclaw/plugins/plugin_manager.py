@@ -10,6 +10,8 @@ import shutil
 from datetime import datetime, UTC
 from typing import Any
 
+from openclaw.config.paths import resolve_state_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,7 +45,7 @@ class PluginManager:
     def __init__(self, plugin_dirs: list[Path] | None = None):
         self.plugins: dict[str, Plugin] = {}
         self.plugin_dirs = plugin_dirs or [
-            Path.home() / ".openclaw" / "plugins",
+            resolve_state_dir() / "plugins",
         ]
         for d in self.plugin_dirs:
             d.mkdir(parents=True, exist_ok=True)
@@ -298,7 +300,7 @@ def _discover_plugin_paths(
                 found.append((item.name, item, "bundled"))
 
     # 1. Global plugins from ~/.openclaw/plugins/
-    global_dir = Path.home() / ".openclaw" / "plugins"
+    global_dir = resolve_state_dir() / "plugins"
     if global_dir.exists():
         for item in sorted(global_dir.iterdir()):
             if item.is_dir() and (item / "__init__.py").exists():
@@ -379,6 +381,9 @@ async def load_gateway_plugins(
     from .registry import create_empty_plugin_registry
     from .api import create_plugin_api
     from .types import PluginRecord, PluginDiagnostic
+    from .path_safety import is_safe_plugin_path, normalize_plugin_path
+    from .schema_validator import validate_plugin_manifest
+    from .discovery import discover_openclaw_plugins
 
     if isinstance(workspace_dir, str):
         workspace_dir = Path(workspace_dir)
@@ -392,9 +397,26 @@ async def load_gateway_plugins(
     enabled_list: list[str] | None = plugins_config.get("enabled")
     disabled_list: list[str] = list(plugins_config.get("disabled") or [])
 
-    plugin_paths = _discover_plugin_paths(config, workspace_dir)
+    # Use integrated discovery from discovery.py (which internally calls _discover_plugin_paths)
+    plugin_paths = discover_openclaw_plugins(
+        str(workspace_dir) if workspace_dir else None,
+        config=config
+    )
 
-    for plugin_id, plugin_path, origin in plugin_paths:
+    for plugin_path_str, plugin_id, origin in plugin_paths:
+        plugin_path = Path(plugin_path_str)
+        
+        # Validate path safety
+        if not is_safe_plugin_path(plugin_path, workspace_dir):
+            logger.warning(f"Skipping unsafe plugin path: {plugin_path}")
+            registry.diagnostics.append(PluginDiagnostic(
+                level="warning",
+                message=f"Unsafe plugin path: {plugin_path}",
+                plugin_id=plugin_id,
+                source=str(plugin_path),
+            ))
+            continue
+        
         # Check enabled/disabled lists
         if enabled_list is not None and plugin_id not in enabled_list:
             continue

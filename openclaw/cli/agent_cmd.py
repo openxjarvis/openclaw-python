@@ -1,6 +1,8 @@
 """Agent execution and management commands — mirrors TS src/cli/program/register.agent.ts"""
 from __future__ import annotations
 
+from openclaw.config.paths import resolve_state_dir
+
 import asyncio
 import json
 import uuid
@@ -634,7 +636,7 @@ def set_identity(
         if identity_file:
             identity_path = Path(identity_file).expanduser()
         else:
-            ws = agent_entry.get("workspace") or str(Path.home() / ".openclaw" / "workspaces" / target_id)
+            ws = agent_entry.get("workspace") or str(resolve_state_dir() / "workspaces" / target_id)
             identity_path = Path(ws) / "IDENTITY.md"
 
         updated: dict = {}
@@ -706,7 +708,7 @@ def _load_raw_config() -> dict:
             return load_config_raw(_Path(cfg_path)) or {}
     except Exception:
         pass
-    default = _Path.home() / ".openclaw" / "openclaw.json"
+    default = _resolve_state_dir() / "openclaw.json"
     if default.exists():
         try:
             return load_config_raw(default) or {}

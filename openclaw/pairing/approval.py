@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .store import PairingStore, ChannelId
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ def add_to_allow_from(
     """
     try:
         # Read current config
-        config_path = Path.home() / ".openclaw" / "openclaw.json"
+        config_path = resolve_state_dir() / "openclaw.json"
         
         if not config_path.exists():
             logger.error("Config file not found")
@@ -134,7 +135,7 @@ def remove_from_allow_from(
         True if successful
     """
     try:
-        config_path = Path.home() / ".openclaw" / "openclaw.json"
+        config_path = resolve_state_dir() / "openclaw.json"
         
         if not config_path.exists():
             return False

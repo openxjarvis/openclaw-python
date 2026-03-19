@@ -16,6 +16,7 @@ import mimetypes
 import uuid
 from pathlib import Path
 from typing import Any
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ def _get_browser_tmp_dir() -> Path:
     tmp = os.environ.get("OPENCLAW_TMP_DIR") or ""
     if tmp:
         return Path(tmp)
-    return Path.home() / ".openclaw" / "tmp"
+    return resolve_state_dir() / "tmp"
 
 
 async def persist_browser_proxy_files(

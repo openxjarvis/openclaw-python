@@ -16,6 +16,8 @@ Architecture:
 """
 from __future__ import annotations
 
+from openclaw.config.paths import resolve_state_dir
+
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
@@ -320,7 +322,7 @@ class ChannelManager:
             self.tools = tools.list_tools()
         else:
             self.tools = list(tools)
-        self.workspace_dir = workspace_dir or Path.home() / ".openclaw" / "workspace"
+        self.workspace_dir = workspace_dir or resolve_state_dir() / "workspace"
 
         # Load bootstrap files and build complete system prompt
         self.system_prompt = self._build_system_prompt_with_bootstrap(system_prompt)
@@ -640,12 +642,16 @@ class ChannelManager:
     # Lifecycle Management
     # =========================================================================
 
-    async def start_channel(self, channel_id: str) -> bool:
+    async def start_channel(self, channel_id: str, account_id: str | None = None) -> bool:
         """
-        Start a specific channel
+        Start a specific channel (supports multi-account)
+        
+        If channel has a gateway adapter, will start individual account(s).
+        Otherwise, falls back to legacy single-instance start().
 
         Args:
             channel_id: Channel to start
+            account_id: Optional specific account ID to start (multi-account mode)
 
         Returns:
             True if started successfully
@@ -668,23 +674,103 @@ class ChannelManager:
             env.state = ChannelState.STARTING
             await self._emit_event(ChannelEventType.STARTING, channel_id, {})
 
-            # Set up message handler
-            handler = self._create_message_handler(channel_id)
-            channel.set_message_handler(handler)
-
-            # Start channel with config
-            await channel.start(env.config)
-
-            env.state = ChannelState.RUNNING
-            env.error = None
-
-            from datetime import datetime
-
-            env.started_at = datetime.now().isoformat()
-
-            logger.info(f"✅ Channel started: {channel_id}")
-            await self._emit_event(ChannelEventType.STARTED, channel_id, {})
-            return True
+            # Check if channel has gateway adapter (multi-account mode)
+            if hasattr(channel, 'gateway') and channel.gateway:
+                # Multi-account mode
+                adapter = channel.gateway
+                
+                # Get account IDs to start
+                account_ids = []
+                if account_id:
+                    account_ids = [account_id]
+                elif hasattr(channel, 'config') and hasattr(channel.config, 'list_account_ids'):
+                    account_ids = channel.config.list_account_ids(env.config)
+                else:
+                    account_ids = ["default"]
+                
+                # Start each account
+                for acc_id in account_ids:
+                    # Resolve account config
+                    account = None
+                    if hasattr(channel, 'config') and hasattr(channel.config, 'resolve_account'):
+                        account = channel.config.resolve_account(env.config, acc_id)
+                    
+                    # Create status snapshot
+                    from openclaw.channels.base import ChannelAccountSnapshot
+                    
+                    status = ChannelAccountSnapshot(
+                        account_id=acc_id,
+                        enabled=True,
+                        configured=True,
+                        running=False,
+                    )
+                    
+                    def get_status():
+                        return status
+                    
+                    def set_status(new_status: ChannelAccountSnapshot):
+                        nonlocal status
+                        status = new_status
+                    
+                    # Create abort signal (simple version)
+                    class AbortSignal:
+                        def __init__(self):
+                            self.aborted = False
+                        
+                        def abort(self):
+                            self.aborted = True
+                    
+                    abort_signal = AbortSignal()
+                    
+                    # Get channel runtime if available
+                    channel_runtime = None
+                    try:
+                        from openclaw.plugins.runtime import create_plugin_runtime
+                        plugin_runtime = create_plugin_runtime()
+                        channel_runtime = plugin_runtime.channel
+                    except Exception:
+                        pass
+                    
+                    # Start account
+                    await adapter.start_account(
+                        cfg=env.config,
+                        account_id=acc_id,
+                        account=account,
+                        runtime=env,
+                        abort_signal=abort_signal,
+                        get_status=get_status,
+                        set_status=set_status,
+                        log=logger,
+                        channel_runtime=channel_runtime,
+                    )
+                
+                env.state = ChannelState.RUNNING
+                env.error = None
+                
+                from datetime import datetime
+                env.started_at = datetime.now().isoformat()
+                
+                logger.info(f"✅ Channel started (multi-account): {channel_id}")
+                await self._emit_event(ChannelEventType.STARTED, channel_id, {})
+                return True
+            
+            else:
+                # Legacy mode: single-instance start()
+                handler = self._create_message_handler(channel_id)
+                channel.set_message_handler(handler)
+                
+                # Start channel with config
+                await channel.start(env.config)
+                
+                env.state = ChannelState.RUNNING
+                env.error = None
+                
+                from datetime import datetime
+                env.started_at = datetime.now().isoformat()
+                
+                logger.info(f"✅ Channel started: {channel_id}")
+                await self._emit_event(ChannelEventType.STARTED, channel_id, {})
+                return True
 
         except Exception as e:
             env.state = ChannelState.ERROR
@@ -1391,7 +1477,7 @@ class ChannelManager:
                 # Get or create session using per-agent SessionManager
                 session = None
                 session_workspace: str | None = None
-                workspace_root: str | None = str(Path.home() / ".openclaw" / "workspace")
+                workspace_root: str | None = str(resolve_state_dir() / "workspace")
                 _session_mgr = self.get_session_manager(agent_id)
                 if _session_mgr:
                     session = _session_mgr.get_or_create_session_by_key(session_key)
@@ -1399,7 +1485,7 @@ class ChannelManager:
 
                     # Resolve session workspace for file generation
                     from openclaw.agents.session_workspace import resolve_session_workspace_dir
-                    _workspace_root = session.workspace_dir if session else Path.home() / ".openclaw" / "workspace"
+                    _workspace_root = session.workspace_dir if session else resolve_state_dir() / "workspace"
                     session_workspace = str(resolve_session_workspace_dir(
                         workspace_root=_workspace_root,
                         session_key=session_key

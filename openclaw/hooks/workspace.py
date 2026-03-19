@@ -12,6 +12,7 @@ from typing import Optional, Any
 
 from .types import HookEntry, HookSnapshot, HookSource
 from .loader import load_hooks_from_dir
+from openclaw.config.paths import resolve_state_dir
 
 # Sentinel value to distinguish "not provided" from "explicitly None"
 _UNSET = object()
@@ -52,7 +53,7 @@ def load_workspace_hook_entries(
     
     # Resolve default directories
     if managed_hooks_dir is None:
-        managed_hooks_dir = Path.home() / ".openclaw" / "hooks"
+        managed_hooks_dir = resolve_state_dir() / "hooks"
     elif isinstance(managed_hooks_dir, str):
         managed_hooks_dir = Path(managed_hooks_dir)
     

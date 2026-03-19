@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from openclaw.config.paths import resolve_state_dir
+
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -124,7 +126,7 @@ def install(
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
     """Install hooks from a directory"""
-    hooks_dir = directory or (Path.home() / ".openclaw" / "hooks")
+    hooks_dir = directory or (resolve_state_dir() / "hooks")
     if not hooks_dir.exists():
         console.print(f"[yellow]⚠[/yellow]  Hooks directory not found: {hooks_dir}")
         raise typer.Exit(1)
@@ -147,7 +149,7 @@ def update(
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
     """Update hooks from a directory"""
-    hooks_dir = directory or (Path.home() / ".openclaw" / "hooks")
+    hooks_dir = directory or (resolve_state_dir() / "hooks")
     if not hooks_dir.exists():
         console.print(f"[yellow]⚠[/yellow]  Hooks directory not found: {hooks_dir}")
         raise typer.Exit(1)

@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from openclaw.config.paths import resolve_state_dir
+
 from openclaw.agents.agent_scope import resolve_agent_workspace_dir
 
 
@@ -49,7 +51,7 @@ def get_default_media_local_roots() -> list[str]:
     Returns:
         List of default root directory paths as strings
     """
-    state_dir = Path.home() / ".openclaw"
+    state_dir = resolve_state_dir()
     return build_media_local_roots(state_dir)
 
 
@@ -89,7 +91,7 @@ def get_agent_scoped_media_local_roots(
         /Users/user/.openclaw/sandboxes
         /Users/user/.openclaw/workspaces/main
     """
-    state_dir = Path.home() / ".openclaw"
+    state_dir = resolve_state_dir()
     
     # Build base roots using build_media_local_roots
     roots_list = build_media_local_roots(state_dir)

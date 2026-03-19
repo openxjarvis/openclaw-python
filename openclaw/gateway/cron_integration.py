@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from ..config.paths import resolve_state_dir
 
 if TYPE_CHECKING:
     from ..agents.providers import LLMProvider
@@ -40,7 +41,7 @@ async def run_isolated_cron_job(
     from ..cron.isolated_agent.run import run_isolated_agent_turn
     
     # Get sessions directory
-    sessions_dir = session_manager.sessions_dir if hasattr(session_manager, "sessions_dir") else Path.home() / ".openclaw" / "sessions"
+    sessions_dir = session_manager.sessions_dir if hasattr(session_manager, "sessions_dir") else resolve_state_dir() / "sessions"
     
     try:
         # Run isolated agent turn

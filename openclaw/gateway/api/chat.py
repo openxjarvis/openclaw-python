@@ -16,6 +16,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from ...config.paths import resolve_state_dir
 
 if TYPE_CHECKING:
     from ..server import GatewayConnection
@@ -609,7 +610,7 @@ class ChatHistoryMethod:
         if not hasattr(session_manager, 'sessions_dir'):
             logger.error(f"SessionManager has no sessions_dir! Type: {type(session_manager)}, attrs: {dir(session_manager)}")
             # Fallback to _sessions_dir
-            sessions_dir = Path(getattr(session_manager, '_sessions_dir', Path.home() / ".openclaw" / ".sessions"))
+            sessions_dir = Path(getattr(session_manager, '_sessions_dir', resolve_state_dir() / ".sessions"))
         else:
             sessions_dir = Path(session_manager.sessions_dir)
         transcript_path = resolve_transcript_path(session_id, sessions_dir)
@@ -739,7 +740,7 @@ class ChatSendMethod:
         if hasattr(session_manager, 'sessions_dir'):
             sessions_dir = Path(session_manager.sessions_dir)
         else:
-            sessions_dir = Path(getattr(session_manager, '_sessions_dir', Path.home() / ".openclaw" / ".sessions"))
+            sessions_dir = Path(getattr(session_manager, '_sessions_dir', resolve_state_dir() / ".sessions"))
         transcript_path = resolve_transcript_path(session_id, sessions_dir)
         
         # Build user message
@@ -1070,7 +1071,7 @@ class ChatAbortMethod:
                         sessions_dir = Path(
                             getattr(session_manager, "sessions_dir",
                                     getattr(session_manager, "_sessions_dir",
-                                            Path.home() / ".openclaw" / ".sessions"))
+                                            resolve_state_dir() / ".sessions"))
                         )
                         transcript_path = resolve_transcript_path(session.session_id, sessions_dir)
                         now = datetime.now(UTC)

@@ -14,6 +14,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ class CanvasHostServer:
     """
     
     def __init__(self, canvas_root: Path | None = None):
-        self.canvas_root = canvas_root or (Path.home() / ".openclaw" / "canvas")
+        self.canvas_root = canvas_root or (resolve_state_dir() / "canvas")
         self.canvas_root.mkdir(parents=True, exist_ok=True)
         
         # Ensure default index.html exists (TS alignment)

@@ -241,3 +241,77 @@ async def ensure_fallback_provider_configured(
     
     # Not configured, prompt user to configure
     return await configure_fallback_provider(config, provider, interactive)
+
+
+async def check_fallback_providers_configured(
+    config: OpenClawConfig,
+    model_ids: list[str],
+    interactive: bool = True
+) -> dict[str, bool]:
+    """批量检查多个 fallback model 的 provider 是否已配置
+    
+    Args:
+        config: Current configuration
+        model_ids: List of model IDs (e.g., ["openai/gpt-4o", "anthropic/claude-sonnet-4"])
+        interactive: Whether to prompt user interactively
+        
+    Returns:
+        Dict of model_id -> is_configured
+    """
+    results = {}
+    unconfigured_providers = set()
+    provider_to_models = {}  # provider -> [model_ids]
+    
+    # Step 1: Check all providers
+    for model_id in model_ids:
+        provider = extract_provider_from_model_id(model_id)
+        if not provider:
+            results[model_id] = True  # Allow unknown providers
+            continue
+        
+        is_configured = check_provider_configured(config, provider)
+        results[model_id] = is_configured
+        
+        if not is_configured:
+            unconfigured_providers.add(provider)
+            if provider not in provider_to_models:
+                provider_to_models[provider] = []
+            provider_to_models[provider].append(model_id)
+    
+    # Step 2: If any unconfigured and interactive, prompt to configure all at once
+    if unconfigured_providers and interactive:
+        print("\n" + "=" * 80)
+        print("Fallback Provider Configuration Needed")
+        print("=" * 80)
+        print("\nThe following providers need API keys configured:")
+        
+        for provider in sorted(unconfigured_providers):
+            provider_info = PROVIDER_MAP.get(provider, {})
+            display_name = provider_info.get("display_name", provider)
+            models = provider_to_models.get(provider, [])
+            print(f"\n  • {display_name}")
+            for model in models:
+                print(f"      - {model}")
+        
+        print("\nYou can configure them now or skip and configure later.")
+        
+        try:
+            from . import prompter
+            configure_all = prompter.confirm(
+                "Configure all missing providers now?",
+                default=True
+            )
+        except Exception:
+            configure_input = input("\nConfigure all missing providers now? [Y/n]: ").strip().lower()
+            configure_all = (configure_input != "n")
+        
+        if configure_all:
+            # Configure each provider
+            for provider in sorted(unconfigured_providers):
+                success = await configure_fallback_provider(config, provider, interactive=True)
+                
+                # Update results for all models using this provider
+                for model_id in provider_to_models.get(provider, []):
+                    results[model_id] = success
+    
+    return results

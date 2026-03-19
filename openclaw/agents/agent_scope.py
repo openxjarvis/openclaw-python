@@ -15,6 +15,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from ..config.paths import resolve_state_dir
 
 from openclaw.routing.session_key import (
     DEFAULT_AGENT_ID,
@@ -287,7 +288,6 @@ def resolve_agent_workspace_dir(cfg: Any, agent_id: str) -> Path:
     Returns:
         Resolved workspace directory path
     """
-    from openclaw.config.paths import resolve_state_dir
     
     normalized_id = normalize_agent_id(agent_id)
     
@@ -340,7 +340,6 @@ def resolve_agent_dir(cfg: Any, agent_id: str) -> Path:
     Returns:
         Resolved agent directory path
     """
-    from openclaw.config.paths import resolve_state_dir
     
     normalized_id = normalize_agent_id(agent_id)
     

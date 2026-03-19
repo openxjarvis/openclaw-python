@@ -12,6 +12,8 @@ import platform
 from pathlib import Path
 from typing import Any
 
+from openclaw.config.paths import resolve_state_dir
+
 # Module-level imports so tests can patch openclaw.gateway.bootstrap.load_config etc.
 try:
     from ..config.loader import load_config
@@ -147,9 +149,10 @@ class GatewayBootstrap:
             config_path_resolved = config_path
         else:
             # Check both possible config locations
-            config_path_resolved = Path.home() / ".openclaw" / "openclaw.json"
+            state_dir = resolve_state_dir()
+            config_path_resolved = state_dir / "openclaw.json"
             if not config_path_resolved.exists():
-                config_path_resolved = Path.home() / ".openclaw" / "config.json"
+                config_path_resolved = state_dir / "config.json"
         
         if not config_path_resolved.exists() and not allow_unconfigured:
             # First-run: attempt interactive onboarding (mirrors TS first-run flow)
@@ -285,7 +288,8 @@ class GatewayBootstrap:
             if self.config and hasattr(self.config, 'agent') and hasattr(self.config.agent, 'workspace'):
                 workspace_dir = Path(self.config.agent.workspace).expanduser().resolve()
             else:
-                workspace_dir = Path.home() / ".openclaw" / "workspace"
+                state_dir = resolve_state_dir()
+                workspace_dir = state_dir / "workspace"
         
         # Ensure workspace exists with bootstrap files (matching TypeScript behavior)
         try:
@@ -776,9 +780,10 @@ class GatewayBootstrap:
             register_skills_change_listener(on_skills_change)
             
             # Watch skill directories
+            state_dir = resolve_state_dir()
             skill_dirs = [
                 Path(__file__).parent.parent / "skills",
-                Path.home() / ".openclaw" / "skills",
+                state_dir / "skills",
                 workspace_dir / "skills",
             ]
             for d in skill_dirs:
@@ -968,6 +973,15 @@ class GatewayBootstrap:
             # Override the ChannelManager that GatewayServer created with our own
             # (since we already configured it in Step 13)
             self.server.channel_manager = self.channel_manager
+            
+            # Inject gateway reference into SessionsSpawnTool (required for subagent spawning)
+            # SessionsSpawnTool needs the gateway object to make internal RPC calls, but it's
+            # registered in Step 10 before GatewayServer exists. We inject it here post-creation.
+            if self.tool_registry:
+                sessions_spawn_tool = self.tool_registry.get("sessions_spawn")
+                if sessions_spawn_tool:
+                    sessions_spawn_tool.gateway = self.server
+                    logger.debug("Injected gateway reference into SessionsSpawnTool")
             
             # Start server: launch as background task but wait briefly then
             # verify the port is actually bound before declaring success.

@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class PersistentAPIKeyStore:
             db_path: Path to SQLite database (default: ~/.openclaw/api_keys.db)
         """
         if db_path is None:
-            db_path = Path.home() / ".openclaw" / "api_keys.db"
+            db_path = resolve_state_dir() / "api_keys.db"
         
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,8 @@
 """Daemon (gateway service) management commands — mirrors TS src/cli/daemon-cli.ts"""
 from __future__ import annotations
 
+from openclaw.config.paths import resolve_state_dir
+
 import os
 import platform
 import subprocess
@@ -45,9 +47,13 @@ def _get_openclaw_bin() -> str:
 
 
 def _get_log_path() -> Path:
-    log_dir = Path.home() / ".openclaw" / "logs"
+    """Get rolling log file path (matches TS daily logs)."""
+    log_dir = resolve_state_dir() / "tmp"
     log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / "gateway.log"
+    # Use rolling log format: openclaw-YYYY-MM-DD.log
+    from datetime import datetime
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    return log_dir / f"openclaw-{date_str}.log"
 
 
 def _get_plist_path() -> Path:
@@ -93,7 +99,7 @@ def _build_launchd_plist(bin_path: str, port: int, log_path: Path) -> str:
         agent_dir = str(resolve_agent_dir())
     except Exception:
         import pathlib
-        agent_dir = str(pathlib.Path.home() / ".openclaw" / "agents" / "main" / "agent")
+        agent_dir = str(pathlib.resolve_state_dir() / "agents" / "main" / "agent")
     env_pairs.append(("OPENCLAW_AGENT_DIR", agent_dir))
     env_pairs.append(("PI_CODING_AGENT_DIR", agent_dir))
 

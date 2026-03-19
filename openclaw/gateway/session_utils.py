@@ -26,6 +26,7 @@ from openclaw.routing.session_key import (
     parse_agent_session_key,
     normalize_agent_id,
 )
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -625,7 +626,6 @@ def list_existing_agent_ids_from_disk() -> list[str]:
     Mirrors TS listExistingAgentIdsFromDisk().
     """
     try:
-        from openclaw.config.paths import resolve_state_dir
         state_dir = Path(resolve_state_dir())
         agents_dir = state_dir / "agents"
         if not agents_dir.is_dir():

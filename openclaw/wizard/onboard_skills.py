@@ -16,6 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,7 @@ async def setup_skills(
     from openclaw.agents.skills_status import build_workspace_skill_status
     from . import prompter
 
-    ws = workspace_dir or (Path.home() / ".openclaw" / "workspace")
+    ws = workspace_dir or (resolve_state_dir() / "workspace")
     cfg = dict(config) if config else {}
 
     print("\n" + "=" * 60)

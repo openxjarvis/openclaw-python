@@ -15,6 +15,7 @@ from urllib.parse import urlparse, unquote
 import aiohttp
 
 from openclaw.media.mime import MediaKind, media_kind_from_mime
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,6 @@ async def _assert_local_media_allowed(
     # block per-agent workspace-* subdirectories unless explicitly allowed
     # (prevents temp-dir-based agents from accessing other agents' workspaces)
     if local_roots is None:
-        from openclaw.config.paths import resolve_state_dir
         state_dir = Path(resolve_state_dir())
         
         # Find workspace root in allowed roots

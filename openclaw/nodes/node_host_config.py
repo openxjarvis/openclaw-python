@@ -6,6 +6,7 @@ import os
 import stat
 import uuid
 from dataclasses import dataclass
+from ..config.paths import resolve_state_dir
 
 
 @dataclass
@@ -30,7 +31,6 @@ NODE_HOST_FILE = "node.json"
 
 def resolve_node_host_config_path() -> str:
     try:
-        from openclaw.config.paths import resolve_state_dir
         state_dir = str(resolve_state_dir())
     except (ImportError, Exception):
         state_dir = os.path.expanduser("~/.openclaw")

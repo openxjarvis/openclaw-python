@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from openclaw.config.paths import resolve_state_dir
 from .loader import format_skills_for_prompt, load_skill_entries_from_dir
 from .types import Skill, SkillEntry, SkillSnapshot
 
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 def get_openclaw_dir() -> Path:
     """Get OpenClaw config directory (~/.openclaw/)."""
-    return Path.home() / ".openclaw"
+    return resolve_state_dir()
 
 
 def get_managed_skills_dir() -> Path:

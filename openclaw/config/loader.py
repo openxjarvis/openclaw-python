@@ -13,6 +13,8 @@ Matches TypeScript openclaw/src/config/io.ts:
 
 from __future__ import annotations
 
+from openclaw.config.paths import resolve_state_dir
+
 import json
 import hashlib
 import logging
@@ -222,10 +224,10 @@ def _resolve_config_path(config_path: Optional[str | Path]) -> Optional[Path]:
         Path.cwd() / "openclaw.json",
         Path.cwd() / "openclaw.json5",
         Path.cwd() / "config" / "openclaw.json",
-        Path.home() / ".openclaw" / "openclaw.json",   # Python-native config (preferred)
-        Path.home() / ".openclaw" / "openclaw.json5",
-        Path.home() / ".openclaw" / "config.json",     # TS-format config (fallback)
-        Path.home() / ".openclaw" / "config.json5",
+        resolve_state_dir() / "openclaw.json",   # Python-native config (preferred)
+        resolve_state_dir() / "openclaw.json5",
+        resolve_state_dir() / "config.json",     # TS-format config (fallback)
+        resolve_state_dir() / "config.json5",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -433,7 +435,7 @@ def write_config_file(
     """
     global _cached_config, _cached_config_path, _cached_config_mtime_ns
 
-    path = Path(config_path) if config_path else Path.home() / ".openclaw" / "openclaw.json"
+    path = Path(config_path) if config_path else resolve_state_dir() / "openclaw.json"
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Invalidate cache before writing
@@ -522,8 +524,8 @@ def get_config_path() -> Path:
     candidates = [
         Path.cwd() / "openclaw.json",
         Path.cwd() / "config" / "openclaw.json",
-        Path.home() / ".openclaw" / "openclaw.json",
-        Path.home() / ".openclaw" / "config.json",
+        resolve_state_dir() / "openclaw.json",
+        resolve_state_dir() / "config.json",
     ]
 
     for candidate in candidates:
@@ -531,7 +533,7 @@ def get_config_path() -> Path:
             return candidate
 
     # Default: user-level config (may not exist)
-    return Path.home() / ".openclaw" / "openclaw.json"
+    return resolve_state_dir() / "openclaw.json"
 
 
 def get_config_value(key_path: str, default: Any = None) -> Any:

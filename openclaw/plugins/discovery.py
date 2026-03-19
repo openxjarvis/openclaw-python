@@ -8,6 +8,8 @@ Scans multiple directories for plugin candidates:
 """
 from __future__ import annotations
 
+from openclaw.config.paths import resolve_state_dir
+
 import json
 import logging
 from pathlib import Path
@@ -128,7 +130,7 @@ class PluginDiscovery:
     
     def _resolve_extensions_dir(self) -> Path:
         """Resolve user extensions directory"""
-        config_dir = Path.home() / ".openclaw"
+        config_dir = resolve_state_dir()
         return config_dir / "extensions"
     
     async def discover_all(self) -> PluginDiscoveryResult:
@@ -401,4 +403,39 @@ def discover_plugins(
     import asyncio
     
     discovery = PluginDiscovery(config=config, workspace_dir=workspace_dir)
+    return asyncio.run(discovery.discover_all())
+
+
+def discover_openclaw_plugins(
+    workspace_dir: str | Path | None = None,
+    extra_paths: list[str] | None = None,
+) -> PluginDiscoveryResult:
+    """
+    Discover OpenClaw plugins from standard locations and extra paths.
+    
+    This function is called by manifest_registry.py and provides compatibility
+    with the discovery interface expected by the registry system.
+    
+    Args:
+        workspace_dir: Workspace directory (optional)
+        extra_paths: Additional plugin search paths
+        
+    Returns:
+        PluginDiscoveryResult with candidates and diagnostics
+    """
+    import asyncio
+    
+    # Convert workspace_dir to Path
+    if workspace_dir is None:
+        workspace_dir = Path.cwd()
+    elif isinstance(workspace_dir, str):
+        workspace_dir = Path(workspace_dir)
+    
+    # Create discovery instance
+    discovery = PluginDiscovery(config={}, workspace_dir=workspace_dir)
+    
+    # TODO: Handle extra_paths
+    # For now, we use the standard discovery locations
+    # In future, we can extend PluginDiscovery to support custom paths
+    
     return asyncio.run(discovery.discover_all())

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from openclaw.config.paths import resolve_state_dir
 
 
 def normalize_token(value: str | None) -> str:
@@ -110,7 +111,7 @@ class IdentityLinkStore:
         Args:
             config_path: Path to identity links JSON file
         """
-        self._config_path = config_path or (Path.home() / ".openclaw" / "identity_links.json")
+        self._config_path = config_path or (resolve_state_dir() / "identity_links.json")
         self._links: dict[str, list[str]] = {}  # canonical -> [identities]
         self._reverse_index: dict[str, str] = {}  # identity -> canonical
         self._load()

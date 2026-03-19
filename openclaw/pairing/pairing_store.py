@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from openclaw.config.paths import resolve_state_dir
 from .code_generator import generate_pairing_code, normalize_pairing_code
 from .types import ChannelPairingAdapter, PairingRequest
 
@@ -30,7 +31,6 @@ PAIRING_PENDING_MAX: int = 3
 
 def _resolve_credentials_dir() -> Path:
     """Return the credentials directory (mirrors TS resolveOAuthDir → stateDir/credentials)."""
-    from openclaw.config.paths import resolve_state_dir
     state_dir = resolve_state_dir()
     # Respect explicit override first (env var kept for compatibility)
     oauth_override = os.environ.get("OPENCLAW_OAUTH_DIR", "").strip()

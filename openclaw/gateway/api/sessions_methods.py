@@ -458,17 +458,34 @@ class SessionsPatchMethod:
         target = resolve_gateway_session_store_target(key)
         
         def mutator(store: Dict[str, SessionEntry]) -> None:
-            apply_sessions_patch_to_store(
+            logger.debug(f"Mutator called, store has {len(store)} entries before patch")
+            result = apply_sessions_patch_to_store(
                 store,
                 target.canonical_key,
                 patch,
                 model_catalog=None
             )
+            if not result.get("ok"):
+                logger.error(f"Patch FAILED! Error: {result.get('error')}")
+            logger.debug(f"Mutator done, patch result ok={result.get('ok')}, store has {len(store)} entries, target_key={target.canonical_key}")
         
         update_session_store(target.store_path, mutator)
         
         # Reload to get updated entry
         store = load_session_store(target.store_path)
+        
+        # Check if entry exists after mutation
+        if target.canonical_key not in store:
+            # This shouldn't happen if apply_sessions_patch_to_store worked correctly
+            logger.error(
+                f"Entry not found after mutation: key={target.canonical_key}, "
+                f"available_keys={list(store.keys())[:10]}"
+            )
+            raise KeyError(
+                f"Session entry not created: {target.canonical_key}. "
+                f"This may indicate a problem with session store persistence."
+            )
+        
         entry = store[target.canonical_key]
         
         return {

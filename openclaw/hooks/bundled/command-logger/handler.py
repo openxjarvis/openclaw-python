@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ async def log_command(event: Any) -> None:
     
     try:
         # Create log directory
-        state_dir = Path.home() / ".openclaw"
+        state_dir = resolve_state_dir()
         log_dir = state_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         

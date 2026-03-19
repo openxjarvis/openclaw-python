@@ -14,6 +14,7 @@ from typing import Any
 from .constants import DEFAULT_SANDBOX_IMAGE, SANDBOX_AGENT_WORKSPACE_MOUNT
 from .docker import DockerSandbox, DockerSandboxConfig, docker_container_state
 from .fs_bridge import SandboxFsBridge, create_sandbox_fs_bridge
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ class SandboxWorkspaceInfo:
 # Scope helpers
 # ---------------------------------------------------------------------------
 
-_DEFAULT_WORKSPACE_ROOT = str(Path.home() / ".openclaw" / "sandboxes")
+_DEFAULT_WORKSPACE_ROOT = str(resolve_state_dir() / "sandboxes")
 
 
 def resolve_sandbox_scope_key(scope: str, session_key: str) -> str:
@@ -139,7 +140,7 @@ async def resolve_sandbox_context(
     workspace_root = sandbox_cfg.get("workspaceRoot", _DEFAULT_WORKSPACE_ROOT)
 
     agent_workspace_dir = str(
-        Path(workspace_dir).resolve() if workspace_dir else Path.home() / ".openclaw" / "workspace"
+        Path(workspace_dir).resolve() if workspace_dir else resolve_state_dir() / "workspace"
     )
     scope_key = resolve_sandbox_scope_key(scope, session_key)
     sandbox_workspace_dir = (
@@ -230,7 +231,7 @@ async def get_sandbox_workspace_info(
     container_workdir = docker_section.get("workdir", SANDBOX_AGENT_WORKSPACE_MOUNT)
 
     agent_workspace_dir = str(
-        Path(workspace_dir).resolve() if workspace_dir else Path.home() / ".openclaw" / "workspace"
+        Path(workspace_dir).resolve() if workspace_dir else resolve_state_dir() / "workspace"
     )
     scope_key = resolve_sandbox_scope_key(scope, session_key)
     sandbox_workspace_dir = (

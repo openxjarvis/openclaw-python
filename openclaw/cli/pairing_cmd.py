@@ -3,6 +3,7 @@
 import typer
 from rich.console import Console
 from rich.table import Table
+from ..config.paths import resolve_state_dir
 
 console = Console()
 pairing_app = typer.Typer(help="Channel pairing management")
@@ -50,7 +51,7 @@ def _telegram_notify_approved(chat_id: str, account_id: str | None = None) -> No
     if not bot_token:
         import json as _j
         from pathlib import Path
-        cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+        cfg_path = resolve_state_dir() / "openclaw.json"
         if cfg_path.exists():
             raw = _j.loads(cfg_path.read_text())
             tg_raw = raw.get("channels", {}).get("telegram", {})
@@ -82,7 +83,7 @@ def _feishu_notify_approved(open_id: str, account_id: str | None = None) -> None
     from pathlib import Path
 
     # Load Feishu credentials from openclaw.json
-    cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+    cfg_path = resolve_state_dir() / "openclaw.json"
     if not cfg_path.exists():
         raise RuntimeError("openclaw.json not found — cannot send Feishu notification")
 

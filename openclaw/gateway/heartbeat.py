@@ -19,6 +19,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Default heartbeat target (matches TS DEFAULT_HEARTBEAT_TARGET = "none")
+DEFAULT_HEARTBEAT_TARGET = "none"
+
 # Default heartbeat prompt (matches TS)
 DEFAULT_HEARTBEAT_PROMPT = (
     "Read HEARTBEAT.md if it exists (workspace context). "
@@ -77,7 +80,7 @@ class HeartbeatConfig:
         model: str | None = None,
         include_reasoning: bool = False,
         light_context: bool = False,
-        target: str = "last",
+        target: str = "none",  # Changed from "last" to align with TS DEFAULT_HEARTBEAT_TARGET
         to: str | None = None,
         account_id: str | None = None,
         prompt: str = DEFAULT_HEARTBEAT_PROMPT,
@@ -447,6 +450,23 @@ class HeartbeatManager:
     async def _execute_heartbeat(self) -> None:
         """Execute heartbeat agent turn and handle HEARTBEAT_OK contract."""
         logger.info("Executing heartbeat turn (session=%s)", self._session_key)
+        
+        # Queue check: skip heartbeat if agent is busy (mirrors TS getQueueSize check)
+        if hasattr(self._agent_runtime, 'is_busy') and callable(self._agent_runtime.is_busy):
+            try:
+                if self._agent_runtime.is_busy():
+                    logger.info("Heartbeat skipped: agent is busy (requests in flight)")
+                    from openclaw.infra.heartbeat_events import emit_heartbeat_event
+                    emit_heartbeat_event({
+                        "agentId": getattr(self._agent_runtime, 'agent_id', 'main'),
+                        "status": "skipped",
+                        "reason": "requests-in-flight",
+                        "indicator": "ok",
+                    })
+                    return
+            except Exception as e:
+                logger.debug(f"Failed to check agent busy state: {e}")
+                # Continue with heartbeat if check fails
 
         # HEARTBEAT.md empty check (mirrors TS preflight gate)
         if not await self._check_heartbeat_md():
@@ -468,10 +488,20 @@ class HeartbeatManager:
         except Exception:
             pass
 
+        # Append current time to prompt (mirrors TS appendCronStyleCurrentTimeLine)
+        from openclaw.agents.current_time import append_cron_style_current_time_line
+        import time
+        
+        prompt_with_time = append_cron_style_current_time_line(
+            self._config.prompt,
+            self._agent_runtime.config if hasattr(self._agent_runtime, 'config') else {},
+            int(time.time() * 1000)
+        )
+
         # Build run_turn kwargs — light_context skips full history (mirrors TS lightContext).
         run_kwargs: dict[str, Any] = {
             "session_key": self._session_key,
-            "messages": [{"role": "user", "content": self._config.prompt}],
+            "messages": [{"role": "user", "content": prompt_with_time}],  # Use prompt with time
             "stream": True,
         }
         if self._config.light_context:
@@ -550,11 +580,48 @@ class HeartbeatManager:
     async def _deliver(self, text: str) -> None:
         """Send heartbeat message via the configured target/to/accountId.
 
+        Implements 24-hour deduplication (mirrors TS lastHeartbeatText/lastHeartbeatSentAt).
         Currently delegates to agent_runtime if it exposes a send() method.
         If not, logs the message only.
         """
         if not text:
             return
+        
+        # Deduplication check (mirrors TS isDuplicateMain logic)
+        import time
+        current_ms = int(time.time() * 1000)
+        
+        try:
+            # Load session store to check last heartbeat
+            from openclaw.config.sessions.store_utils import load_session_store_from_path, save_session_store_to_path
+            from openclaw.config.sessions.paths import resolve_default_session_store_path
+            
+            store_path = resolve_default_session_store_path(agent_id=None)  # Use default agent
+            
+            if store_path.exists():
+                store = load_session_store_from_path(store_path)
+                entry = store.get(self._session_key.lower())  # Case-insensitive lookup
+                
+                if entry:
+                    prev_text = getattr(entry, 'lastHeartbeatText', None) or getattr(entry, 'last_heartbeat_text', None)
+                    prev_at = getattr(entry, 'lastHeartbeatSentAt', None) or getattr(entry, 'last_heartbeat_sent_at', None)
+                    
+                    # Check if duplicate (same text within 24 hours)
+                    if prev_text and prev_at:
+                        time_diff_ms = current_ms - prev_at
+                        TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000
+                        
+                        if time_diff_ms < TWENTY_FOUR_HOURS_MS and prev_text.strip() == text.strip():
+                            logger.info(
+                                "Heartbeat suppressed: duplicate message within 24h (age=%d min)",
+                                int(time_diff_ms / 60000)
+                            )
+                            return
+        except Exception as e:
+            logger.debug(f"Failed to check heartbeat deduplication: {e}")
+            # Continue to send even if dedup check fails
+        
+        # Send the message
         if hasattr(self._agent_runtime, "send_heartbeat_message"):
             await self._agent_runtime.send_heartbeat_message(
                 text=text,
@@ -564,6 +631,36 @@ class HeartbeatManager:
             )
         else:
             logger.info("Heartbeat message (target=%s): %s", self._config.target, text[:200])
+        
+        # Update session store with last heartbeat info (mirrors TS)
+        try:
+            from openclaw.config.sessions.store_utils import load_session_store_from_path, save_session_store_to_path
+            from openclaw.config.sessions.paths import resolve_default_session_store_path
+            
+            store_path = resolve_default_session_store_path(agent_id=None)
+            
+            if store_path.exists():
+                store = load_session_store_from_path(store_path)
+                entry = store.get(self._session_key.lower())
+                
+                if entry:
+                    # Update lastHeartbeatText and lastHeartbeatSentAt
+                    if hasattr(entry, 'lastHeartbeatText'):
+                        entry.lastHeartbeatText = text
+                    else:
+                        entry.last_heartbeat_text = text
+                    
+                    if hasattr(entry, 'lastHeartbeatSentAt'):
+                        entry.lastHeartbeatSentAt = current_ms
+                    else:
+                        entry.last_heartbeat_sent_at = current_ms
+                    
+                    # Save updated store
+                    save_session_store_to_path(store_path, store)
+                    logger.debug("Updated session store with heartbeat metadata")
+        except Exception as e:
+            logger.debug(f"Failed to update heartbeat metadata: {e}")
+            # Non-critical failure, already sent the message
 
     async def _emit_indicator(self, is_ok: bool) -> None:
         """Emit a heartbeat indicator event."""
@@ -640,7 +737,7 @@ def resolve_heartbeat_config(
         model=base.get("model"),
         include_reasoning=base.get("includeReasoning", base.get("include_reasoning", False)),
         light_context=base.get("lightContext", base.get("light_context", False)),
-        target=base.get("target", "last"),
+        target=base.get("target", DEFAULT_HEARTBEAT_TARGET),  # Use constant for consistency
         to=base.get("to"),
         account_id=base.get("accountId") or base.get("account_id"),
         prompt=base.get("prompt", DEFAULT_HEARTBEAT_PROMPT),
@@ -661,6 +758,7 @@ __all__ = [
     "HeartbeatManager",
     "HeartbeatVisibilityConfig",
     "DEFAULT_HEARTBEAT_PROMPT",
+    "DEFAULT_HEARTBEAT_TARGET",
     "DEFAULT_ACK_MAX_CHARS",
     "resolve_heartbeat_config",
     "strip_heartbeat_ok",

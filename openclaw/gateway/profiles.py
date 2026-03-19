@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from ..config.paths import resolve_state_dir
 
 
 @dataclass
@@ -138,7 +139,7 @@ class ProfileManager:
         """
         profiles = ["default"]
         
-        profiles_dir = Path.home() / ".openclaw" / "profiles"
+        profiles_dir = resolve_state_dir() / "profiles"
         if profiles_dir.exists():
             for item in profiles_dir.iterdir():
                 if item.is_dir():
@@ -190,7 +191,7 @@ class ProfileManager:
         if name == "default":
             raise ValueError("Cannot delete default profile")
         
-        profile_dir = Path.home() / ".openclaw" / "profiles" / name
+        profile_dir = resolve_state_dir() / "profiles" / name
         if profile_dir.exists():
             import shutil
             shutil.rmtree(profile_dir)

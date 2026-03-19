@@ -15,6 +15,8 @@ Key responsibilities:
 """
 from __future__ import annotations
 
+from openclaw.config.paths import resolve_state_dir
+
 import asyncio
 import logging
 import os
@@ -831,7 +833,7 @@ def _extract_delivery_targets(
         from pathlib import Path
         import json
 
-        sessions_file = Path.home() / ".openclaw" / "agents" / "main" / "sessions" / "sessions.json"
+        sessions_file = resolve_state_dir() / "agents" / "main" / "sessions" / "sessions.json"
         if not sessions_file.exists():
             logger.warning(f"cron: session store not found at {sessions_file}")
             return targets

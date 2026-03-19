@@ -8,6 +8,8 @@ import typer
 from pathlib import Path
 from rich.console import Console
 
+from openclaw.config.paths import resolve_state_dir
+
 console = Console()
 app = typer.Typer(help="Reconfigure OpenClaw installation")
 
@@ -46,7 +48,7 @@ def configure_workspace(
         if workspace_dir:
             ws_dir = Path(workspace_dir).expanduser().resolve()
         else:
-            ws_dir = Path.home() / ".openclaw" / "workspace"
+            ws_dir = resolve_state_dir() / "workspace"
         
         console.print(f"\n[bold cyan]Configuring OpenClaw Workspace[/bold cyan]")
         console.print(f"Workspace: {shorten_home_path(ws_dir)}")
@@ -91,7 +93,7 @@ def verify_setup(
         console.print(f"Agent ID: {agent_id}\n")
         
         # Check workspace
-        workspace_dir = Path.home() / ".openclaw" / "workspace"
+        workspace_dir = resolve_state_dir() / "workspace"
         if workspace_dir.exists():
             console.print(f"[green]✓[/green] Workspace exists: {shorten_home_path(workspace_dir)}")
             

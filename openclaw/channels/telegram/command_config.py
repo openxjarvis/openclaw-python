@@ -15,6 +15,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Any, Optional
+from ...config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -164,10 +165,10 @@ def _resolve_channel_config_writes(cfg: dict, channel_id: Optional[str]) -> bool
 
 def _get_config_path() -> Path:
     """Resolve the openclaw.json config file path."""
-    p = Path.home() / ".openclaw" / "openclaw.json"
+    p = resolve_state_dir() / "openclaw.json"
     if p.exists():
         return p
-    fallback = Path.home() / ".openclaw" / "config.json"
+    fallback = resolve_state_dir() / "config.json"
     if fallback.exists():
         return fallback
     return p

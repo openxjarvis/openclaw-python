@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ def load_project_context_files(
         List of context files (ordered: global first, then root to cwd)
     """
     resolved_cwd = Path(cwd or os.getcwd())
-    resolved_agent_dir = Path(agent_dir or Path.home() / ".openclaw")
+    resolved_agent_dir = Path(agent_dir or resolve_state_dir())
     
     context_files: List[ContextFile] = []
     seen_paths: set[str] = set()

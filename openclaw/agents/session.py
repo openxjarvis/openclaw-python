@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 
 from openclaw.agents.session_ids import generate_session_id, looks_like_session_id
 from openclaw.agents.session_entry import SessionEntry, SessionStore
+from openclaw.config.paths import resolve_state_dir
 from openclaw.routing.session_key import (
     build_agent_main_session_key,
     build_agent_peer_session_key,
@@ -154,7 +155,7 @@ class Session(BaseModel):
         if session_id is None:
             session_id = str(_uuid_mod.uuid4())
         if workspace_dir is None:
-            workspace_dir = Path.home() / ".openclaw" / "workspace"
+            workspace_dir = resolve_state_dir() / "workspace"
         super().__init__(
             session_id=session_id,
             workspace_dir=workspace_dir,
@@ -517,7 +518,7 @@ class Session(BaseModel):
                     entry_type = entry.get("type")
                     if entry_type == "session":
                         # Header — restore cwd / session_key / agent_id if present
-                        if entry.get("cwd") and self.workspace_dir == Path.home() / ".openclaw" / "workspace":
+                        if entry.get("cwd") and self.workspace_dir == resolve_state_dir() / "workspace":
                             self.workspace_dir = Path(entry["cwd"])
                         if entry.get("sessionKey") and not self.session_key:
                             self.session_key = entry["sessionKey"]
@@ -585,7 +586,7 @@ class SessionManager:
             agent_id: Agent identifier (default: "main")
             base_dir: Override the openclaw home directory (useful for testing isolation)
         """
-        self.workspace_dir = Path(workspace_dir) if workspace_dir is not None else Path.home() / ".openclaw" / "workspace"
+        self.workspace_dir = Path(workspace_dir) if workspace_dir is not None else resolve_state_dir() / "workspace"
         self.agent_id = normalize_agent_id(agent_id)
         self._sessions: dict[str, Session] = {}
 
@@ -594,7 +595,7 @@ class SessionManager:
 
         # Canonical path: ~/.openclaw/agents/{agentId}/sessions/ (matches TS)
         # base_dir allows tests to use a tmp directory instead of the real ~/.openclaw
-        openclaw_home = Path(base_dir) if base_dir is not None else Path.home() / ".openclaw"
+        openclaw_home = Path(base_dir) if base_dir is not None else resolve_state_dir()
         self._sessions_dir = openclaw_home / "agents" / self.agent_id / "sessions"
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
         

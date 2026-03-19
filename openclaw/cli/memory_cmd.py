@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.table import Table
+from ..config.paths import resolve_state_dir
 
 console = Console()
 memory_app = typer.Typer(help="Memory search and indexing")
@@ -24,7 +25,7 @@ def status(
     try:
         from ..memory.manager import SimpleMemorySearchManager
         
-        workspace_dir = Path.home() / ".openclaw" / "workspace"
+        workspace_dir = resolve_state_dir() / "workspace"
         manager = SimpleMemorySearchManager(workspace_dir)
         
         mem_status = manager.status()
@@ -70,7 +71,7 @@ def index_memory(
     try:
         from ..memory.manager import SimpleMemorySearchManager
         
-        workspace_dir = Path.home() / ".openclaw" / "workspace"
+        workspace_dir = resolve_state_dir() / "workspace"
         manager = SimpleMemorySearchManager(workspace_dir)
         
         console.print("[cyan]Indexing memory files...[/cyan]")
@@ -96,7 +97,7 @@ def search(
     try:
         from ..memory.manager import SimpleMemorySearchManager
         
-        workspace_dir = Path.home() / ".openclaw" / "workspace"
+        workspace_dir = resolve_state_dir() / "workspace"
         manager = SimpleMemorySearchManager(workspace_dir)
         
         results = asyncio.run(manager.search(query, {

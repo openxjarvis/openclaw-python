@@ -12,6 +12,7 @@ import logging
 import shutil
 from pathlib import Path
 from typing import Any
+from openclaw.config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ LEGACY_PATHS = [
 ]
 
 # Current config path
-CURRENT_PATH = Path.home() / ".openclaw" / "openclaw.json"
+CURRENT_PATH = resolve_state_dir() / "openclaw.json"
 
 
 def detect_legacy_config() -> Path | None:

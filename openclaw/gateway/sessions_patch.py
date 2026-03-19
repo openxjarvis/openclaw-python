@@ -11,6 +11,8 @@ import time
 import uuid
 from typing import Any
 
+from openclaw.agents.sessions.model_overrides import ModelOverrideSelection
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,7 +114,21 @@ def _parse_session_label(raw: Any) -> dict[str, Any]:
 
 
 def _is_subagent_session_key(key: str) -> bool:
-    return key.strip().lower().startswith("subagent:")
+    """Check if session key is a subagent key (matches TS isSubagentSessionKey)"""
+    raw = key.strip()
+    if not raw:
+        return False
+    # Check for legacy format: subagent:xxx
+    if raw.lower().startswith("subagent:"):
+        return True
+    # Check for new format: agent:main:subagent:xxx
+    # Parse and check if rest starts with "subagent:"
+    from openclaw.routing.session_key import parse_agent_session_key
+    parsed = parse_agent_session_key(raw)
+    if parsed:
+        rest = (parsed.rest or "").lower()
+        return rest.startswith("subagent:")
+    return False
 
 
 def _invalid(message: str) -> dict[str, Any]:
@@ -425,11 +441,11 @@ def apply_sessions_patch_to_store(
                 )
                 apply_model_override_to_session_entry(
                     entry=next_entry,
-                    selection={
-                        "provider": ref.provider,
-                        "model": ref.model,
-                        "isDefault": is_default,
-                    },
+                    selection=ModelOverrideSelection(
+                        provider=ref.provider,
+                        model=ref.model,
+                        is_default=is_default,
+                    ),
                 )
             except Exception as exc:
                 logger.warning("Model override validation error: %s", exc)
@@ -497,5 +513,6 @@ def apply_sessions_patch_to_store(
             next_entry[field] = patch[field]
 
     store[store_key] = next_entry
-    logger.debug("Patched session: %s", store_key)
+    logger.debug("Patched session key=%s, sessionId=%s, store_size=%d",
+                 store_key, next_entry.get("sessionId"), len(store))
     return {"ok": True, "entry": next_entry}

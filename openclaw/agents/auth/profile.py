@@ -15,6 +15,7 @@ else:
     UTC = timezone.utc
 from pathlib import Path
 from typing import Any, Optional, Dict, List
+from openclaw.config.paths import resolve_state_dir
 
 
 def calculate_auth_profile_cooldown_ms(error_count: int) -> int:
@@ -151,7 +152,7 @@ class ProfileStore:
         Args:
             config_dir: Directory to store profile config
         """
-        self.config_dir = config_dir or Path.home() / ".openclaw"
+        self.config_dir = config_dir or resolve_state_dir()
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.config_file = self.config_dir / "auth_profiles.json"
 

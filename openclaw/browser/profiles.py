@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from ..config.paths import resolve_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ class ProfileManager:
             profiles_dir: Directory for browser profiles
         """
         if profiles_dir is None:
-            profiles_dir = Path.home() / ".openclaw" / "browser" / "profiles"
+            profiles_dir = resolve_state_dir() / "profiles"
         
         self.profiles_dir = profiles_dir
         self.profiles_dir.mkdir(parents=True, exist_ok=True)

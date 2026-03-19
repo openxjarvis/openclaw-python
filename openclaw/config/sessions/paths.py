@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 import logging
 
+from openclaw.config.paths import resolve_state_dir
 from openclaw.routing.session_key import DEFAULT_AGENT_ID, normalize_agent_id
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,6 @@ def resolve_agent_sessions_dir(agent_id: str | None = None) -> Path:
     Returns:
         Path to agent sessions directory
     """
-    from openclaw.config.paths import resolve_state_dir
     from pathlib import Path
     
     state_dir = Path(resolve_state_dir())

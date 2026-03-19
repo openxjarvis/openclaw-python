@@ -92,12 +92,27 @@ class ChannelGatewayAdapter(Protocol):
         cfg: dict[str, Any],
         account_id: str,
         account: dict[str, Any] | None,
+        runtime: Any,  # RuntimeEnv
         abort_signal: Any,
         get_status: Callable[[], ChannelAccountSnapshot],
         set_status: Callable[[ChannelAccountSnapshot], None],
         log: Any,
+        channel_runtime: Any | None = None,  # PluginRuntime["channel"]
     ) -> None:
-        """Start a single account. Runs until stopped or error. Mirrors TS startAccount()."""
+        """
+        Start a single account. Runs until stopped or error. Mirrors TS startAccount().
+        
+        Args:
+            cfg: Full OpenClaw config
+            account_id: Account ID  
+            account: Resolved account config
+            runtime: Runtime environment
+            abort_signal: AbortSignal for cancellation
+            get_status: Function to get current status snapshot
+            set_status: Function to update status snapshot
+            log: Channel log sink
+            channel_runtime: Optional PluginRuntime["channel"] for external plugins
+        """
         ...
 
     async def stop_account(

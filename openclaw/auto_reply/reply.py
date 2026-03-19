@@ -11,7 +11,8 @@ import asyncio
 from pathlib import Path
 from typing import Optional, Any
 
-from openclaw.config.unified import load_config, UnifiedConfig
+from openclaw.config.loader import load_config
+from openclaw.config.schema import OpenClawConfig
 from openclaw.agents.runtime import Agent
 from openclaw.agents.context import AgentContext
 from openclaw.routing.session_key import parse_session_key, build_agent_main_session_key
@@ -31,7 +32,7 @@ async def get_reply(
     session_key: str,
     user_message: str,
     options: Optional[GetReplyOptions] = None,
-    config_override: Optional[UnifiedConfig] = None
+    config_override: Optional[OpenClawConfig] = None
 ) -> Optional[ReplyPayload | list[ReplyPayload]]:
     """Get automated reply from agent.
     
@@ -246,7 +247,7 @@ async def get_reply_from_config(
     session_key: str,
     user_message: str,
     options: Optional[GetReplyOptions] = None,
-    config_override: Optional[UnifiedConfig] = None
+    config_override: Optional[OpenClawConfig] = None
 ) -> Optional[ReplyPayload | list[ReplyPayload]]:
     """Get reply from agent using configuration.
     
