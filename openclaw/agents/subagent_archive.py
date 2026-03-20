@@ -64,11 +64,12 @@ async def _archive_expired_subagents(cfg: Any, gateway: Any) -> None:
                 session_manager = gateway.session_manager
                 
                 # Delete session (which renames transcript)
+                # Note: delete_session is synchronous, not async
                 if hasattr(session_manager, "delete_session"):
-                    await session_manager.delete_session(child_session_key)
+                    session_manager.delete_session(child_session_key)
                 elif hasattr(session_manager, "delete"):
                     # Try alternate method name
-                    await session_manager.delete(child_session_key)
+                    session_manager.delete(child_session_key)
                 else:
                     logger.warning(f"session_manager has no delete method for {child_session_key}")
             
