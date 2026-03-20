@@ -337,7 +337,7 @@ class TelegramDraftStream:
                 return await self._send_or_edit_message(html_text)
 
         except Exception as exc:
-            _err = str(exc).lower()
+            _err = str(exc).lower() if exc else "unknown error"
             if "chat not found" in _err:
                 logger.warning(
                     "Telegram stream preview stopped: chat not found (chat_id=%s). "
@@ -345,7 +345,7 @@ class TelegramDraftStream:
                     self._chat_id,
                 )
             else:
-                logger.warning("Telegram stream preview error: %s", exc)
+                logger.warning("Telegram stream preview error: %s", exc, exc_info=True)
             self._stopped = True
             return False
 
