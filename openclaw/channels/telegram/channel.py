@@ -502,7 +502,7 @@ class TelegramChannel(ChannelPlugin):
 
             async def _on_silence(channel_id: str) -> None:
                 logger.info("Telegram channel silence detected — requesting heartbeat wake")
-                request_heartbeat_now(reason="wake", agent_id=None, session_key=None)
+                await request_heartbeat_now(reason="wake", agent_id=None, session_key=None)
 
             self._heartbeat_monitor = HeartbeatMonitor(
                 channel_id=self.id,
@@ -3215,6 +3215,51 @@ class TelegramChannel(ChannelPlugin):
         elif chat.type == "channel":
             chat_type = "channel"
 
+        # ✅ Resolve stream mode configuration for draft vs block decision
+        # Mirrors TS bot-message-dispatch.ts L171-313
+        from openclaw.channels.telegram.stream_mode import resolve_stream_mode_config
+        from openclaw.channels.telegram.reasoning_coordinator import ReasoningCoordinator
+        
+        # Resolve session key for config lookup
+        session_key = f"telegram:{chat.id}"
+        
+        # Resolve stream mode configuration
+        stream_mode_cfg = resolve_stream_mode_config(
+            cfg=self._cfg,
+            telegram_cfg=self._config or {},
+            session_key=session_key,
+            agent_id="main",  # Telegram typically routes to main agent
+            is_dm=is_dm,
+        )
+        
+        # Log stream mode decision for testing/debugging
+        logger.info(
+            f"[TEST] Stream mode resolved: reasoning={stream_mode_cfg['reasoning_level']}, "
+            f"can_draft_answer={stream_mode_cfg['can_stream_answer_draft']}, "
+            f"disable_block={stream_mode_cfg['disable_block_streaming']}"
+        )
+        
+        # Create archived preview collectors
+        archived_answer_previews: list[dict] = []
+        archived_reasoning_preview_ids: list[int] = []
+        
+        # Create reasoning coordinator
+        reasoning_coordinator = ReasoningCoordinator()
+        
+        # Define superseded preview callbacks
+        def on_superseded_answer_preview(preview: dict) -> None:
+            archived_answer_previews.append({
+                "message_id": preview["message_id"],
+                "text_snapshot": preview["text_snapshot"],
+            })
+            logger.debug(f"Archived answer preview: msg_id={preview['message_id']}")
+        
+        def on_superseded_reasoning_preview(preview: dict) -> None:
+            msg_id = preview["message_id"]
+            if msg_id not in archived_reasoning_preview_ids:
+                archived_reasoning_preview_ids.append(msg_id)
+                logger.debug(f"Archived reasoning preview: msg_id={msg_id}")
+
         inbound = InboundMessage(
             channel_id=self.id,
             message_id=str(message.message_id),
@@ -3232,6 +3277,24 @@ class TelegramChannel(ChannelPlugin):
                 "chat_username": chat.username,
                 **({"message_thread_id": message.message_thread_id}
                    if getattr(message, "message_thread_id", None) else {}),
+                
+                # ✅ NEW: Stream mode configuration (draft vs block decision)
+                # Passed to agent_runner_execution for block streaming control
+                "_stream_mode_config": stream_mode_cfg,
+                "_disable_block_streaming": stream_mode_cfg["disable_block_streaming"],
+                "_reasoning_level": stream_mode_cfg["reasoning_level"],
+                "_can_stream_answer_draft": stream_mode_cfg["can_stream_answer_draft"],
+                "_can_stream_reasoning_draft": stream_mode_cfg["can_stream_reasoning_draft"],
+                "_is_dm": is_dm,
+                
+                # ✅ NEW: Draft stream callbacks for superseded preview handling
+                "_on_superseded_answer_preview": on_superseded_answer_preview,
+                "_on_superseded_reasoning_preview": on_superseded_reasoning_preview,
+                "_archived_answer_previews": archived_answer_previews,
+                "_archived_reasoning_preview_ids": archived_reasoning_preview_ids,
+                
+                # ✅ NEW: Reasoning coordinator for block separation
+                "_reasoning_coordinator": reasoning_coordinator,
             },
         )
 

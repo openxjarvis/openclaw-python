@@ -15,39 +15,43 @@ from pathlib import Path
 
 def slugify_session_key(session_key: str) -> str:
     """
-    Convert session key to safe directory name
-    Based on TypeScript: slugifySessionKey()
-    
-    Creates a safe directory name with hash for uniqueness:
-    - Lowercase
-    - Replace non-alphanumeric with dash
-    - Append 8-char hash for collision prevention
-    
-    Args:
-        session_key: Session identifier (e.g., "telegram-8366053063")
-    
-    Returns:
-        Safe directory name (e.g., "telegram-8366053063-a1b2c3d4")
-    
-    Examples:
-        >>> slugify_session_key("telegram-8366053063")
-        'telegram-8366053063-a1b2c3d4'
-        
-        >>> slugify_session_key("Discord#User#1234")
-        'discord-user-1234-5e6f7g8h'
+    Convert session key to safe directory name.
+    Mirrors TS slugifySessionKey() from sandbox/shared.ts.
+
+    Uses SHA-256 (matches TS hashTextSha256), first 8 hex chars.
     """
     trimmed = session_key.strip() or "session"
-    
-    # Create SHA1 hash and take first 8 chars
-    hash_obj = hashlib.sha1(trimmed.encode("utf-8"))
-    hash_short = hash_obj.hexdigest()[:8]
-    
+
+    # SHA-256 hash — matches TS hashTextSha256 (openclaw/src/infra/hash.ts)
+    hash_short = hashlib.sha256(trimmed.encode("utf-8")).hexdigest()[:8]
+
     # Sanitize: lowercase, replace non-alphanumeric with dash
     safe = re.sub(r"[^a-z0-9._-]+", "-", trimmed.lower())
     safe = re.sub(r"^-+|-+$", "", safe)  # Remove leading/trailing dashes
-    
+
     base = safe[:32] or "session"
     return f"{base}-{hash_short}"
+
+
+def resolve_sandbox_scope_key(scope: str, session_key: str) -> str:
+    """
+    Compute the sandbox scope key used to name the sandbox subdirectory.
+    Mirrors TS resolveSandboxScopeKey() from sandbox/shared.ts.
+
+    - scope="shared"  → "shared"  (one dir for all sessions)
+    - scope="session" → session_key (one dir per session)
+    - scope="agent"   → "agent:{agent_id}" derived from session_key
+    """
+    trimmed = session_key.strip() or "main"
+    if scope == "shared":
+        return "shared"
+    if scope == "session":
+        return trimmed
+    # scope == "agent" — derive agent id from session key
+    # agent id is the part before the last "--" separator, or fall back to "main"
+    parts = trimmed.rsplit("--", 1)
+    agent_id = parts[0] if len(parts) > 1 else "main"
+    return f"agent:{agent_id}"
 
 
 def resolve_session_workspace_dir(workspace_root: Path | str, session_key: str) -> Path:

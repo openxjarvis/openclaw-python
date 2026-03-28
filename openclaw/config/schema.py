@@ -48,12 +48,12 @@ class AuthConfig(BaseModel):
     token: str | None = Field(default=None)
     password: str | None = Field(default=None)
     allow_tailscale: bool | None = Field(default=None, alias="allowTailscale")
-    trusted_proxy: dict[str, Any] | None = Field(default=None, alias="trustedProxy")
+    trusted_proxy: "GatewayTrustedProxyConfig | dict[str, Any] | None" = Field(default=None, alias="trustedProxy")
 
 
 class GatewayNodesConfig(BaseModel):
     """Gateway nodes configuration"""
-    browser: dict[str, Any] | None = Field(default=None)
+    browser: "BrowserConfig | dict[str, Any] | None" = Field(default=None)
     allow_commands: list[str] | None = Field(default=None, alias="allowCommands")
     deny_commands: list[str] | None = Field(default=None, alias="denyCommands")
 
@@ -635,8 +635,8 @@ class AgentDefaults(BaseModel):
     # Block streaming configuration - mirrors TS agents.defaults
     blockStreamingDefault: Literal["on", "off"] | None = Field(default=None)
     blockStreamingBreak: Literal["text_end", "message_end"] | None = Field(default=None)
-    blockStreamingChunk: dict[str, Any] | None = Field(default=None)
-    blockStreamingCoalesce: dict[str, Any] | None = Field(default=None)
+    blockStreamingChunk: "BlockStreamingChunkConfig | dict[str, Any] | None" = Field(default=None)
+    blockStreamingCoalesce: "BlockStreamingCoalesceConfig | dict[str, Any] | None" = Field(default=None)
     # Fields added in P2 alignment - mirrors TS AgentDefaultsSchema
     imageModel: str | ModelConfig | None = Field(default=None)
     pdfModel: str | ModelConfig | None = Field(default=None)
@@ -657,7 +657,7 @@ class AgentDefaults(BaseModel):
     thinkingDefault: Literal["off", "minimal", "low", "medium", "high", "xhigh", "adaptive"] | None = Field(default=None)
     verboseDefault: Literal["off", "on", "full"] | None = Field(default=None)
     elevatedDefault: Literal["off", "on", "ask", "full"] | None = Field(default=None)
-    humanDelay: dict[str, Any] | None = Field(default=None)
+    humanDelay: "HumanDelayConfig | dict[str, Any] | None" = Field(default=None)
     timeoutSeconds: int | None = Field(default=None)
     mediaMaxMb: float | None = Field(default=None)
     imageMaxDimensionPx: int | None = Field(default=None)
@@ -694,7 +694,7 @@ class SandboxDockerConfig(BaseModel):
     memory: str | int | None = Field(default=None)
     memory_swap: str | int | None = Field(default=None, alias="memorySwap")
     cpus: float | None = Field(default=None)
-    ulimits: dict[str, Any] | None = Field(default=None)
+    ulimits: "dict[str, DockerUlimitConfig] | dict[str, Any] | None" = Field(default=None)
     seccomp_profile: str | None = Field(default=None, alias="seccompProfile")
     apparmor_profile: str | None = Field(default=None, alias="apparmorProfile")
     dns: list[str] | None = Field(default=None)
@@ -729,16 +729,38 @@ class SandboxConfig(BaseModel):
 
     Mirrors TS agents.defaults.sandbox / agents.list[].sandbox schema.
     See: openclaw/docs/gateway/sandboxing.md
+    
+    Default: mode="all" to ensure workspace isolation and match TS behavior.
+    Requires Docker. If Docker is unavailable, Gateway will warn and auto-disable.
+    Users can explicitly set mode="off" in openclaw.json to disable sandbox.
     """
 
     # When to sandbox: "off" | "non-main" | "all"
-    mode: str = Field(default="off")
+    mode: str = Field(
+        default="all",
+        description="Sandbox mode: 'all' (recommended, requires Docker), 'non-main', or 'off'"
+    )
 
     # Container scope: "session" | "agent" | "shared"
-    scope: str = Field(default="session")
+    scope: str = Field(
+        default="session",
+        description="Container scope: 'session' (isolated per-session, recommended), 'agent', or 'shared'"
+    )
 
     # Workspace access inside sandbox: "none" | "ro" | "rw"
-    workspaceAccess: str = Field(default="none")
+    # TS default is "none" — matches resolveSandboxConfigForAgent in sandbox/config.ts
+    workspaceAccess: str = Field(
+        default="none",
+        description="Workspace access inside container: 'none' (default), 'ro', or 'rw'"
+    )
+
+    # Sandbox workspace root — where per-session/agent sandbox subdirs are created.
+    # TS: DEFAULT_SANDBOX_WORKSPACE_ROOT = path.join(STATE_DIR, "sandboxes")
+    # Keeping this None means "use ~/.openclaw/sandboxes/" (resolved at runtime).
+    workspaceRoot: Optional[str] = Field(
+        default=None,
+        description="Sandbox workspace root. Defaults to ~/.openclaw/sandboxes/"
+    )
 
     # Docker-level settings (bind mounts etc.)
     docker: SandboxDockerConfig = Field(default_factory=SandboxDockerConfig)
@@ -801,7 +823,7 @@ class AgentEntry(BaseModel):
     # Fields added in P2 alignment - mirrors TS AgentEntrySchema
     skills: list[str] | None = Field(default=None)
     memorySearch: "MemorySearchConfig | None" = Field(default=None)
-    humanDelay: dict[str, Any] | None = Field(default=None)
+    humanDelay: "HumanDelayConfig | dict[str, Any] | None" = Field(default=None)
     heartbeat: HeartbeatConfig | None = Field(default=None)
 
     model_config = ConfigDict(populate_by_name=True)
@@ -942,7 +964,7 @@ class TelegramChannelConfig(BaseModel):
     textChunkLimit: int | None = Field(default=None, alias="text_chunk_limit")
     chunkMode: str | None = Field(default=None, alias="chunk_mode")
     blockStreaming: bool | None = Field(default=None, alias="block_streaming")
-    blockStreamingCoalesce: dict[str, Any] | None = Field(default=None, alias="block_streaming_coalesce")
+    blockStreamingCoalesce: "BlockStreamingCoalesceConfig | dict[str, Any] | None" = Field(default=None, alias="block_streaming_coalesce")
     
     # Reactions
     reactionNotifications: str | None = Field(default=None, alias="reaction_notifications")
@@ -1016,15 +1038,6 @@ class FeishuChannelConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
-class BlockStreamingCoalesceConfig(BaseModel):
-    """Block streaming coalescing configuration - mirrors TS BlockStreamingCoalesceConfig"""
-    min_chars: int | None = Field(default=None, alias="minChars")
-    max_chars: int | None = Field(default=None, alias="maxChars")
-    idle_ms: int | None = Field(default=None, alias="idleMs")
-    
-    model_config = ConfigDict(populate_by_name=True)
-
-
 class SlackAccountConfig(BaseModel):
     """Slack account configuration - mirrors TS SlackAccountConfig"""
     
@@ -1045,7 +1058,7 @@ class SlackAccountConfig(BaseModel):
     
     # Streaming (P1-5: block_streaming support)
     block_streaming: bool | None = Field(default=None, alias="blockStreaming")
-    block_streaming_coalesce: BlockStreamingCoalesceConfig | None = Field(
+    block_streaming_coalesce: "BlockStreamingCoalesceConfig | None" = Field(
         default=None, 
         alias="blockStreamingCoalesce"
     )
@@ -1084,7 +1097,7 @@ class SlackConfig(BaseModel):
     
     # Block streaming defaults
     block_streaming: bool | None = Field(default=None, alias="blockStreaming")
-    block_streaming_coalesce: BlockStreamingCoalesceConfig | None = Field(
+    block_streaming_coalesce: "BlockStreamingCoalesceConfig | None" = Field(
         default=None,
         alias="blockStreamingCoalesce"
     )
@@ -1623,13 +1636,38 @@ class SessionMaintenanceConfig(BaseModel):
     """Session maintenance configuration — mirrors TS session.maintenance schema."""
     model_config = ConfigDict(populate_by_name=True)
 
-    pruneAfter: str | None = Field(default=None)
-    pruneDays: int | None = Field(default=None)
-    maxEntries: int | None = Field(default=None)
-    rotateBytes: str | None = Field(default=None)
-    maxDiskBytes: str | None = Field(default=None)
-    highWaterBytes: str | None = Field(default=None)
-    resetArchiveRetention: str | None = Field(default=None)
+    mode: Literal["warn", "enforce"] | None = Field(
+        default=None,
+        description="Whether to enforce maintenance or warn only. Default: 'warn'"
+    )
+    pruneAfter: str | int | None = Field(
+        default=None,
+        description="Remove session entries older than this duration (e.g. '30d', '12h'). Default: '30d'"
+    )
+    pruneDays: int | None = Field(
+        default=None,
+        description="Deprecated. Use pruneAfter instead."
+    )
+    maxEntries: int | None = Field(
+        default=None,
+        description="Maximum number of session entries to keep. Default: 500"
+    )
+    rotateBytes: str | int | None = Field(
+        default=None,
+        description="Rotate sessions.json when it exceeds this size (e.g. '10mb'). Default: 10mb"
+    )
+    maxDiskBytes: str | int | None = Field(
+        default=None,
+        description="Optional per-agent sessions-directory disk budget (e.g. '500mb')"
+    )
+    highWaterBytes: str | int | None = Field(
+        default=None,
+        description="Target size after disk-budget cleanup (high-water mark). Default: 80% of maxDiskBytes"
+    )
+    resetArchiveRetention: str | int | Literal[False] | None = Field(
+        default=None,
+        description="Retention for archived reset transcripts. Set false to disable. Default: same as pruneAfter"
+    )
 
 
 class SessionConfig(BaseModel):
@@ -1717,6 +1755,297 @@ class CliConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+# ─── Browser config ──────────────────────────────────────────────────────────
+
+class BrowserProfileConfig(BaseModel):
+    """Browser profile configuration - mirrors TS BrowserProfileConfig"""
+    cdp_port: int | None = Field(default=None, alias="cdpPort")
+    cdp_url: str | None = Field(default=None, alias="cdpUrl")
+    driver: Literal["openclaw", "extension"] | None = Field(default=None)
+    attach_only: bool | None = Field(default=None, alias="attachOnly")
+    color: str | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class BrowserSnapshotDefaults(BaseModel):
+    mode: Literal["efficient"] | None = Field(default=None)
+
+
+class BrowserSsrfPolicyConfig(BaseModel):
+    allow_private_network: bool | None = Field(default=None, alias="allowPrivateNetwork")
+    dangerously_allow_private_network: bool | None = Field(default=None, alias="dangerouslyAllowPrivateNetwork")
+    allowed_hostnames: list[str] | None = Field(default=None, alias="allowedHostnames")
+    hostname_allowlist: list[str] | None = Field(default=None, alias="hostnameAllowlist")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class BrowserConfig(BaseModel):
+    """Top-level browser configuration - mirrors TS BrowserConfig"""
+    enabled: bool | None = Field(default=None)
+    evaluate_enabled: bool | None = Field(default=None, alias="evaluateEnabled")
+    cdp_url: str | None = Field(default=None, alias="cdpUrl")
+    remote_cdp_timeout_ms: int | None = Field(default=None, alias="remoteCdpTimeoutMs")
+    remote_cdp_handshake_timeout_ms: int | None = Field(default=None, alias="remoteCdpHandshakeTimeoutMs")
+    color: str | None = Field(default=None)
+    executable_path: str | None = Field(default=None, alias="executablePath")
+    headless: bool | None = Field(default=None)
+    no_sandbox: bool | None = Field(default=None, alias="noSandbox")
+    attach_only: bool | None = Field(default=None, alias="attachOnly")
+    cdp_port_range_start: int | None = Field(default=None, alias="cdpPortRangeStart")
+    default_profile: str | None = Field(default=None, alias="defaultProfile")
+    profiles: dict[str, BrowserProfileConfig] | None = Field(default=None)
+    snapshot_defaults: BrowserSnapshotDefaults | None = Field(default=None, alias="snapshotDefaults")
+    ssrf_policy: BrowserSsrfPolicyConfig | None = Field(default=None, alias="ssrfPolicy")
+    extra_args: list[str] | None = Field(default=None, alias="extraArgs")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ─── Auth config ─────────────────────────────────────────────────────────────
+
+class AuthProfileConfig(BaseModel):
+    """Auth profile entry - mirrors TS AuthProfileConfig"""
+    provider: str = ""
+    mode: Literal["api_key", "oauth", "token"] | None = Field(default=None)
+    email: str | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AuthCooldownsConfig(BaseModel):
+    """Auth cooldowns - mirrors TS auth.cooldowns"""
+    billing_backoff_hours: float | None = Field(default=None, alias="billingBackoffHours")
+    billing_backoff_hours_by_provider: dict[str, float] | None = Field(default=None, alias="billingBackoffHoursByProvider")
+    billing_max_hours: float | None = Field(default=None, alias="billingMaxHours")
+    failure_window_hours: float | None = Field(default=None, alias="failureWindowHours")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TopLevelAuthConfig(BaseModel):
+    """Top-level auth configuration - mirrors TS AuthConfig"""
+    profiles: dict[str, AuthProfileConfig] | None = Field(default=None)
+    order: dict[str, list[str]] | None = Field(default=None)
+    cooldowns: AuthCooldownsConfig | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ─── Diagnostics config ─────────────────────────────────────────────────────
+
+class DiagnosticsOtelConfig(BaseModel):
+    """OpenTelemetry diagnostics - mirrors TS DiagnosticsOtelConfig"""
+    enabled: bool | None = Field(default=None)
+    endpoint: str | None = Field(default=None)
+    protocol: Literal["http/protobuf", "grpc"] | None = Field(default=None)
+    headers: dict[str, str] | None = Field(default=None)
+    service_name: str | None = Field(default=None, alias="serviceName")
+    traces: bool | None = Field(default=None)
+    metrics: bool | None = Field(default=None)
+    logs: bool | None = Field(default=None)
+    sample_rate: float | None = Field(default=None, alias="sampleRate")
+    flush_interval_ms: int | None = Field(default=None, alias="flushIntervalMs")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class DiagnosticsCacheTraceConfig(BaseModel):
+    """Cache trace diagnostics - mirrors TS DiagnosticsCacheTraceConfig"""
+    enabled: bool | None = Field(default=None)
+    file_path: str | None = Field(default=None, alias="filePath")
+    include_messages: bool | None = Field(default=None, alias="includeMessages")
+    include_prompt: bool | None = Field(default=None, alias="includePrompt")
+    include_system: bool | None = Field(default=None, alias="includeSystem")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class DiagnosticsConfig(BaseModel):
+    """Diagnostics configuration - mirrors TS DiagnosticsConfig"""
+    enabled: bool | None = Field(default=None)
+    flags: list[str] | None = Field(default=None)
+    stuck_session_warn_ms: int | None = Field(default=None, alias="stuckSessionWarnMs")
+    otel: DiagnosticsOtelConfig | None = Field(default=None)
+    cache_trace: DiagnosticsCacheTraceConfig | None = Field(default=None, alias="cacheTrace")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ─── HumanDelay config ───────────────────────────────────────────────────────
+
+class HumanDelayConfig(BaseModel):
+    """Human delay configuration - mirrors TS HumanDelayConfig"""
+    mode: Literal["off", "natural", "custom"] | None = Field(default=None)
+    min_ms: int | None = Field(default=None, alias="minMs")
+    max_ms: int | None = Field(default=None, alias="maxMs")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ─── Block streaming config ──────────────────────────────────────────────────
+
+class BlockStreamingChunkConfig(BaseModel):
+    """Block streaming chunk config - mirrors TS BlockStreamingChunkConfig"""
+    min_chars: int | None = Field(default=None, alias="minChars")
+    max_chars: int | None = Field(default=None, alias="maxChars")
+    break_preference: Literal["paragraph", "newline", "sentence"] | None = Field(default=None, alias="breakPreference")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class BlockStreamingCoalesceConfig(BaseModel):
+    """Block streaming coalesce config - mirrors TS BlockStreamingCoalesceConfig"""
+    min_chars: int | None = Field(default=None, alias="minChars")
+    max_chars: int | None = Field(default=None, alias="maxChars")
+    idle_ms: int | None = Field(default=None, alias="idleMs")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ─── Gateway trusted proxy config ────────────────────────────────────────────
+
+class GatewayTrustedProxyConfig(BaseModel):
+    """Gateway trusted proxy config - mirrors TS GatewayTrustedProxyConfig"""
+    user_header: str = Field(alias="userHeader")
+    required_headers: list[str] | None = Field(default=None, alias="requiredHeaders")
+    allow_users: list[str] | None = Field(default=None, alias="allowUsers")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ─── Docker ulimits ──────────────────────────────────────────────────────────
+
+class DockerUlimitConfig(BaseModel):
+    """Single ulimit entry for Docker - mirrors TS ulimits structure"""
+    soft: int | None = Field(default=None)
+    hard: int | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ─── Top-level typed config models (replacing dict[str, Any]) ─────────────────
+
+class SecretsDefaultsConfig(BaseModel):
+    """Default resolution strategies for secret refs."""
+    env: str | None = Field(default=None)
+    file: str | None = Field(default=None)
+    exec: str | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+class SecretResolutionConfig(BaseModel):
+    max_provider_concurrency: int | None = Field(default=None, alias="maxProviderConcurrency")
+    max_refs_per_provider: int | None = Field(default=None, alias="maxRefsPerProvider")
+    max_batch_bytes: int | None = Field(default=None, alias="maxBatchBytes")
+    model_config = ConfigDict(populate_by_name=True)
+
+class SecretsConfig(BaseModel):
+    """Secrets config -- mirrors TS SecretsConfig."""
+    providers: dict[str, Any] | None = Field(default=None)
+    defaults: SecretsDefaultsConfig | None = Field(default=None)
+    resolution: SecretResolutionConfig | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class TalkProviderConfig(BaseModel):
+    """Per-provider TTS/talk config -- mirrors TS TalkProviderConfig."""
+    voice_id: str | None = Field(default=None, alias="voiceId")
+    voice_aliases: dict[str, str] | None = Field(default=None, alias="voiceAliases")
+    model_id: str | None = Field(default=None, alias="modelId")
+    output_format: str | None = Field(default=None, alias="outputFormat")
+    api_key: str | dict[str, Any] | None = Field(default=None, alias="apiKey")
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+class TalkConfig(BaseModel):
+    """Talk/TTS config -- mirrors TS TalkConfig."""
+    provider: str | None = Field(default=None)
+    providers: dict[str, TalkProviderConfig] | None = Field(default=None)
+    interrupt_on_speech: bool = Field(default=True, alias="interruptOnSpeech")
+    voice_id: str | None = Field(default=None, alias="voiceId")
+    voice_aliases: dict[str, str] | None = Field(default=None, alias="voiceAliases")
+    model_id: str | None = Field(default=None, alias="modelId")
+    output_format: str | None = Field(default=None, alias="outputFormat")
+    api_key: str | dict[str, Any] | None = Field(default=None, alias="apiKey")
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class ExecApprovalForwardTarget(BaseModel):
+    channel: str
+    to: str
+    account_id: str | None = Field(default=None, alias="accountId")
+    thread_id: str | int | None = Field(default=None, alias="threadId")
+    model_config = ConfigDict(populate_by_name=True)
+
+class ExecApprovalForwardingConfig(BaseModel):
+    enabled: bool = Field(default=False)
+    mode: Literal["session", "targets", "both"] = Field(default="session")
+    agent_filter: list[str] | None = Field(default=None, alias="agentFilter")
+    session_filter: list[str] | None = Field(default=None, alias="sessionFilter")
+    targets: list[ExecApprovalForwardTarget] | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True)
+
+class ApprovalsConfig(BaseModel):
+    """Approvals config -- mirrors TS ApprovalsConfig."""
+    exec: ExecApprovalForwardingConfig | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class WideAreaDiscoveryConfig(BaseModel):
+    enabled: bool | None = Field(default=None)
+    domain: str | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True)
+
+class MdnsDiscoveryConfig(BaseModel):
+    mode: Literal["off", "minimal", "full"] | None = Field(default="minimal")
+    model_config = ConfigDict(populate_by_name=True)
+
+class DiscoveryConfig(BaseModel):
+    """Discovery config -- mirrors TS DiscoveryConfig."""
+    wide_area: WideAreaDiscoveryConfig | None = Field(default=None, alias="wideArea")
+    mdns: MdnsDiscoveryConfig | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class BroadcastConfig(BaseModel):
+    """Broadcast config -- mirrors TS BroadcastConfig."""
+    strategy: Literal["parallel", "sequential"] | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class AudioTranscriptionConfig(BaseModel):
+    command: list[str] = Field(default_factory=list)
+    timeout_seconds: int | None = Field(default=None, alias="timeoutSeconds")
+    model_config = ConfigDict(populate_by_name=True)
+
+class AudioConfig(BaseModel):
+    """Audio config -- mirrors TS AudioConfig (deprecated)."""
+    transcription: AudioTranscriptionConfig | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class NodeHostBrowserProxyConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    allow_profiles: list[str] | None = Field(default=None, alias="allowProfiles")
+    model_config = ConfigDict(populate_by_name=True)
+
+class NodeHostConfig(BaseModel):
+    """Node host config -- mirrors TS NodeHostConfig."""
+    browser_proxy: NodeHostBrowserProxyConfig | None = Field(default=None, alias="browserProxy")
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class CanvasHostConfig(BaseModel):
+    """Canvas host config -- mirrors TS CanvasHostConfig."""
+    enabled: bool | None = Field(default=None)
+    root: str | None = Field(default=None)
+    port: int = Field(default=18793)
+    live_reload: bool = Field(default=True, alias="liveReload")
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class WebReconnectConfig(BaseModel):
+    initial_ms: int | None = Field(default=None, alias="initialMs")
+    max_ms: int | None = Field(default=None, alias="maxMs")
+    factor: float | None = Field(default=None)
+    jitter: float | None = Field(default=None)
+    max_attempts: int | None = Field(default=None, alias="maxAttempts")
+    model_config = ConfigDict(populate_by_name=True)
+
+class WebConfig(BaseModel):
+    """Web config -- mirrors TS WebConfig."""
+    enabled: bool = Field(default=True)
+    heartbeat_seconds: int | None = Field(default=None, alias="heartbeatSeconds")
+    reconnect: WebReconnectConfig | None = Field(default=None)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
 class OpenClawConfig(BaseModel):
     """Root configuration schema - mirrors TypeScript OpenClawConfig"""
     
@@ -1734,37 +2063,37 @@ class OpenClawConfig(BaseModel):
     skills: SkillsConfig | None = Field(default_factory=SkillsConfig)
     plugins: PluginsConfig | None = Field(default_factory=PluginsConfig)
     
-    # Additional configs (matching TypeScript)
+    # Additional configs (matching TypeScript with typed models)
     meta: MetaConfig | None = Field(default=None)
-    auth: dict[str, Any] | None = Field(default=None)
+    auth: TopLevelAuthConfig | dict[str, Any] | None = Field(default=None)
     env: EnvConfig | dict[str, Any] | None = Field(default=None)
     wizard: WizardConfig | None = Field(default=None)
-    diagnostics: dict[str, Any] | None = Field(default=None)
+    diagnostics: DiagnosticsConfig | dict[str, Any] | None = Field(default=None)
     logging: LoggingConfig | None = Field(default=None)
     update: UpdateConfig | None = Field(default=None)
-    browser: dict[str, Any] | None = Field(default=None)
+    browser: BrowserConfig | dict[str, Any] | None = Field(default=None)
     ui: UIConfig | None = Field(default=None)
     models: ModelsConfig | None = Field(default=None)
-    node_host: dict[str, Any] | None = Field(default=None, alias="nodeHost")
+    node_host: NodeHostConfig | None = Field(default=None, alias="nodeHost")
     bindings: list[dict[str, Any]] | None = Field(default=None)
-    broadcast: dict[str, Any] | None = Field(default=None)
-    audio: dict[str, Any] | None = Field(default=None)
+    broadcast: BroadcastConfig | None = Field(default=None)
+    audio: AudioConfig | None = Field(default=None)
     messages: MessagesConfig | None = Field(default=None)
     commands: CommandsConfig | None = Field(default=None)
-    approvals: dict[str, Any] | None = Field(default=None)
+    approvals: ApprovalsConfig | None = Field(default=None)
     session: SessionConfig = Field(default_factory=SessionConfig)
-    web: dict[str, Any] | None = Field(default=None)
+    web: WebConfig | None = Field(default=None)
     cron: CronConfig | None = Field(default=None)
     hooks: HooksConfig | None = Field(default=None)
-    discovery: dict[str, Any] | None = Field(default=None)
-    canvas_host: dict[str, Any] | None = Field(default=None, alias="canvasHost")
-    talk: dict[str, Any] | None = Field(default=None)
+    discovery: DiscoveryConfig | None = Field(default=None)
+    canvas_host: CanvasHostConfig | None = Field(default=None, alias="canvasHost")
+    talk: TalkConfig | None = Field(default=None)
     memory: MemoryConfig | None = Field(default=None)
     # P2 alignment: new top-level config sections from TS
     acp: AcpConfig | None = Field(default=None)
     media: MediaTopLevelConfig | None = Field(default=None)
     cli: CliConfig | None = Field(default=None)
-    secrets: dict[str, Any] | None = Field(default=None)
+    secrets: SecretsConfig | None = Field(default=None)
     # $schema field for JSON schema editor tooling
     schema_ref: str | None = Field(default=None, alias="$schema")
 
@@ -1776,6 +2105,10 @@ class OpenClawConfig(BaseModel):
 # Rebuild models to resolve forward references
 # This is necessary because some classes reference other classes defined later in the file
 AgentConfig.model_rebuild()
+AuthConfig.model_rebuild()
+GatewayNodesConfig.model_rebuild()
 AgentDefaults.model_rebuild()
 AgentsConfig.model_rebuild()
+SandboxDockerConfig.model_rebuild()
+SlackAccountConfig.model_rebuild()
 OpenClawConfig.model_rebuild()

@@ -1,96 +1,160 @@
 """
-Tool policy for subagents and sandbox
+Tool policy for subagents and sandbox — fully aligned with TypeScript.
 
-Matches TypeScript src/agents/pi-tools.policy.ts
-
-Determines which tools are allowed/denied based on:
-- Subagent depth (orchestrator vs leaf)
-- Sandbox restrictions
-- User configuration
+Matches:
+- src/agents/pi-tools.policy.ts (resolveSubagentToolPolicy, makeToolPolicyMatcher, filterToolsByPolicy)
+- src/agents/tool-policy-shared.ts (expandToolGroups, normalizeToolName, TOOL_GROUPS)
+- src/agents/glob-pattern.ts (compileGlobPattern, matchesAnyGlobPattern)
 """
 from __future__ import annotations
 
-from typing import Literal, Optional
+import re
+from dataclasses import dataclass
+from typing import Literal, Optional, Union
 
-# Default max spawn depth (matches TS DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH)
 DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH = 1
 
-# Tools always denied for subagents (matches TS SUBAGENT_TOOL_DENY_ALWAYS)
-# Lines 46-60 in pi-tools.policy.ts
 SUBAGENT_TOOL_DENY_ALWAYS = [
-    # System admin - dangerous from subagent
     "gateway",
     "agents_list",
-    # Interactive setup - not a task
     "whatsapp_login",
-    # Status/scheduling - main agent coordinates
     "session_status",
     "cron",
-    # Memory - pass relevant info in spawn prompt instead
     "memory_search",
     "memory_get",
-    # Direct session sends - subagents communicate through announce chain
     "sessions_send",
 ]
 
-# Additional tools denied for leaf subagents (matches TS SUBAGENT_TOOL_DENY_LEAF)
-# Lines 66 in pi-tools.policy.ts
 SUBAGENT_TOOL_DENY_LEAF = [
     "sessions_list",
     "sessions_history",
     "sessions_spawn",
 ]
 
+TOOL_NAME_ALIASES: dict[str, str] = {
+    "bash": "exec",
+    "apply-patch": "apply_patch",
+}
+
+TOOL_GROUPS: dict[str, list[str]] = {
+    "group:fs": ["read", "write", "edit", "ls", "find", "grep"],
+    "group:runtime": ["exec", "process", "apply_patch"],
+    "group:web": ["web_search", "web_fetch"],
+    "group:memory": ["memory_search", "memory_get"],
+    "group:openclaw": [
+        "browser", "message", "subagents", "session_status",
+        "sessions_list", "sessions_history", "sessions_send", "sessions_spawn",
+        "tts", "voice_call", "cron", "canvas", "gateway", "agents_list",
+        "whatsapp_login", "image", "nodes",
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Normalize helpers (matches tool-policy-shared.ts)
+# ---------------------------------------------------------------------------
 
 def normalize_tool_name(name: str) -> str:
-    """
-    Normalize tool name for matching.
-    
-    Args:
-        name: Tool name
-    
-    Returns:
-        Normalized tool name (lowercase, trimmed)
-    """
-    return name.strip().lower()
+    normalized = name.strip().lower()
+    return TOOL_NAME_ALIASES.get(normalized, normalized)
 
+
+def normalize_tool_list(lst: list[str] | None) -> list[str]:
+    if not lst:
+        return []
+    return [n for n in (normalize_tool_name(t) for t in lst) if n]
+
+
+def expand_tool_groups(lst: list[str] | None) -> list[str]:
+    """Expand group:xxx references into individual tool names (TS expandToolGroups)."""
+    normalized = normalize_tool_list(lst)
+    expanded: list[str] = []
+    for value in normalized:
+        group = TOOL_GROUPS.get(value)
+        if group:
+            expanded.extend(group)
+        else:
+            expanded.append(value)
+    return list(dict.fromkeys(expanded))
+
+
+# ---------------------------------------------------------------------------
+# Glob pattern matching (matches glob-pattern.ts)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _GlobAll:
+    kind: Literal["all"] = "all"
+
+@dataclass
+class _GlobExact:
+    value: str
+    kind: Literal["exact"] = "exact"
+
+@dataclass
+class _GlobRegex:
+    value: re.Pattern[str]
+    kind: Literal["regex"] = "regex"
+
+
+CompiledGlobPattern = Union[_GlobAll, _GlobExact, _GlobRegex]
+
+
+def _escape_regex(value: str) -> str:
+    return re.escape(value)
+
+
+def compile_glob_pattern(raw: str) -> CompiledGlobPattern:
+    normalized = normalize_tool_name(raw)
+    if not normalized:
+        return _GlobExact(value="")
+    if normalized == "*":
+        return _GlobAll()
+    if "*" not in normalized:
+        return _GlobExact(value=normalized)
+    regex_str = "^" + _escape_regex(normalized).replace(r"\*", ".*") + "$"
+    return _GlobRegex(value=re.compile(regex_str))
+
+
+def compile_glob_patterns(raw: list[str] | None) -> list[CompiledGlobPattern]:
+    if not raw:
+        return []
+    patterns = [compile_glob_pattern(r) for r in raw]
+    return [p for p in patterns if not (isinstance(p, _GlobExact) and not p.value)]
+
+
+def matches_any_glob_pattern(value: str, patterns: list[CompiledGlobPattern]) -> bool:
+    for p in patterns:
+        if isinstance(p, _GlobAll):
+            return True
+        if isinstance(p, _GlobExact) and value == p.value:
+            return True
+        if isinstance(p, _GlobRegex) and p.value.search(value):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Deny list resolution
+# ---------------------------------------------------------------------------
 
 def resolve_subagent_deny_list(depth: int, max_spawn_depth: int) -> list[str]:
-    """
-    Build the deny list for a subagent at given depth.
-    
-    Matches TS resolveSubagentDenyList() lines 76-84.
-    
-    Strategy:
-    - Depth 1 with maxSpawnDepth >= 2 (orchestrator): allowed to use sessions_spawn,
-      subagents, sessions_list, sessions_history so it can manage its children.
-    - Depth >= maxSpawnDepth (leaf): denied sessions_spawn and
-      session management tools. Still allowed subagents (for list/status visibility).
-    
-    Args:
-        depth: Current subagent depth
-        max_spawn_depth: Maximum allowed spawn depth
-    
-    Returns:
-        List of denied tool names
-    """
     is_leaf = depth >= max(1, int(max_spawn_depth))
-    
     if is_leaf:
         return [*SUBAGENT_TOOL_DENY_ALWAYS, *SUBAGENT_TOOL_DENY_LEAF]
-    
-    # Orchestrator subagent: only deny the always-denied tools
-    # sessions_spawn, subagents, sessions_list, sessions_history are allowed
     return [*SUBAGENT_TOOL_DENY_ALWAYS]
 
+
+# ---------------------------------------------------------------------------
+# ToolPolicy (uses glob matching like TS makeToolPolicyMatcher)
+# ---------------------------------------------------------------------------
 
 class ToolPolicy:
     """
     Tool policy with allow/deny lists.
-    
-    Matches TS SandboxToolPolicy type.
+    Uses glob pattern compilation for matching (aligned with TS makeToolPolicyMatcher).
     """
-    
+
     def __init__(
         self,
         allow: Optional[list[str]] = None,
@@ -98,64 +162,40 @@ class ToolPolicy:
     ):
         self.allow = allow
         self.deny = deny or []
-    
+        self._compiled_deny = compile_glob_patterns(expand_tool_groups(self.deny))
+        self._compiled_allow = compile_glob_patterns(
+            expand_tool_groups(self.allow) if self.allow is not None else None
+        )
+
     def is_allowed(self, tool_name: str) -> bool:
-        """
-        Check if tool is allowed by this policy.
-        
-        Matches TS makeToolPolicyMatcher() logic lines 15-40.
-        
-        Args:
-            tool_name: Tool name to check
-        
-        Returns:
-            True if allowed, False if denied
-        """
         normalized = normalize_tool_name(tool_name)
-        
-        # Check deny list first
-        for denied in self.deny:
-            if normalize_tool_name(denied) == normalized:
-                return False
-        
-        # If no allow list, everything not denied is allowed
-        if self.allow is None:
+
+        if matches_any_glob_pattern(normalized, self._compiled_deny):
+            return False
+
+        if not self._compiled_allow:
             return True
-        
-        # Check allow list
-        for allowed in self.allow:
-            if normalize_tool_name(allowed) == normalized:
-                return True
-        
-        # Special case: apply_patch allowed if exec is allowed
-        if normalized == "apply_patch":
-            for allowed in self.allow:
-                if normalize_tool_name(allowed) == "exec":
-                    return True
-        
+
+        if matches_any_glob_pattern(normalized, self._compiled_allow):
+            return True
+
+        if normalized == "apply_patch" and matches_any_glob_pattern("exec", self._compiled_allow):
+            return True
+
         return False
 
+
+# ---------------------------------------------------------------------------
+# Subagent tool policy resolution (matches TS resolveSubagentToolPolicy)
+# ---------------------------------------------------------------------------
 
 def resolve_subagent_tool_policy(
     config: Optional[dict] = None,
     depth: Optional[int] = None,
 ) -> ToolPolicy:
-    """
-    Resolve tool policy for a subagent.
-    
-    Matches TS resolveSubagentToolPolicy() lines 86-103.
-    
-    Args:
-        config: OpenClaw configuration
-        depth: Subagent depth (None = assume depth 1)
-    
-    Returns:
-        ToolPolicy instance
-    """
     if config is None:
         config = {}
-    
-    # Get configuration
+
     configured = config.get("tools", {}).get("subagents", {}).get("tools", {})
     max_spawn_depth = (
         config.get("agents", {})
@@ -163,61 +203,45 @@ def resolve_subagent_tool_policy(
         .get("subagents", {})
         .get("maxSpawnDepth", DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH)
     )
-    
+
     effective_depth = depth if isinstance(depth, int) and depth >= 0 else 1
-    
-    # Build base deny list
+
     base_deny = resolve_subagent_deny_list(effective_depth, max_spawn_depth)
-    
-    # Get explicit allow/alsoAllow
+
     allow = configured.get("allow") if isinstance(configured.get("allow"), list) else None
     also_allow = configured.get("alsoAllow") if isinstance(configured.get("alsoAllow"), list) else None
-    
-    explicit_allow = set()
-    if allow:
-        explicit_allow.update(normalize_tool_name(t) for t in allow)
-    if also_allow:
-        explicit_allow.update(normalize_tool_name(t) for t in also_allow)
-    
-    # Filter base deny by explicit allows
+
+    explicit_allow = set(
+        normalize_tool_name(t)
+        for t in [*(allow or []), *(also_allow or [])]
+    )
+
     deny = [
         tool_name for tool_name in base_deny
         if normalize_tool_name(tool_name) not in explicit_allow
     ]
-    
-    # Add explicit denies
+
     if isinstance(configured.get("deny"), list):
         deny.extend(configured["deny"])
-    
-    # Merge allow and alsoAllow
-    merged_allow = None
-    if allow and also_allow:
-        merged_allow = list(set([*allow, *also_allow]))
-    elif allow:
-        merged_allow = allow
-    
+
+    merged_allow = (
+        list(dict.fromkeys([*allow, *also_allow])) if allow and also_allow
+        else allow
+    )
+
     return ToolPolicy(allow=merged_allow, deny=deny)
 
+
+# ---------------------------------------------------------------------------
+# Convenience helpers
+# ---------------------------------------------------------------------------
 
 def is_tool_allowed_by_policy(
     tool_name: str,
     policy: Optional[ToolPolicy] = None,
 ) -> bool:
-    """
-    Check if tool is allowed by policy.
-    
-    Matches TS isToolAllowedByPolicyName() lines 105-110.
-    
-    Args:
-        tool_name: Tool name to check
-        policy: Tool policy (None = allow all)
-    
-    Returns:
-        True if allowed, False if denied
-    """
     if policy is None:
         return True
-    
     return policy.is_allowed(tool_name)
 
 
@@ -225,24 +249,11 @@ def filter_tools_by_policy(
     tools: list,
     policy: Optional[ToolPolicy] = None,
 ) -> list:
-    """
-    Filter tools list by policy.
-    
-    Matches TS filterToolsByPolicy() lines 112-118.
-    
-    Args:
-        tools: List of tool objects (must have 'name' attribute)
-        policy: Tool policy (None = allow all)
-    
-    Returns:
-        Filtered tools list
-    """
     if policy is None:
         return tools
-    
     return [
         tool for tool in tools
-        if hasattr(tool, 'name') and policy.is_allowed(tool.name)
+        if hasattr(tool, "name") and policy.is_allowed(tool.name)
     ]
 
 
@@ -250,10 +261,17 @@ __all__ = [
     "DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH",
     "SUBAGENT_TOOL_DENY_ALWAYS",
     "SUBAGENT_TOOL_DENY_LEAF",
+    "TOOL_NAME_ALIASES",
+    "TOOL_GROUPS",
     "ToolPolicy",
+    "normalize_tool_name",
+    "normalize_tool_list",
+    "expand_tool_groups",
+    "compile_glob_pattern",
+    "compile_glob_patterns",
+    "matches_any_glob_pattern",
     "resolve_subagent_deny_list",
     "resolve_subagent_tool_policy",
     "is_tool_allowed_by_policy",
     "filter_tools_by_policy",
-    "normalize_tool_name",
 ]

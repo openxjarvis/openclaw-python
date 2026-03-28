@@ -46,13 +46,17 @@ def format_duration_compact(runtime_ms: int) -> str:
     return f"{seconds}s"
 
 
-def format_token_usage_display(entry: dict[str, Any] | None) -> str:
+def format_token_usage_display(entry: Any | None) -> str:
     """Format token usage for display (mirrors TS shared/subagents-format.ts)"""
     if not entry:
         return ""
     
-    input_tokens = entry.get("inputTokens", 0) or 0
-    output_tokens = entry.get("outputTokens", 0) or 0
+    if isinstance(entry, dict):
+        input_tokens = entry.get("inputTokens", 0) or 0
+        output_tokens = entry.get("outputTokens", 0) or 0
+    else:
+        input_tokens = getattr(entry, "inputTokens", None) or getattr(entry, "input_tokens", 0) or 0
+        output_tokens = getattr(entry, "outputTokens", None) or getattr(entry, "output_tokens", 0) or 0
     
     if input_tokens == 0 and output_tokens == 0:
         return ""
@@ -310,20 +314,21 @@ class SubagentsTool(AgentToolBase[dict, dict]):
         if target in ("all", "*"):
             killed_count = 0
             killed_labels = []
+            seen_keys: set[str] = set()
             
             for run in runs:
-                if run.ended_at:
+                child_key = (run.child_session_key or "").strip()
+                if not child_key or child_key in seen_keys:
                     continue
+                seen_keys.add(child_key)
                 
-                # Kill this run
-                await self._kill_subagent_run(run, cfg)
-                killed_count += 1
-                killed_labels.append(resolve_run_label(run))
+                if not run.ended_at:
+                    await self._kill_subagent_run(run, cfg)
+                    killed_count += 1
+                    killed_labels.append(resolve_run_label(run))
                 
-                # Cascade to descendants
                 cascade_result = await self._cascade_kill_children(
-                    run.child_session_key,
-                    cfg,
+                    child_key, cfg, seen_keys,
                 )
                 killed_count += cascade_result["killed"]
                 killed_labels.extend(cascade_result["labels"])
@@ -360,11 +365,28 @@ class SubagentsTool(AgentToolBase[dict, dict]):
         
         run = resolved["entry"]
         
-        # Kill this run
-        await self._kill_subagent_run(run, cfg)
+        stop_result = await self._kill_subagent_run(run, cfg)
         
-        # Cascade to descendants
-        cascade_result = await self._cascade_kill_children(run.child_session_key, cfg)
+        seen_keys: set[str] = set()
+        target_child_key = (run.child_session_key or "").strip()
+        if target_child_key:
+            seen_keys.add(target_child_key)
+        cascade_result = await self._cascade_kill_children(
+            run.child_session_key, cfg, seen_keys,
+        )
+        
+        if not stop_result.get("killed") and cascade_result["killed"] == 0:
+            return AgentToolResult(
+                content=[TextContent(text=f"{resolve_run_label(run)} is already finished.")],
+                details={
+                    "status": "done",
+                    "action": "kill",
+                    "target": target,
+                    "runId": run.run_id,
+                    "sessionKey": run.child_session_key,
+                    "text": f"{resolve_run_label(run)} is already finished.",
+                },
+            )
         
         cascade_text = (
             f" (+ {cascade_result['killed']} descendant{'s' if cascade_result['killed'] != 1 else ''})"
@@ -372,7 +394,11 @@ class SubagentsTool(AgentToolBase[dict, dict]):
             else ""
         )
         
-        text = f"killed {resolve_run_label(run)}{cascade_text}."
+        text = (
+            f"killed {resolve_run_label(run)}{cascade_text}."
+            if stop_result.get("killed")
+            else f"killed {cascade_result['killed']} descendant{'s' if cascade_result['killed'] != 1 else ''} of {resolve_run_label(run)}."
+        )
         
         return AgentToolResult(
             content=[TextContent(text=text)],
@@ -502,6 +528,8 @@ class SubagentsTool(AgentToolBase[dict, dict]):
                 entry = self.gateway.session_manager.get_session_entry(run.child_session_key)
                 if isinstance(entry, dict):
                     session_id = entry.get("sessionId")
+                elif entry is not None:
+                    session_id = getattr(entry, "sessionId", None) or getattr(entry, "session_id", None)
             except Exception:
                 pass
         
@@ -559,8 +587,7 @@ class SubagentsTool(AgentToolBase[dict, dict]):
                     run_id = response["runId"]
             
             except Exception as err:
-                # Restore normal announce behavior if steer fails
-                registry.mark_subagent_run_for_steer_restart("")  # Clear suppression
+                registry.clear_subagent_run_steer_restart(run.run_id)
                 
                 return AgentToolResult(
                     content=[TextContent(text=f"Failed to steer: {err}")],
@@ -633,15 +660,8 @@ class SubagentsTool(AgentToolBase[dict, dict]):
             gateway=self.gateway,
         )
         
-        max_spawn_depth = 1
-        if hasattr(cfg, "agents") and hasattr(cfg.agents, "defaults"):
-            defaults = cfg.agents.defaults
-            if hasattr(defaults, "subagents"):
-                subagents_cfg = defaults.subagents
-                if isinstance(subagents_cfg, dict):
-                    max_spawn_depth = subagents_cfg.get("maxSpawnDepth", 1)
-                elif hasattr(subagents_cfg, "maxSpawnDepth"):
-                    max_spawn_depth = subagents_cfg.maxSpawnDepth or 1
+        from openclaw.agents.subagent_spawn import _get_subagent_config_value
+        max_spawn_depth = _get_subagent_config_value(cfg, "maxSpawnDepth", 1)
         
         if caller_depth < max_spawn_depth:
             # Orchestrator: see own children
@@ -764,6 +784,8 @@ class SubagentsTool(AgentToolBase[dict, dict]):
                 entry = self.gateway.session_manager.get_session_entry(child_session_key)
                 if isinstance(entry, dict):
                     session_id = entry.get("sessionId")
+                elif entry is not None:
+                    session_id = getattr(entry, "sessionId", None) or getattr(entry, "session_id", None)
             except Exception:
                 pass
         

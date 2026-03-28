@@ -1478,20 +1478,147 @@ class ChannelManager:
                 session = None
                 session_workspace: str | None = None
                 workspace_root: str | None = str(resolve_state_dir() / "workspace")
+                _sandbox_enabled = False
+                _ws_access = "none"
                 _session_mgr = self.get_session_manager(agent_id)
                 if _session_mgr:
                     session = _session_mgr.get_or_create_session_by_key(session_key)
                     logger.info(f"[{channel_id}] Session created/retrieved: key={session_key}, uuid={session.session_id}")
 
-                    # Resolve session workspace for file generation
-                    from openclaw.agents.session_workspace import resolve_session_workspace_dir
-                    _workspace_root = session.workspace_dir if session else resolve_state_dir() / "workspace"
-                    session_workspace = str(resolve_session_workspace_dir(
-                        workspace_root=_workspace_root,
-                        session_key=session_key
-                    ))
+                    # Resolve workspace — mirrors TS behaviour:
+                    # - Agent workspace root = _session_mgr.workspace_dir (never session.workspace_dir
+                    #   which may carry stale cwd from old JSONL files).
+                    # - Sandbox OFF or workspaceAccess=rw → cwd = workspace root directly.
+                    # - Sandbox ON + workspaceAccess≠rw → cwd = per-session subdir inside
+                    #   sandboxes root (~/.openclaw/sandboxes/<slug>/), NOT inside workspace/.
+                    _workspace_root = (
+                        Path(_session_mgr.workspace_dir)
+                        if hasattr(_session_mgr, "workspace_dir") and _session_mgr.workspace_dir
+                        else resolve_state_dir() / "workspace"
+                    )
                     workspace_root = str(_workspace_root)
-                    logger.info(f"[{channel_id}] Session workspace: {session_workspace}")
+
+                    _sandbox_enabled = False
+                    _sb_cfg = None
+                    try:
+                        # Load config fresh — self.config is not always set on ChannelManager
+                        try:
+                            from openclaw.config.loader import load_config as _load_cfg_sb
+                            _cfg_sb = _load_cfg_sb()
+                        except Exception:
+                            _cfg_sb = getattr(self, "config", None)
+                        if isinstance(_cfg_sb, dict):
+                            _sb_cfg = (
+                                _cfg_sb.get("agents", {})
+                                .get("defaults", {})
+                                .get("sandbox")
+                            ) or _cfg_sb.get("sandbox")
+                        elif _cfg_sb is not None:
+                            _agents = getattr(_cfg_sb, "agents", None)
+                            _defaults = getattr(_agents, "defaults", None) if _agents else None
+                            _sb_cfg = getattr(_defaults, "sandbox", None) if _defaults else None
+                            if not _sb_cfg:
+                                _sb_cfg = getattr(_cfg_sb, "sandbox", None)
+                        if _sb_cfg:
+                            _sb_mode = (
+                                _sb_cfg.get("mode", "off")
+                                if isinstance(_sb_cfg, dict)
+                                else getattr(_sb_cfg, "mode", "off")
+                            )
+                            _sandbox_enabled = str(_sb_mode).strip().lower() not in ("off", "")
+                    except Exception:
+                        pass
+
+                    _ws_access = "none"
+                    if _sb_cfg and _sandbox_enabled:
+                        _ws_access = str(
+                            _sb_cfg.get("workspaceAccess", "none")
+                            if isinstance(_sb_cfg, dict)
+                            else getattr(_sb_cfg, "workspaceAccess", None)
+                            or getattr(_sb_cfg, "workspace_access", "none")
+                        ).strip().lower()
+
+                    if _sandbox_enabled and _ws_access != "rw":
+                        # Per-session sandbox subdir lives in ~/.openclaw/sandboxes/ (NOT workspace/).
+                        # Mirrors TS: DEFAULT_SANDBOX_WORKSPACE_ROOT = path.join(STATE_DIR, "sandboxes")
+                        from openclaw.config.paths import resolve_default_sandbox_workspace_root
+                        from openclaw.agents.session_workspace import (
+                            resolve_session_workspace_dir,
+                            resolve_sandbox_scope_key,
+                        )
+                        _sandbox_root_cfg = (
+                            _sb_cfg.get("workspaceRoot")
+                            if isinstance(_sb_cfg, dict)
+                            else getattr(_sb_cfg, "workspaceRoot", None)
+                        )
+                        _sandbox_root = Path(_sandbox_root_cfg).expanduser() if _sandbox_root_cfg else resolve_default_sandbox_workspace_root()
+                        _scope = str(
+                            _sb_cfg.get("scope", "session")
+                            if isinstance(_sb_cfg, dict)
+                            else getattr(_sb_cfg, "scope", "session")
+                        )
+                        _scope_key = resolve_sandbox_scope_key(_scope, session_key)
+                        if _scope == "shared":
+                            session_workspace = str(_sandbox_root)
+                        else:
+                            session_workspace = str(resolve_session_workspace_dir(
+                                workspace_root=_sandbox_root,
+                                session_key=_scope_key,
+                            ))
+                        logger.info(f"[{channel_id}] Sandbox session workspace (ws_access={_ws_access}, scope={_scope}): {session_workspace}")
+
+                        # Bootstrap sandbox workspace — mirrors TS ensureSandboxWorkspaceLayout:
+                        # copies SOUL.md, USER.md, TOOLS.md etc. from agent workspace (write-if-missing).
+                        # Without this, a fresh sandbox dir has no soul/config → broken agent.
+                        try:
+                            from openclaw.agents.sandbox.workspace import ensure_sandbox_workspace
+                            _skip_bs = False
+                            try:
+                                _cfg_bs = _cfg_sb if _cfg_sb is not None else {}
+                                _skip_bs = bool(
+                                    _cfg_bs.get("agents", {}).get("defaults", {}).get("skipBootstrap", False)
+                                    if isinstance(_cfg_bs, dict)
+                                    else getattr(
+                                        getattr(getattr(_cfg_bs, "agents", None), "defaults", None),
+                                        "skipBootstrap", False,
+                                    )
+                                )
+                            except Exception:
+                                pass
+                            await ensure_sandbox_workspace(
+                                workspace_dir=session_workspace,
+                                seed_from=workspace_root,
+                                skip_bootstrap=_skip_bs,
+                            )
+                            logger.debug(
+                                "[%s] Sandbox workspace bootstrapped from %s → %s",
+                                channel_id, workspace_root, session_workspace,
+                            )
+                        except Exception as _boot_exc:
+                            logger.debug("Sandbox workspace bootstrap (non-fatal): %s", _boot_exc)
+
+                        # Sync skills into sandbox — mirrors TS syncSkillsToWorkspace.
+                        # Copies all skill dirs (bundled + managed + workspace) into
+                        # <sandbox>/skills/ so the agent can read SKILL.md from its CWD.
+                        try:
+                            from openclaw.agents.skills.workspace import sync_skills_to_workspace
+                            await sync_skills_to_workspace(
+                                source_workspace_dir=workspace_root,
+                                target_workspace_dir=session_workspace,
+                                config=_cfg_sb,
+                            )
+                            logger.debug(
+                                "[%s] Skills synced to sandbox %s",
+                                channel_id, session_workspace,
+                            )
+                        except Exception as _sync_exc:
+                            logger.debug("Sandbox skills sync (non-fatal): %s", _sync_exc)
+                    else:
+                        session_workspace = workspace_root
+                        if _sandbox_enabled:
+                            logger.info(f"[{channel_id}] Sandbox on, workspaceAccess=rw → using workspace root: {session_workspace}")
+                        else:
+                            logger.info(f"[{channel_id}] Using workspace root as cwd (sandbox off): {session_workspace}")
 
                     # Record inbound session metadata (mirrors TS recordSessionMetaFromInbound).
                     # Uses preserve-activity semantics: does NOT refresh updatedAt so that
@@ -1711,34 +1838,60 @@ class ChannelManager:
 
                 if hasattr(channel, "_app") and channel._app is not None:
                     # Telegram channel
-                    try:
-                        from openclaw.channels.telegram.draft_stream import TelegramDraftStream
-                        _is_dm_tg = getattr(message, "chat_type", "") == "direct"
-                        _draft_stream = TelegramDraftStream(
-                            bot_api=channel._app.bot,
-                            chat_id=int(message.chat_id),
-                            reply_to_message_id=int(message.message_id) if message.message_id else None,
-                            throttle_ms=1000,
-                            min_initial_chars=20,
-                            is_dm=_is_dm_tg,
-                        )
-                        # .update() is synchronous — create_task handles the async
-                        # send/edit internally via asyncio.create_task inside the class.
-                        _stream_callback = _draft_stream.update
-                    except Exception as _ds_err:
-                        logger.debug("Failed to create TelegramDraftStream: %s", _ds_err)
-                        _draft_stream = None
-                        _stream_callback = None
-
-                    # Block reply configuration — mirrors TS bot-message-dispatch.ts L169-184
-                    # and dispatch-from-config.ts L326 (shouldSendToolSummaries).
-                    # Decision logic:
-                    # 1. Resolve block streaming config from agents.defaults.blockStreamingDefault
-                    #    and telegram.blockStreaming (account-level override)
-                    # 2. Check shouldSendToolSummaries: only enable if NOT group chat
-                    #    and NOT native command source
+                    
+                    # ✅ FIX: Resolve preview streaming mode (mirrors TS L182)
+                    # Determines if draft/preview streaming is enabled at all.
+                    # Default: "partial" (streaming enabled)
+                    # Values: "off" | "partial" | "block"
+                    _stream_mode = "partial"  # Default per TS resolveTelegramPreviewStreamMode
+                    _tg_cfg_stream = getattr(channel, "_config", None) or {}
+                    
+                    # Check telegram.streaming (preferred) or legacy telegram.streamMode
+                    if "streaming" in _tg_cfg_stream:
+                        _streaming_val = _tg_cfg_stream["streaming"]
+                        if _streaming_val == False or _streaming_val == "off":
+                            _stream_mode = "off"
+                        elif _streaming_val == True or _streaming_val in ("partial", "progress"):
+                            _stream_mode = "partial"
+                        elif _streaming_val == "block":
+                            _stream_mode = "block"
+                    elif "streamMode" in _tg_cfg_stream:
+                        _stream_mode = _tg_cfg_stream.get("streamMode", "partial")
+                    
+                    _preview_streaming_enabled = (_stream_mode != "off")
+                    
+                    logger.info(
+                        f"[telegram] Preview streaming: mode={_stream_mode}, "
+                        f"enabled={_preview_streaming_enabled}, chat={message.chat_id}"
+                    )
+                    
+                    # Block reply configuration — mirrors TS bot-message-dispatch.ts L169-184.
+                    #
+                    # TS has TWO separate concepts:
+                    # 1. accountBlockStreamingEnabled (L171-174) — simple config check,
+                    #    gates draft stream creation
+                    # 2. disableBlockStreaming (L305-313) — complex logic passed as a
+                    #    reply option to control block message behavior
+                    #
+                    # Python must separate these two concepts correctly.
+                    _account_block_streaming_enabled = False
+                    _force_block_for_reasoning = False
+                    _block_streaming_enabled = False  # for reply option (disableBlockStreaming)
+                    _should_send_tool_summaries = True
+                    _block_cfg = None
                     try:
                         from openclaw.auto_reply.reply.block_streaming import resolve_block_streaming_config
+                        
+                        # Resolve reasoning level
+                        _reasoning_level_for_block = "off"
+                        try:
+                            from openclaw.channels.telegram.reasoning import resolve_reasoning_level
+                            _tg_cfg_for_r = getattr(channel, "_config", None) or {}
+                            _reasoning_level_for_block = resolve_reasoning_level(_tg_cfg_for_r)
+                        except Exception:
+                            pass
+                        
+                        _force_block_for_reasoning = (_reasoning_level_for_block == "on")
                         
                         _block_cfg = resolve_block_streaming_config(
                             cfg=_cfg,
@@ -1746,48 +1899,141 @@ class ChannelManager:
                             account_id=message.account_id,
                         )
                         
-                        # Mirrors TS: const shouldSendToolSummaries = 
-                        #   ctx.ChatType !== "group" && ctx.CommandSource !== "native"
+                        # TS L171-174: accountBlockStreamingEnabled is JUST the config
+                        # boolean — telegram.blockStreaming or agents.defaults.blockStreamingDefault.
+                        # resolve_block_streaming_config already resolves this correctly.
+                        _account_block_streaming_enabled = _block_cfg.enabled
+                        
+                        # shouldSendToolSummaries only affects the reply option
+                        # (disableBlockStreaming), NOT draft stream creation.
                         _should_send_tool_summaries = (
                             getattr(message, "chat_type", "") != "group"
                             and getattr(message, "command_source", "") != "native"
                         )
-                        
-                        if _block_cfg.enabled and _should_send_tool_summaries:
-                            _tg_chat_id_for_block = int(message.chat_id)
-                            # Tracks whether the first block has been sent — used to add a
-                            # human-like delay between consecutive blocks (mirrors TS getHumanDelay).
-                            _block_sent_flags = [False]
-
-                            async def _tg_block_send(
-                                text: str,
-                                _cid=_tg_chat_id_for_block,
-                                _flags=_block_sent_flags,
-                            ) -> None:
-                                import random as _random
-                                try:
-                                    if _flags[0]:
-                                        # Human-like delay between consecutive block messages.
-                                        # Mirrors TS getHumanDelay() / human-delay.ts (800–2500ms).
-                                        _delay_s = _random.uniform(0.8, 2.5)
-                                        await asyncio.sleep(_delay_s)
-                                    _flags[0] = True
-                                    await channel.send_text(
-                                        target=str(_cid),
-                                        text=text,
-                                    )
-                                    # Reset the draft stream so the NEXT text segment starts
-                                    # a fresh streaming preview, rather than editing the
-                                    # preview that corresponds to the just-sent block message.
-                                    # Mirrors TS forceNewMessage() called after onAssistantMessageStart.
-                                    if _draft_stream is not None and hasattr(_draft_stream, "force_new_message"):
-                                        _draft_stream.force_new_message()
-                                except Exception as _e:
-                                    logger.debug("[telegram] block_send_fn error: %s", _e)
-
-                            _block_send_fn = _tg_block_send
                     except Exception as _block_cfg_err:
                         logger.debug("Failed to resolve block streaming config: %s", _block_cfg_err)
+                    
+                    # Draft stream creation gate — mirrors TS L183-184:
+                    #   canStreamAnswerDraft = previewStreamingEnabled
+                    #     && !accountBlockStreamingEnabled
+                    #     && !forceBlockStreamingForReasoning
+                    #
+                    # accountBlockStreamingEnabled is the RAW config value
+                    # (NOT conditioned on shouldSendToolSummaries).
+                    _can_stream_answer_draft = (
+                        _preview_streaming_enabled and 
+                        not _account_block_streaming_enabled and
+                        not _force_block_for_reasoning
+                    )
+                    
+                    # TS disableBlockStreaming (L305-313):
+                    #   !previewStreamingEnabled → true (disable)
+                    #   forceBlockStreamingForReasoning → false (don't disable)
+                    #   explicit config → inverse of config value
+                    #   canStreamAnswerDraft → true (disable -- draft takes over)
+                    #   else → undefined
+                    # Python _block_streaming_enabled is the inverse (True = block streaming ON)
+                    if not _preview_streaming_enabled:
+                        _block_streaming_enabled = False
+                    elif _force_block_for_reasoning:
+                        _block_streaming_enabled = True
+                    elif _account_block_streaming_enabled:
+                        _block_streaming_enabled = _should_send_tool_summaries
+                    elif _can_stream_answer_draft:
+                        _block_streaming_enabled = False
+                    else:
+                        _block_streaming_enabled = False
+                    
+                    # Archived preview tracking (mirrors TS archivedAnswerPreviews / archivedReasoningPreviewIds)
+                    _archived_answer_previews: list[dict] = []
+                    _archived_reasoning_preview_ids: list[int] = []
+
+                    def _on_superseded_answer_preview(info: dict) -> None:
+                        _archived_answer_previews.append(info)
+
+                    def _on_superseded_reasoning_preview(info: dict) -> None:
+                        mid = info.get("message_id")
+                        if mid is not None:
+                            _archived_reasoning_preview_ids.append(mid)
+
+                    if _can_stream_answer_draft:
+                        try:
+                            from openclaw.channels.telegram.draft_stream import TelegramDraftStream
+                            _is_dm_tg = getattr(message, "chat_type", "") == "direct"
+                            _draft_stream = TelegramDraftStream(
+                                bot_api=channel._app.bot,
+                                chat_id=int(message.chat_id),
+                                reply_to_message_id=int(message.message_id) if message.message_id else None,
+                                throttle_ms=1000,
+                                min_initial_chars=30,
+                                is_dm=_is_dm_tg,
+                                on_superseded_preview=_on_superseded_answer_preview,
+                            )
+                            # .update() is synchronous — create_task handles the async
+                            # send/edit internally via asyncio.create_task inside the class.
+                            _stream_callback = _draft_stream.update
+                            logger.info(
+                                f"[telegram] Answer draft stream ENABLED: stream_mode={_stream_mode}, "
+                                f"account_block_streaming={_account_block_streaming_enabled}, "
+                                f"force_for_reasoning={_force_block_for_reasoning}, chat={message.chat_id}"
+                            )
+                        except Exception as _ds_err:
+                            logger.debug("Failed to create TelegramDraftStream: %s", _ds_err)
+                            _draft_stream = None
+                            _stream_callback = None
+                    else:
+                        # Answer draft disabled: either streamMode=off, block streaming, or reasoning force
+                        _draft_stream = None
+                        _stream_callback = None
+                        logger.info(
+                            f"[telegram] Answer draft stream DISABLED: stream_mode={_stream_mode}, "
+                            f"preview_enabled={_preview_streaming_enabled}, "
+                            f"account_block_streaming={_account_block_streaming_enabled}, "
+                            f"force_for_reasoning={_force_block_for_reasoning}, chat={message.chat_id}"
+                        )
+
+                    # Setup block_send_fn when block streaming is enabled
+                    if _block_streaming_enabled:
+                        _tg_chat_id_for_block = int(message.chat_id)
+                        # Tracks whether the first block has been sent — used to add a
+                        # human-like delay between consecutive blocks (mirrors TS getHumanDelay).
+                        _block_sent_flags = [False]
+
+                        async def _tg_block_send(
+                            text: str,
+                            _cid=_tg_chat_id_for_block,
+                            _flags=_block_sent_flags,
+                            _meta=message.metadata,
+                        ) -> None:
+                            try:
+                                if _flags[0]:
+                                    # TS Telegram path does NOT pass humanDelay to the reply
+                                    # dispatcher, so inter-block delay defaults to 0.  Only
+                                    # apply a delay when _human_delay_config is present in
+                                    # message metadata (configurable per-channel).
+                                    _hd_cfg = (_meta or {}).get("_human_delay_config")
+                                    if _hd_cfg:
+                                        import random as _random
+                                        _lo = _hd_cfg.get("min_s", 0.8)
+                                        _hi = _hd_cfg.get("max_s", 2.5)
+                                        await asyncio.sleep(_random.uniform(_lo, _hi))
+                                _flags[0] = True
+                                await channel.send_text(
+                                    target=str(_cid),
+                                    text=text,
+                                )
+                                # Reset the draft stream so the NEXT text segment starts
+                                # a fresh streaming preview, rather than editing the
+                                # preview that corresponds to the just-sent block message.
+                                # Mirrors TS forceNewMessage() called after onAssistantMessageStart.
+                                # Note: In block streaming mode, _draft_stream is None for answer,
+                                # but reasoning_draft may exist independently.
+                                if _draft_stream is not None and hasattr(_draft_stream, "force_new_message"):
+                                    _draft_stream.force_new_message()
+                            except Exception as _e:
+                                logger.debug("[telegram] block_send_fn error: %s", _e)
+
+                        _block_send_fn = _tg_block_send
 
                     # Reasoning lane — second TelegramDraftStream for <think> content.
                     # Mirrors TS reasoning-lane-coordinator.ts + lane-delivery.ts.
@@ -1803,9 +2049,9 @@ class ChannelManager:
                             _reasoning_draft = _TDS2(
                                 bot_api=channel._app.bot,
                                 chat_id=int(message.chat_id),
-                                reply_to_message_id=None,  # standalone reasoning bubble
+                                reply_to_message_id=None,
                                 throttle_ms=1000,
-                                min_initial_chars=10,
+                                on_superseded_preview=_on_superseded_reasoning_preview,
                             )
                             _reasoning_callback = _reasoning_draft.update
                     except Exception as _rl_err:
@@ -2121,11 +2367,28 @@ class ChannelManager:
                 except Exception:
                     _turn_system_prompt = _base_system_prompt
 
-                # Inject the actual session workspace path per-turn so the agent
-                # always knows the real subdirectory to write files into.
-                # Resolves the TODO in system_prompt.py:
-                #   "Future: Add session_workspace parameter and use resolve_session_workspace_dir()"
-                if session_workspace:
+                # Inject ## Sandbox section when sandbox is enabled.
+                # Mirrors TS build_sandbox_section injected into system prompt.
+                if _sandbox_enabled:
+                    try:
+                        from openclaw.agents.system_prompt_sections import build_sandbox_section
+                        _sb_info: dict = {
+                            "enabled": True,
+                            "workspace_access": _ws_access,
+                        }
+                        if session_workspace and _ws_access != "rw":
+                            _sb_info["workspace_dir"] = session_workspace
+                        _sb_section_lines = build_sandbox_section(_sb_info)
+                        if _sb_section_lines:
+                            _turn_system_prompt = (_turn_system_prompt or "") + "\n\n" + "\n".join(_sb_section_lines)
+                    except Exception:
+                        pass
+
+                # When sandbox uses a per-session workspace (sandbox on + ws_access != rw),
+                # inject the path so the agent knows where to save files.
+                # When sandbox is OFF or workspaceAccess=rw, the agent uses the workspace
+                # root directly and can read/edit SOUL.md, USER.md, etc. — no note needed.
+                if session_workspace and _sandbox_enabled and _ws_access != "rw":
                     _ws_note = (
                         "\n\n## Session Workspace\n"
                         f"Your **session workspace** for this conversation is: `{session_workspace}`\n"
@@ -2208,6 +2471,118 @@ class ChannelManager:
                 except Exception as _mte:
                     logger.debug("Per-dispatch MessageTool binding failed: %s", _mte)
 
+                # ------------------------------------------------------------------
+                # Skill dispatch + SKILL.md injection (must run in channel_manager
+                # because ReplyContext is created here, bypassing get_reply.py).
+                #
+                # Path 1 — Slash commands: mirrors TS resolveSkillCommandInvocation
+                #   in get-reply-inline-actions.ts. Handles /pptx [args] and
+                #   /skill pptx [args]. Args are extracted and passed as user input.
+                #
+                # Path 2 — Keyword detection (Python-specific Gemini workaround):
+                #   TS relies on Claude following "## Skills (mandatory)" system
+                #   prompt instructions. Gemini ignores those, so we proactively
+                #   inject the full SKILL.md into the message for always=True skills.
+                # ------------------------------------------------------------------
+                try:
+                    import re as _re_sk
+                    from openclaw.agents.skills.workspace import load_workspace_skill_entries, filter_skill_entries
+                    from pathlib import Path as _SPath
+
+                    # Workspace for skill loading — prefer session_workspace, fall back to state dir
+                    _skill_ws = session_workspace
+                    if not _skill_ws:
+                        from openclaw.config.paths import resolve_state_dir as _rsd_ski
+                        _skill_ws = str(_rsd_ski() / "workspace")
+
+                    _cfg_dict = (
+                        _cfg.model_dump() if hasattr(_cfg, "model_dump") else
+                        (_cfg if isinstance(_cfg, dict) else {})
+                    )
+                    _sk_entries = load_workspace_skill_entries(_skill_ws, _cfg_dict)
+                    _sk_eligible = filter_skill_entries(_sk_entries, _cfg_dict, None)
+                    _always_entries = [e for e in _sk_eligible if e.metadata and e.metadata.always]
+
+                    def _read_skill_md_cm(loc: object) -> str | None:
+                        if not loc:
+                            return None
+                        try:
+                            return _SPath(str(loc)).read_text(encoding="utf-8").strip() or None
+                        except Exception:
+                            return None
+
+                    def _build_skill_rewrite_cm(skill_name: str, user_input: str, content: str | None) -> str:
+                        """Mirrors TS promptParts join in get-reply-inline-actions.ts lines 238-242."""
+                        parts = [f'Use the "{skill_name}" skill for this request.']
+                        if content:
+                            parts.append(
+                                "The skill instructions from SKILL.md are preloaded below"
+                                " — follow them exactly:\n\n" + content
+                            )
+                        if user_input and user_input.strip():
+                            parts.append(f"User input:\n{user_input.strip()}")
+                        return "\n\n".join(parts)
+
+                    _msg_stripped = (message_text or "").strip()
+                    _injected = False
+
+                    # Path 1: Slash command dispatch — mirrors TS resolveSkillCommandInvocation.
+                    # Handles /pptx [args]  and  /skill pptx [args].
+                    if _msg_stripped.startswith("/"):
+                        _slash_m = _re_sk.match(r"^/([^\s]+)(?:\s+([\s\S]+))?$", _msg_stripped)
+                        if _slash_m:
+                            _cmd_name = _slash_m.group(1).lower()
+                            _cmd_args = (_slash_m.group(2) or "").strip()
+                            # Resolve /skill pptx [args] format (mirrors TS /skill handler)
+                            if _cmd_name == "skill" and _cmd_args:
+                                _skill_re = _re_sk.match(r"^([^\s]+)(?:\s+([\s\S]+))?$", _cmd_args)
+                                if _skill_re:
+                                    _cmd_name = _skill_re.group(1).lower()
+                                    _cmd_args = (_skill_re.group(2) or "").strip()
+                            for _ae in _always_entries:
+                                if _ae.skill.name.lower() == _cmd_name:
+                                    _sc = _read_skill_md_cm(getattr(_ae.skill, "location", None))
+                                    # Use extracted args as user input (aligns with TS skillInvocation.args)
+                                    _user_inp = _cmd_args if _cmd_args else _msg_stripped
+                                    effective_message_text = _build_skill_rewrite_cm(_ae.skill.name, _user_inp, _sc)
+                                    _injected = True
+                                    logger.info(
+                                        "[%s] Skill slash-cmd /%s → rewrite%s",
+                                        channel_id, _ae.skill.name,
+                                        " (SKILL.md injected)" if _sc else "",
+                                    )
+                                    break
+
+                    # Path 2: Keyword detection for natural language (Gemini workaround).
+                    if not _injected:
+                        _SKILL_KEYWORDS: dict[str, list[str]] = {
+                            "pptx": ["ppt", ".pptx", "presentation", "slide", "deck",
+                                     "幻灯片", "演示文稿", "演示", "pptx"],
+                            "docx": [".docx", "word document", "word doc", "docx"],
+                            "pdf": [".pdf", "pdf file", "pdf document"],
+                            "xlsx": [".xlsx", ".xls", "excel", "spreadsheet", "表格", "xlsx"],
+                        }
+                        _body_lower = _msg_stripped.lower()
+                        for _ae in _always_entries:
+                            _kws = _SKILL_KEYWORDS.get(_ae.skill.name)
+                            if not _kws:
+                                continue
+                            for _kw in _kws:
+                                if _kw in _body_lower:
+                                    _sc = _read_skill_md_cm(getattr(_ae.skill, "location", None))
+                                    effective_message_text = _build_skill_rewrite_cm(_ae.skill.name, _msg_stripped, _sc)
+                                    _injected = True
+                                    logger.info(
+                                        "[%s] Skill keyword '%s' → skill '%s'%s",
+                                        channel_id, _kw, _ae.skill.name,
+                                        " (SKILL.md injected)" if _sc else "",
+                                    )
+                                    break
+                            if _injected:
+                                break
+                except Exception as _ski_exc:
+                    logger.debug("Skill injection (non-fatal): %s", _ski_exc)
+
                 reply_ctx = ReplyContext(
                     session_id=session_id_for_run,
                     session_key=session_key,
@@ -2234,6 +2609,7 @@ class ChannelManager:
                     reasoning_stream_callback=_reasoning_callback,
                     reasoning_draft_stream=_reasoning_draft,
                     block_send_fn=_block_send_fn,
+                    ctx_metadata=message.metadata,  # ✅ Pass metadata from InboundMessage
                 )
 
                 # Fire-and-forget: handler returns immediately.

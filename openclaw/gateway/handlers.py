@@ -385,6 +385,7 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
     attachments = params.get("attachments")
     timeout_secs = params.get("timeout")
     lane = params.get("lane")
+    session_workspace = params.get("sessionWorkspace")
 
     if _agent_runtime is None or _session_manager is None:
         raise RuntimeError("Agent runtime not initialized")
@@ -515,6 +516,7 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
                     _run_agent_turn(
                         connection, run_id, session, message, tools, model,
                         images=images, extra_system_prompt=extra_system_prompt,
+                        session_workspace=session_workspace,
                     ),
                     timeout=timeout_secs
                 )
@@ -538,6 +540,7 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
             await _run_agent_turn(
                 connection, run_id, session, message, tools, model,
                 images=images, extra_system_prompt=extra_system_prompt,
+                session_workspace=session_workspace,
             )
 
     if _queue_manager is not None:
@@ -616,6 +619,7 @@ async def _run_agent_turn(
     *,
     images: list[dict[str, Any]] | None = None,
     extra_system_prompt: str | None = None,
+    session_workspace: str | None = None,
 ) -> None:
     """Execute agent turn and stream events — matches TS agentCommand fire-and-forget."""
     seq = 0
@@ -705,6 +709,8 @@ async def _run_agent_turn(
         session_key_for_run = getattr(session, "session_key", None) or getattr(session, "session_id", None)
         if session_key_for_run:
             run_kwargs["session_key"] = session_key_for_run
+        if session_workspace:
+            run_kwargs["session_workspace"] = session_workspace
         async for event in _agent_runtime.run_turn(session, message, tools, model, **run_kwargs):
             evt_type = getattr(event, "type", "")
             stream = "assistant"
@@ -2308,9 +2314,9 @@ async def handle_skills_update(connection: Any, params: dict[str, Any]) -> dict[
         
         # Get current skills config (mirrors TS lines 165-167)
         cfg_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
-        skills = copy.deepcopy(cfg_dict.get("skills", {}))
-        entries = copy.deepcopy(skills.get("entries", {}))
-        current = copy.deepcopy(entries.get(skill_key, {}))
+        skills = copy.deepcopy(cfg_dict.get("skills") or {})
+        entries = copy.deepcopy(skills.get("entries") or {})
+        current = copy.deepcopy(entries.get(skill_key) or {})
         
         # Update enabled flag (mirrors TS lines 168-170)
         if isinstance(enabled, bool):
@@ -2345,7 +2351,11 @@ async def handle_skills_update(connection: Any, params: dict[str, Any]) -> dict[
         
         write_config_file(cfg_dict)
         
-        return {"ok": True, "skillKey": skill_key, "config": current}
+        # Bump skills snapshot version (for refresh detection)
+        from openclaw.agents.skills.refresh import bump_skills_snapshot_version
+        bump_skills_snapshot_version()
+        
+        return {"ok": True, "updated": True, "skillKey": skill_key, "config": current}
     except Exception as exc:
         logger.error("skills.update error: %s", exc, exc_info=True)
         return {"ok": False, "skillKey": skill_key, "error": str(exc)}
@@ -2447,20 +2457,48 @@ async def handle_web_login_wait(connection: Any, params: dict[str, Any]) -> dict
     return {"authenticated": False}
 
 
+_wizard_sessions: dict[str, Any] = {}
+
+
+def _find_running_wizard() -> str | None:
+    """Return session ID of a running wizard, if any."""
+    for sid, sess in _wizard_sessions.items():
+        if sess.get_status() == "running":
+            return sid
+    return None
+
+
 @register_handler("wizard.start")
 async def handle_wizard_start(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Start setup wizard"""
+    """Start setup wizard — mirrors TS wizard.start handler."""
     if _wizard_handler:
         return await _wizard_handler.wizard_start(params)
-    
-    # Fallback if wizard handler not available
+
+    mode = params.get("mode", "quickstart")
+    workspace = params.get("workspace")
+
+    if not isinstance(mode, str) or mode not in ("quickstart", "advanced", "manual", "local", "remote"):
+        return {"error": "invalid mode"}
+
+    running_id = _find_running_wizard()
+    if running_id:
+        return {"error": "wizard already running", "sessionId": running_id}
+
     from ..wizard.session import WizardSession
+    import uuid
+
+    async def _runner(prompter):
+        from ..wizard.onboarding import run_onboarding_wizard
+        await run_onboarding_wizard(flow=mode, workspace_dir=workspace)
+
     try:
-        session = WizardSession(
-            mode=params.get("mode", "quickstart"),
-            workspace=params.get("workspace")
-        )
-        return session.to_dict()
+        session_id = str(uuid.uuid4())
+        session = WizardSession(runner=_runner)
+        _wizard_sessions[session_id] = session
+        result = await session.next()
+        if result.done:
+            _wizard_sessions.pop(session_id, None)
+        return {"sessionId": session_id, **result.to_dict()}
     except Exception as e:
         logger.error(f"Error starting wizard: {e}", exc_info=True)
         return {"error": str(e)}
@@ -2468,26 +2506,63 @@ async def handle_wizard_start(connection: Any, params: dict[str, Any]) -> dict[s
 
 @register_handler("wizard.next")
 async def handle_wizard_next(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Advance wizard to next step"""
+    """Advance wizard to next step — mirrors TS wizard.next handler."""
     if _wizard_handler:
         return await _wizard_handler.wizard_next(params)
-    return {"error": "Wizard handler not available"}
+
+    session_id = params.get("sessionId", "")
+    session = _wizard_sessions.get(session_id)
+    if not session:
+        return {"error": "wizard not found"}
+
+    answer = params.get("answer")
+    if answer and isinstance(answer, dict):
+        step_id = str(answer.get("stepId", ""))
+        value = answer.get("value")
+        if session.get_status() != "running":
+            return {"error": "wizard not running"}
+        try:
+            await session.answer(step_id, value)
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    result = await session.next()
+    if result.done:
+        _wizard_sessions.pop(session_id, None)
+    return result.to_dict()
 
 
 @register_handler("wizard.cancel")
 async def handle_wizard_cancel(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Cancel wizard session"""
+    """Cancel wizard session — mirrors TS wizard.cancel handler."""
     if _wizard_handler:
         return await _wizard_handler.wizard_cancel(params)
-    return {"status": "cancelled"}
+
+    session_id = params.get("sessionId", "")
+    session = _wizard_sessions.get(session_id)
+    if not session:
+        return {"error": "wizard not found"}
+
+    session.cancel()
+    _wizard_sessions.pop(session_id, None)
+    return {"status": session.get_status(), "error": session.get_error()}
 
 
 @register_handler("wizard.status")
 async def handle_wizard_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get wizard status"""
+    """Get wizard status — mirrors TS wizard.status handler."""
     if _wizard_handler:
         return await _wizard_handler.wizard_status(params)
-    return {"error": "Wizard handler not available"}
+
+    session_id = params.get("sessionId", "")
+    session = _wizard_sessions.get(session_id)
+    if not session:
+        return {"error": "wizard not found"}
+
+    status = session.get_status()
+    if status != "running":
+        _wizard_sessions.pop(session_id, None)
+    return {"status": status, "error": session.get_error()}
 
 # Additional Talk Mode handlers (mirrors TS talk-mode-handler.ts)
 _TALK_MODE_DEFAULTS: dict[str, Any] = {
@@ -3750,8 +3825,56 @@ async def handle_plugins_doctor(connection: Any, params: dict[str, Any]) -> dict
 
 @register_handler("doctor.memory.status")
 async def handle_doctor_memory_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Memory subsystem health check."""
-    return {"ok": True, "status": "ok"}
+    """Memory subsystem health check -- mirrors TS doctor.memory.status handler.
+
+    Returns embedding availability, provider info, and connection health.
+    """
+    from pathlib import Path as _Path
+
+    agent_id = "default"
+    try:
+        from openclaw.config.loader import load_config as _lc_doc
+        cfg = _lc_doc()
+        if cfg:
+            cfg_dict = cfg if isinstance(cfg, dict) else (cfg.model_dump() if hasattr(cfg, "model_dump") else {})
+            agents_cfg = cfg_dict.get("agents", {}) or {}
+            agent_id = agents_cfg.get("defaultId") or agents_cfg.get("default_id") or "default"
+    except Exception:
+        cfg = None
+
+    try:
+        state_dir = _Path.home() / ".openclaw" / "state"
+        workspace_dir = state_dir / "agents" / agent_id
+
+        from openclaw.memory.manager import get_memory_search_manager
+        manager = await get_memory_search_manager(workspace_dir, config=cfg, agent_id=agent_id)
+
+        status = manager.status()
+        embedding = await manager.probe_embedding_availability()
+
+        payload = {
+            "agentId": agent_id,
+            "provider": status.provider,
+            "embedding": {
+                "ok": embedding.ok,
+            },
+        }
+        if embedding.error:
+            payload["embedding"]["error"] = embedding.error
+        if not embedding.ok and not embedding.error:
+            payload["embedding"]["error"] = "memory embeddings unavailable"
+
+        return {"ok": True, **payload}
+
+    except Exception as e:
+        return {
+            "ok": True,
+            "agentId": agent_id,
+            "embedding": {
+                "ok": False,
+                "error": f"gateway memory probe failed: {e}",
+            },
+        }
 
 
 @register_handler("node.canvas.capability.refresh")
@@ -3820,8 +3943,136 @@ async def handle_secrets_resolve(connection: Any, params: dict[str, Any]) -> dic
 
 @register_handler("tools.catalog")
 async def handle_tools_catalog(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Return the tools catalog for the agent."""
-    return {"ok": True, "tools": []}
+    """Return the tools catalog -- mirrors TS tools-catalog.ts.
+
+    Builds core tool groups from the registry and plugin tools,
+    returning { agentId, profiles, groups } structure.
+    """
+    PROFILE_OPTIONS = [
+        {"id": "minimal", "label": "Minimal"},
+        {"id": "coding", "label": "Coding"},
+        {"id": "messaging", "label": "Messaging"},
+        {"id": "full", "label": "Full"},
+    ]
+
+    TOOL_SECTIONS = [
+        {
+            "id": "file-ops",
+            "label": "File Operations",
+            "tool_names": ["read_file", "write_file", "edit_file", "read", "write", "edit", "grep", "ls", "apply_patch"],
+        },
+        {
+            "id": "shell",
+            "label": "Shell & Process",
+            "tool_names": ["bash", "process"],
+        },
+        {
+            "id": "web",
+            "label": "Web",
+            "tool_names": ["web_fetch", "web_search"],
+        },
+        {
+            "id": "media",
+            "label": "Media & Image",
+            "tool_names": ["image", "tts", "pdf_analysis"],
+        },
+        {
+            "id": "memory",
+            "label": "Memory",
+            "tool_names": ["memory_search", "memory_get"],
+        },
+        {
+            "id": "sessions",
+            "label": "Sessions",
+            "tool_names": ["sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "session_status"],
+        },
+        {
+            "id": "channels",
+            "label": "Channel Actions",
+            "tool_names": ["message", "telegram_actions", "discord_actions", "slack_actions", "whatsapp_actions"],
+        },
+        {
+            "id": "advanced",
+            "label": "Advanced",
+            "tool_names": ["browser", "cron", "voice_call", "canvas", "nodes", "subagents"],
+        },
+    ]
+
+    PROFILE_MAP: dict[str, list[str]] = {
+        "minimal": ["read_file", "web_fetch"],
+        "coding": ["read_file", "write_file", "edit_file", "bash", "read", "write", "edit", "web_fetch", "web_search", "grep", "ls"],
+        "messaging": ["web_fetch", "web_search", "message", "image"],
+        "full": [],
+    }
+
+    agent_id = params.get("agentId", "") or "default"
+    include_plugins = params.get("includePlugins", True)
+
+    registry = _tool_registry
+    if registry is None:
+        return {"ok": True, "agentId": agent_id, "profiles": PROFILE_OPTIONS, "groups": []}
+
+    all_tools = {t.name: t for t in registry.list_tools()}
+    groups = []
+
+    for section in TOOL_SECTIONS:
+        tools_in_section = []
+        for tool_name in section["tool_names"]:
+            tool = all_tools.get(tool_name)
+            if tool is None:
+                continue
+            default_profiles = [
+                pid for pid, names in PROFILE_MAP.items()
+                if not names or tool_name in names
+            ]
+            tools_in_section.append({
+                "id": tool.name,
+                "label": getattr(tool, "label", tool.name) or tool.name,
+                "description": getattr(tool, "description", "") or "",
+                "source": "core",
+                "defaultProfiles": default_profiles,
+            })
+        if tools_in_section:
+            groups.append({
+                "id": section["id"],
+                "label": section["label"],
+                "source": "core",
+                "tools": tools_in_section,
+            })
+
+    if include_plugins and _plugin_manager:
+        try:
+            assigned_names = {t["id"] for g in groups for t in g.get("tools", [])}
+            plugin_groups: dict[str, dict] = {}
+            for tool_name, tool in all_tools.items():
+                if tool_name in assigned_names:
+                    continue
+                plugin_id = getattr(tool, "plugin_id", None) or "plugin"
+                group_id = f"plugin:{plugin_id}"
+                if group_id not in plugin_groups:
+                    plugin_groups[group_id] = {
+                        "id": group_id,
+                        "label": plugin_id,
+                        "source": "plugin",
+                        "pluginId": plugin_id,
+                        "tools": [],
+                    }
+                plugin_groups[group_id]["tools"].append({
+                    "id": tool.name,
+                    "label": getattr(tool, "label", tool.name) or tool.name,
+                    "description": getattr(tool, "description", "Plugin tool") or "Plugin tool",
+                    "source": "plugin",
+                    "pluginId": plugin_id,
+                    "optional": getattr(tool, "optional", None),
+                    "defaultProfiles": [],
+                })
+            for pg in sorted(plugin_groups.values(), key=lambda g: g["label"]):
+                pg["tools"] = sorted(pg["tools"], key=lambda t: t["id"])
+                groups.append(pg)
+        except Exception:
+            pass
+
+    return {"ok": True, "agentId": agent_id, "profiles": PROFILE_OPTIONS, "groups": groups}
 
 
 logger.info(f"Registered {len(_handlers)} gateway handlers")

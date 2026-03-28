@@ -115,9 +115,92 @@ PROVIDER_API_KEY_ENV_VARS = {
 
 
 def _has_api_key(provider: str) -> bool:
-    """Check if an API key exists for the given provider."""
+    """Check if an API key exists for the given provider.
+    
+    Checks in order (mirrors TS behavior):
+    1. Environment variables
+    2. openclaw.json models.providers[provider].apiKey
+    
+    This ensures subagents can use the same providers as parent agents.
+    """
+    # 1. Check environment variables
     env_vars = PROVIDER_API_KEY_ENV_VARS.get(provider, [f"{provider.upper()}_API_KEY"])
-    return any(os.getenv(var) for var in env_vars)
+    if any(os.getenv(var) for var in env_vars):
+        return True
+    
+    # 2. Check openclaw.json config (mirrors TS config.models?.providers?.[provider]?.apiKey)
+    try:
+        from openclaw.config.loader import load_config
+        cfg = load_config()
+        
+        # Access models.providers (support both dict and Pydantic object)
+        if hasattr(cfg, 'models') and cfg.models:
+            models_cfg = cfg.models
+            if hasattr(models_cfg, 'providers') and models_cfg.providers:
+                providers = models_cfg.providers
+                # Handle both dict and object access
+                if isinstance(providers, dict):
+                    provider_config = providers.get(provider)
+                    if isinstance(provider_config, dict):
+                        api_key = provider_config.get('apiKey')
+                        if api_key and isinstance(api_key, str) and api_key.strip():
+                            return True
+                elif hasattr(providers, provider):
+                    provider_config = getattr(providers, provider)
+                    if hasattr(provider_config, 'apiKey'):
+                        api_key = provider_config.apiKey
+                        if api_key and isinstance(api_key, str) and api_key.strip():
+                            return True
+    except Exception as e:
+        # Don't fail if config loading fails; just fallback to env vars only
+        logger.debug(f"Failed to check API key in config for {provider}: {e}")
+    
+    return False
+
+
+def _get_api_key(provider: str) -> str | None:
+    """Get API key for the given provider.
+    
+    Checks in order (mirrors TS getApiKey behavior):
+    1. Environment variables
+    2. openclaw.json models.providers[provider].apiKey
+    
+    Returns:
+        API key string or None if not found
+    """
+    # 1. Check environment variables
+    env_vars = PROVIDER_API_KEY_ENV_VARS.get(provider, [f"{provider.upper()}_API_KEY"])
+    for var in env_vars:
+        key = os.getenv(var)
+        if key:
+            return key
+    
+    # 2. Check openclaw.json config
+    try:
+        from openclaw.config.loader import load_config
+        cfg = load_config()
+        
+        if hasattr(cfg, 'models') and cfg.models:
+            models_cfg = cfg.models
+            if hasattr(models_cfg, 'providers') and models_cfg.providers:
+                providers = models_cfg.providers
+                # Handle both dict and object access
+                if isinstance(providers, dict):
+                    provider_config = providers.get(provider)
+                    if isinstance(provider_config, dict):
+                        api_key = provider_config.get('apiKey')
+                        if api_key and isinstance(api_key, str):
+                            return api_key.strip() or None
+                elif hasattr(providers, provider):
+                    provider_config = getattr(providers, provider)
+                    if hasattr(provider_config, 'apiKey'):
+                        api_key = provider_config.apiKey
+                        if api_key and isinstance(api_key, str):
+                            return api_key.strip() or None
+    except Exception as e:
+        logger.debug(f"Failed to get API key from config for {provider}: {e}")
+    
+    return None
 
 
 def _create_forward_compat_model(provider: str, model_id: str) -> Model:

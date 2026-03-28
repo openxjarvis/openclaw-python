@@ -35,7 +35,7 @@ SILENT_REPLY_TOKEN = "[[silent]]"
 class QueuedMessage:
     """A single outbound message waiting to be delivered."""
 
-    kind: str  # "tool_result" | "block" | "final"
+    kind: str  # "tool" | "block" | "final"
     content: str
     metadata: dict[str, Any] = field(default_factory=dict)
     tool_call_id: str | None = None
@@ -120,7 +120,7 @@ class ReplyDispatcher:
 
     async def send_tool_result(self, tool_call_id: str, result: str) -> None:
         """Enqueue a tool-result message.  Mirrors TS ``sendToolResult``."""
-        await self._enqueue(QueuedMessage(kind="tool_result", content=result, tool_call_id=tool_call_id))
+        await self._enqueue(QueuedMessage(kind="tool", content=result, tool_call_id=tool_call_id))
 
     async def send_block_reply(self, payload: "ReplyPayload | str", metadata: dict[str, Any] | None = None) -> None:
         """Send a streaming block reply.
@@ -200,7 +200,7 @@ class ReplyDispatcher:
 
     def get_queued_counts(self) -> dict[str, int]:
         """Return counts per kind.  Mirrors TS ``getQueuedCounts``."""
-        counts: dict[str, int] = {"tool_result": 0, "block": 0, "final": 0}
+        counts: dict[str, int] = {"tool": 0, "block": 0, "final": 0}
         # Iterate current queue snapshot
         items = list(self._queue._queue)  # type: ignore[attr-defined]
         for msg in items:

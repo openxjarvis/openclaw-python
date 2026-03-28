@@ -91,7 +91,8 @@ def resolve_sandbox_scope_key(scope: str, session_key: str) -> str:
     if scope == "shared":
         return "shared"
     if scope == "agent":
-        return session_key.split(":")[0] or session_key
+        agent_id = session_key.split(":")[0] or "main"
+        return f"agent:{agent_id}"
     # scope == "session" (default)
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in session_key)
     return safe[:64] or "default"
@@ -102,7 +103,7 @@ def resolve_sandbox_workspace_dir(workspace_root: str, scope_key: str) -> str:
 
     Mirrors TS ``resolveSandboxWorkspaceDir()``.
     """
-    return str(Path(workspace_root) / "workspaces" / scope_key)
+    return str(Path(workspace_root) / scope_key)
 
 
 # ---------------------------------------------------------------------------
@@ -134,9 +135,9 @@ async def resolve_sandbox_context(
         logger.debug("Sandbox mode is 'off'; skipping sandbox context resolution")
         return None
 
-    # Resolve workspace paths
-    scope = sandbox_cfg.get("scope", "session")
-    workspace_access = sandbox_cfg.get("workspaceAccess", "rw")
+    # Resolve workspace paths (defaults aligned with TS config.ts)
+    scope = sandbox_cfg.get("scope", "agent")
+    workspace_access = sandbox_cfg.get("workspaceAccess", "none")
     workspace_root = sandbox_cfg.get("workspaceRoot", _DEFAULT_WORKSPACE_ROOT)
 
     agent_workspace_dir = str(
@@ -164,7 +165,7 @@ async def resolve_sandbox_context(
         memory=docker_section.get("memory"),
         cpus=docker_section.get("cpus"),
         workspace_access=workspace_access,
-        network_mode=docker_section.get("network", "bridge"),
+        network_mode=docker_section.get("network", "none"),
         env=docker_section.get("env", {}),
         volumes=docker_section.get("volumes", {}),
     )
@@ -224,8 +225,8 @@ async def get_sandbox_workspace_info(
     if sandbox_cfg.get("mode", "off") == "off":
         return None
 
-    scope = sandbox_cfg.get("scope", "session")
-    workspace_access = sandbox_cfg.get("workspaceAccess", "rw")
+    scope = sandbox_cfg.get("scope", "agent")
+    workspace_access = sandbox_cfg.get("workspaceAccess", "none")
     workspace_root = sandbox_cfg.get("workspaceRoot", _DEFAULT_WORKSPACE_ROOT)
     docker_section = sandbox_cfg.get("docker", {})
     container_workdir = docker_section.get("workdir", SANDBOX_AGENT_WORKSPACE_MOUNT)

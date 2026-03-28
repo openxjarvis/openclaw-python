@@ -533,6 +533,7 @@ from .daemon_cmd import daemon_app
 from .dns_cmd import dns_app
 from .devices_cmd import devices_app
 from .update_cmd import update_app
+from .sessions_cmd import app as sessions_app
 from .misc_cmd import register_misc_commands
 
 app.add_typer(gateway_app, name="gateway")
@@ -563,6 +564,7 @@ app.add_typer(daemon_app, name="daemon")
 app.add_typer(dns_app, name="dns")
 app.add_typer(devices_app, name="devices")
 app.add_typer(update_app, name="update")
+app.add_typer(sessions_app, name="sessions")
 
 # Note: pairing_app already added above with channels
 # Register misc commands (tui, update, onboard, setup, configure, etc)

@@ -910,6 +910,7 @@ class ChatSendMethod:
                 system_prompt=system_prompt,
                 session_key=session_key,
                 run_id=run_id,
+                streaming_behavior="followUp",  # Queue if agent is already processing
             ):
                 evt_type = getattr(event, "type", "")
                 event_data: dict[str, Any] = {}

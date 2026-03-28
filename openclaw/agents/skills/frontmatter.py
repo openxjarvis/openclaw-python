@@ -15,6 +15,7 @@ from .types import (
     OpenClawSkillMetadata,
     SkillInstallSpec,
     SkillInvocationPolicy,
+    SkillRequires,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,26 +66,64 @@ def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
 def parse_openclaw_metadata(frontmatter: dict[str, Any]) -> OpenClawSkillMetadata | None:
     """
     Extract OpenClaw metadata from frontmatter (matches TS resolveOpenClawMetadata).
-    
+
+    Supports two frontmatter layouts:
+
+    1. Top-level ``openclaw:`` block (canonical):
+       ```yaml
+       openclaw:
+         always: true
+       ```
+
+    2. Nested ``metadata.openclaw`` block (used by some skills, e.g. pptx):
+       ```yaml
+       metadata:
+         openclaw:
+           always: true
+       ```
+
+    TS equivalent: resolveOpenClawManifestBlock({ frontmatter }) which reads
+    the ``metadata`` field as a JSON5 string and extracts the ``openclaw`` key.
+    In Python, YAML already parses ``metadata`` as a native dict, so we just
+    access ``frontmatter["metadata"]["openclaw"]`` directly.
+
     Args:
         frontmatter: Parsed frontmatter dictionary
-    
+
     Returns:
         OpenClawSkillMetadata or None
     """
-    openclaw = frontmatter.get("openclaw", {})
-    
+    # Layout 1: top-level ``openclaw:`` (most common)
+    openclaw = frontmatter.get("openclaw")
+
+    # Layout 2: ``metadata.openclaw`` (e.g. pptx skill)
+    if not openclaw:
+        metadata_block = frontmatter.get("metadata")
+        if isinstance(metadata_block, dict):
+            openclaw = metadata_block.get("openclaw")
+        elif isinstance(metadata_block, str):
+            # Rare: metadata stored as JSON/JSON5 string — try to parse it
+            try:
+                import json as _json
+                parsed = _json.loads(metadata_block)
+                if isinstance(parsed, dict):
+                    openclaw = parsed.get("openclaw")
+            except Exception:
+                pass
+
     if not openclaw or not isinstance(openclaw, dict):
         return None
     
     # Parse requires section
     requires_raw = openclaw.get("requires", {})
-    requires = {}
+    requires: SkillRequires | None = None
     if isinstance(requires_raw, dict):
-        for key in ["bins", "anyBins", "env", "config"]:
-            value = requires_raw.get(key, [])
-            if value:
-                requires[key] = normalize_string_list(value)
+        requires = SkillRequires(
+            bins=normalize_string_list(requires_raw.get("bins", [])),
+            any_bins=normalize_string_list(requires_raw.get("anyBins", []) or requires_raw.get("any_bins", [])),
+            env=normalize_string_list(requires_raw.get("env", [])),
+            config=normalize_string_list(requires_raw.get("config", [])),
+        )
     
     # Parse install specs
     install_raw = openclaw.get("install", [])

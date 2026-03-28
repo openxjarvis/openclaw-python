@@ -531,12 +531,9 @@ def evaluate_session_freshness(
     """
     Evaluate if a session should be reset based on freshness policy.
 
-    Matches TypeScript evaluateSessionFreshness().
-
-    Policies:
-    - "daily": Reset if last activity > 24h ago
-    - "idle": Reset if idle for configured duration (default 4h)
-    - None / "off": Never reset
+    Thin wrapper that delegates to the canonical implementation in
+    ``openclaw.agents.session_store.evaluate_session_freshness`` (which has
+    full TS parity including daily-reset-at-hour semantics).
 
     Args:
         last_activity_ms: Timestamp of last activity in milliseconds (Unix epoch).
@@ -548,20 +545,27 @@ def evaluate_session_freshness(
     """
     import time
 
+    from openclaw.agents.session_store import (
+        SessionResetPolicy,
+        evaluate_session_freshness as _evaluate,
+    )
+
     if not reset_policy or reset_policy == "off":
         return False
 
     if last_activity_ms is None:
         return False
 
+    idle_minutes: int | None = None
+    if idle_duration_ms is not None:
+        idle_minutes = max(1, idle_duration_ms // 60_000)
+    elif reset_policy == "idle":
+        idle_minutes = 240  # 4 hours default
+
+    policy = SessionResetPolicy(
+        mode=reset_policy,
+        idle_minutes=idle_minutes,
+    )
     now_ms = int(time.time() * 1000)
-    elapsed_ms = now_ms - last_activity_ms
-
-    if reset_policy == "daily":
-        return elapsed_ms > 24 * 60 * 60 * 1000  # 24 hours
-
-    if reset_policy == "idle":
-        threshold = idle_duration_ms if idle_duration_ms is not None else 4 * 60 * 60 * 1000  # 4 hours
-        return elapsed_ms > threshold
-
-    return False
+    result = _evaluate(last_activity_ms, now_ms, policy)
+    return not result.fresh

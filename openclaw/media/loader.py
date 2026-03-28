@@ -223,6 +223,15 @@ async def load_web_media(
     if scheme in ("", "file") or url_or_path.startswith("/"):
         path_str = unquote(url_or_path.replace("file://", ""))
         path = Path(path_str)
+        
+        # ✅ FIX: Resolve relative paths against workspace_root
+        # Mirrors TS behavior where relative paths are resolved against session workspace.
+        # If path is relative and workspace_root is provided, resolve it first.
+        if not path.is_absolute() and workspace_root:
+            path = (Path(workspace_root) / path).resolve()
+        elif not path.is_absolute():
+            # No workspace_root provided - resolve against CWD
+            path = path.resolve()
 
         # Assert local media is allowed (mirrors TS lines 81-138 in src/web/media.ts)
         if not sandbox_validated:

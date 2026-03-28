@@ -518,6 +518,11 @@ class GatewayServer:
         self.active_runs: dict[str, asyncio.Task] = {}  # Track active agent runs for abort
         self.auth_rate_limiter = AuthRateLimiter(limit=8, window_ms=60_000)
         
+        # Agent event tracking (mirrors TS createAgentEventHandler state)
+        self._agent_run_seq: dict[str, int] = {}  # Per-run seq tracking for gap detection
+        self._tool_event_recipients: dict[str, set[str]] = {}  # Tool event connection tracking
+        self._chat_accumulator: dict[str, str] = {}  # Accumulate chat text per runId
+        
         # Initialize memory manager (lazy initialization)
         self._memory_manager = None
         self._sync_manager = None  # SyncManager started alongside memory manager
@@ -575,6 +580,11 @@ class GatewayServer:
         if agent_runtime:
             agent_runtime.add_event_listener(self.on_agent_event)
             logger.info("Gateway registered as Agent Runtime observer")
+        
+        # Subscribe to infra/agent_events for TS-compatible event handling
+        from openclaw.infra.agent_events import on_agent_event as subscribe_infra_events
+        self._infra_unsub = subscribe_infra_events(self._on_infra_agent_event)
+        logger.info("Gateway subscribed to infra/agent_events")
 
         # Listen for channel events to broadcast
         self.channel_manager.add_event_listener(self._on_channel_event)
@@ -619,15 +629,179 @@ class GatewayServer:
     async def on_agent_event(self, event: Event):
         """
         Observer callback: Agent Runtime automatically calls this for every event
+        
+        This is the OLD event system (Event objects). For TS compatibility,
+        the main handling is now in _on_infra_agent_event which receives
+        dict events with runId/stream/seq structure.
 
-        This implements the Observer Pattern where Gateway passively receives
-        events instead of channels actively pushing to Gateway.
-
+        This method is kept for backward compatibility with old Event listeners.
+        
         Args:
             event: Unified Event from Agent Runtime
         """
         # Broadcast to all WebSocket clients using standardized format
         await self.broadcast_event("agent", event.to_dict())
+    
+    def _on_infra_agent_event(self, event: dict[str, Any]) -> None:
+        """
+        Handle agent events from infra/agent_events layer.
+        
+        This is a SYNCHRONOUS callback that gets called from emit_agent_event.
+        It mirrors TS createAgentEventHandler logic from openclaw/src/gateway/server-chat.ts:450-562
+        
+        We spawn an async task to handle the actual event processing.
+        
+        Args:
+            event: Agent event dict with TS structure: {runId, seq, stream, ts, data, sessionKey}
+        """
+        # Spawn async task to handle event (can't await in sync callback)
+        asyncio.create_task(self._handle_infra_agent_event_async(event))
+    
+    async def _handle_infra_agent_event_async(self, event: dict[str, Any]) -> None:
+        """
+        Async handler for infra agent events.
+        
+        Implements full TS createAgentEventHandler logic:
+        1. Seq gap detection
+        2. Tool event routing
+        3. Chat event synthesis
+        4. Node forwarding
+        5. Cleanup on lifecycle end
+        
+        Reference: openclaw/src/gateway/server-chat.ts:450-562
+        """
+        run_id = event.get("runId", "")
+        seq = event.get("seq", 0)
+        stream = event.get("stream", "")
+        session_key = event.get("sessionKey")
+        ts = event.get("ts", int(time.time() * 1000))
+        data = event.get("data", {})
+        
+        # 1. Seq gap detection (mirrors TS lines 463-514)
+        last_seq = self._agent_run_seq.get(run_id, 0)
+        if seq != last_seq + 1 and last_seq != 0:  # Skip gap check for first event
+            gap_event = {
+                "runId": run_id,
+                "stream": "error",
+                "ts": int(time.time() * 1000),
+                "sessionKey": session_key,
+                "seq": seq,
+                "data": {
+                    "reason": "seq gap",
+                    "expected": last_seq + 1,
+                    "received": seq,
+                }
+            }
+            await self.broadcast_event("agent", gap_event)
+            logger.warning(f"Seq gap detected for run {run_id[:8]}: expected {last_seq + 1}, got {seq}")
+        
+        self._agent_run_seq[run_id] = seq
+        
+        # 2. Tool event handling (mirrors TS tool routing and verbose control)
+        is_tool_event = stream == "tool"
+        if is_tool_event:
+            # Get verbose level from run context
+            from openclaw.infra.agent_events import get_agent_run_context
+            context = get_agent_run_context(run_id)
+            verbose_level = context.get("verbose_level", "full") if context else "full"
+            
+            # Apply verbose filtering (mirrors TS tool result filtering)
+            if verbose_level in ("off", "summary"):
+                # Remove or truncate detailed results
+                if "result" in data:
+                    # Keep a summary, hide full result
+                    data = {**data, "result": "[Result hidden - verbose mode: {}]".format(verbose_level)}
+                if "partialResult" in data:
+                    data = {**data, "partialResult": "[Result hidden]"}
+                
+                # Rebuild event with filtered data
+                event = {**event, "data": data}
+            
+            # TODO: Implement tool event recipients tracking for per-connection routing
+            # This would require tracking which connections requested the tool
+            # For now, broadcast to all connections
+        
+        # 3. Broadcast agent event
+        await self.broadcast_event("agent", event)
+        
+        # 4. Chat event synthesis for assistant stream (mirrors TS lines 539-555)
+        if session_key and stream == "assistant":
+            text = data.get("text", "")
+            if text:
+                await self._emit_chat_delta(session_key, run_id, seq, text)
+        
+        # 5. Lifecycle end/error handling (mirrors TS lines 558-561)
+        lifecycle_phase = data.get("phase") if stream == "lifecycle" else None
+        if lifecycle_phase in ("end", "error"):
+            if session_key and stream == "lifecycle":
+                await self._emit_chat_final(session_key, run_id)
+            
+            # Cleanup
+            self._agent_run_seq.pop(run_id, None)
+            self._tool_event_recipients.pop(run_id, None)
+            self._chat_accumulator.pop(run_id, None)
+        
+        # 6. Node forwarding (mirrors TS nodeSendToSession)
+        if session_key and self.node_subscription_manager:
+            await self.node_subscription_manager.send_to_session(
+                session_key,
+                "agent",  # TS uses "agent" not "agent.event"
+                event
+            )
+    
+    async def _emit_chat_delta(self, session_key: str, run_id: str, seq: int, text: str) -> None:
+        """
+        Emit chat delta event for streaming text.
+        
+        Mirrors TS emitChatDelta from server-chat.ts
+        """
+        # Accumulate text for this run
+        if run_id not in self._chat_accumulator:
+            self._chat_accumulator[run_id] = ""
+        self._chat_accumulator[run_id] += text
+        
+        chat_event = {
+            "runId": run_id,
+            "seq": seq,
+            "sessionKey": session_key,
+            "text": text,
+            "delta": True,
+            "ts": int(time.time() * 1000)
+        }
+        await self.broadcast_event("chat", chat_event)
+        
+        # Also send to nodes
+        if self.node_subscription_manager:
+            await self.node_subscription_manager.send_to_session(
+                session_key,
+                "chat",
+                chat_event
+            )
+    
+    async def _emit_chat_final(self, session_key: str, run_id: str) -> None:
+        """
+        Emit chat final event to mark end of streaming.
+        
+        Mirrors TS emitChatFinal from server-chat.ts
+        """
+        accumulated_text = self._chat_accumulator.get(run_id, "")
+        
+        final_event = {
+            "runId": run_id,
+            "sessionKey": session_key,
+            "text": accumulated_text,
+            "final": True,
+            "ts": int(time.time() * 1000)
+        }
+        await self.broadcast_event("chat", final_event)
+        
+        # Also send to nodes
+        if self.node_subscription_manager:
+            await self.node_subscription_manager.send_to_session(
+                session_key,
+                "chat",
+                final_event
+            )
 
     async def handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
         """Handle WebSocket upgrade and connection (aiohttp)"""

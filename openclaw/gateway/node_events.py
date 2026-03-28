@@ -174,18 +174,20 @@ class NodeEventHandler:
         model: str | None,
         images: list | None,
     ) -> None:
-        """Run agent turn and send events back to the requesting node."""
+        """Run agent turn and send events back to the requesting node.
+        
+        Note: Events are now automatically forwarded to subscribed nodes via
+        Gateway._handle_infra_agent_event_async, so we don't need to manually
+        send them here. We just run the agent turn.
+        """
         session_key = getattr(session, "session_id", "") or ""
         try:
             async for event in self._agent_runtime.run_turn(
                 session, message, model=model, images=images
             ):
-                if self._subscription_manager is not None:
-                    await self._subscription_manager.send_to_session(
-                        session_key,
-                        "agent.event",
-                        {"event": event.__dict__ if hasattr(event, "__dict__") else str(event)},
-                    )
+                # Events are automatically forwarded via infra/agent_events subscription
+                # No need to manually send here - this was causing duplicate events
+                pass
         except Exception as exc:
             logger.error(f"Agent run for node {node_id!r} failed: {exc}", exc_info=True)
 

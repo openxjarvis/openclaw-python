@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Awaitable
 
 from openclaw.markdown.fences import parse_fence_spans, is_safe_fence_break
@@ -31,6 +30,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_BLOCK_STREAM_MIN = 800
 DEFAULT_BLOCK_STREAM_MAX = 1200
 DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS = 1000
+BLOCK_REPLY_SEND_TIMEOUT_MS = 15000
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +95,7 @@ class BlockReplyCoalescer:
         self._cfg = config
         self._on_flush = on_flush
         self._buffer = ""
+        self._joiner = config.joiner
         self._idle_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
@@ -102,7 +103,10 @@ class BlockReplyCoalescer:
         """Push a text chunk into the accumulation buffer."""
         async with self._lock:
             self._cancel_idle()
-            self._buffer += text
+            if self._buffer and self._joiner:
+                self._buffer += self._joiner + text
+            else:
+                self._buffer += text
 
             # Max-chars hard flush
             while len(self._buffer) >= self._cfg.max_chars:
@@ -200,20 +204,42 @@ class BlockStreamingPipeline:
         cfg: BlockStreamingConfig,
         on_block: Callable[[str], Awaitable[None]],
     ) -> None:
+        self._aborted: bool = False
+        self._did_stream: bool = False
+
+        timeout_s = BLOCK_REPLY_SEND_TIMEOUT_MS / 1000
+
+        async def _guarded_send(text: str) -> None:
+            if self._aborted:
+                return
+            try:
+                await asyncio.wait_for(on_block(text), timeout=timeout_s)
+                self._did_stream = True
+            except asyncio.TimeoutError:
+                logger.warning("Block send timed out after %dms — aborting pipeline",
+                               BLOCK_REPLY_SEND_TIMEOUT_MS)
+                self._aborted = True
+
         # Use provided coalesce_config or create from chunk_config
         if cfg.coalesce_config:
             coalesce_cfg = cfg.coalesce_config
         elif cfg.chunk_config:
+            joiner = {
+                "sentence": " ",
+                "newline": "\n",
+                "paragraph": "\n\n",
+            }.get(cfg.chunk_config.break_preference, "\n")
             coalesce_cfg = BlockStreamingCoalesceConfig(
                 min_chars=cfg.chunk_config.min_chars,
                 max_chars=cfg.chunk_config.max_chars,
                 idle_ms=DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS,
-                flush_on_enqueue=cfg.chunk_config.break_preference == "paragraph",
+                joiner=joiner,
+                flush_on_enqueue=cfg.chunk_config.break_preference == "newline",
             )
         else:
             coalesce_cfg = BlockStreamingCoalesceConfig()
-        
-        self._coalescer = BlockReplyCoalescer(coalesce_cfg, on_block)
+
+        self._coalescer = BlockReplyCoalescer(coalesce_cfg, _guarded_send)
         self._enabled = cfg.enabled
         self._block_count = 0
 
@@ -221,14 +247,22 @@ class BlockStreamingPipeline:
     def block_count(self) -> int:
         return self._block_count
 
+    @property
+    def is_aborted(self) -> bool:
+        return self._aborted
+
+    @property
+    def did_stream(self) -> bool:
+        return self._did_stream
+
     async def push(self, text: str) -> None:
-        if not self._enabled or not text:
+        if not self._enabled or not text or self._aborted:
             return
         self._block_count += 1
         await self._coalescer.push(text)
 
     async def finish(self) -> None:
-        if not self._enabled:
+        if not self._enabled or self._aborted:
             return
         await self._coalescer.flush_final()
 
@@ -314,10 +348,12 @@ def resolve_block_streaming_config(
     
     coalesce_config = None
     if coalesce_raw:
+        idle_ms = int(coalesce_raw.get("idleMs", DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS))
+        idle_ms = min(idle_ms, 5000)
         coalesce_config = BlockStreamingCoalesceConfig(
             min_chars=int(coalesce_raw.get("minChars", DEFAULT_BLOCK_STREAM_MIN)),
             max_chars=int(coalesce_raw.get("maxChars", DEFAULT_BLOCK_STREAM_MAX)),
-            idle_ms=int(coalesce_raw.get("idleMs", DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS)),
+            idle_ms=idle_ms,
             joiner=coalesce_raw.get("joiner", "\n"),
             flush_on_enqueue=bool(coalesce_raw.get("flushOnEnqueue", False)),
         )

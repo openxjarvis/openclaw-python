@@ -1,5 +1,13 @@
 """Session configuration store."""
 
+import warnings
+
+warnings.warn(
+    "openclaw.config.sessions.store is a stub. Use openclaw.config.sessions.store_utils instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 from typing import Any, Dict, Optional
 
 

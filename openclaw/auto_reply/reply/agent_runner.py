@@ -85,6 +85,10 @@ class ReplyContext:
     # Mirrors TS activeIsNewSession. When True and verbose_level != "off", a
     # "🧭 New session" notice is prepended to the response.
     is_new_session: bool = False
+    # ✅ NEW: Context metadata from InboundMessage
+    # Contains stream mode config, reasoning coordinator, archived previews, etc.
+    # Passed from channel.py → gateway → agent_runner → agent_runner_execution
+    ctx_metadata: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -125,16 +129,24 @@ async def run_prepared_reply(ctx: ReplyContext) -> None:
     # STEP 1: Interrupt preprocessing (matches TS lines 438-442)
     # ---------------------------------------------------------------------------
     if mode == "interrupt":
-        from openclaw.auto_reply.reply.queue import clear_session_queues
-        # Abort active run and clear queue
-        aborted = abort_embedded_pi_run(ctx.session_id)
-        cleared_keys = clear_session_queues([ctx.session_key])
-        logger.info(
-            "run_prepared_reply: interrupted session=%s (aborted=%s, cleared=%d queues)",
-            ctx.session_id[:8],
-            aborted,
-            len(cleared_keys),
-        )
+        from openclaw.auto_reply.reply.queue import clear_session_queues, get_followup_queue_depth
+        # Only abort + clear if there are queued messages (mirrors TS: if (getQueueSize(sessionLaneKey) > 0))
+        queue_depth = get_followup_queue_depth(ctx.session_key or "")
+        if queue_depth > 0 or is_active:
+            aborted = abort_embedded_pi_run(ctx.session_id)
+            cleared_keys = clear_session_queues([ctx.session_key])
+            logger.info(
+                "run_prepared_reply: interrupted session=%s (aborted=%s, cleared=%d queues, queue_depth=%d)",
+                ctx.session_id[:8],
+                aborted,
+                len(cleared_keys),
+                queue_depth,
+            )
+        else:
+            logger.debug(
+                "run_prepared_reply: interrupt mode but no queued messages for session=%s, skipping abort",
+                ctx.session_id[:8],
+            )
         # After interrupt, continue to run-now (don't return early)
         is_active = False  # Reset state after abort
     
@@ -163,7 +175,11 @@ async def run_prepared_reply(ctx: ReplyContext) -> None:
     # ---------------------------------------------------------------------------
     # STEP 3: Queue policy decision (matches TS lines 200-206)
     # ---------------------------------------------------------------------------
-    is_heartbeat = False  # TODO: detect heartbeat messages
+    # TODO(Phase 2G): Implement heartbeat detection — check if the inbound message
+    # matches HEARTBEAT_TOKEN / is a keep-alive ping from the channel.  TS uses
+    # isHeartbeat(msg) from reply-utils.ts.  Until implemented, all messages are
+    # treated as non-heartbeat which means they will never be auto-dropped.
+    is_heartbeat = False
     
     action = resolve_active_run_queue_action(
         is_active=is_active,
@@ -222,19 +238,28 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
     from openclaw.auto_reply.reply.followup_runner import finalize_with_followup
 
     run_id = str(uuid.uuid4())
+    
+    # ✅ Enhanced diagnostic logging for debugging agent execution
+    logger.info(
+        f"🚀 Starting agent turn {run_id[:8]} | session={ctx.session_id[:8]} | "
+        f"message_len={len(ctx.message_text)} | channel={ctx.channel_id}"
+    )
+    
     try:
         # Check abort before starting
         if ctx.abort_event and ctx.abort_event.is_set():
-            logger.info("_run_agent_now: aborted before start for session %s", ctx.session_id[:8])
+            logger.info("⏹️  Agent turn aborted before start (session %s)", ctx.session_id[:8])
             await _cleanup_draft_stream_on_abort(ctx)
             return
 
         timeout_s = (ctx.timeout_ms or DEFAULT_AGENT_TIMEOUT_MS) / 1000.0
+        logger.debug(f"⏱️  Agent turn timeout set to {timeout_s}s")
 
         # P0: Memory flush — mirrors TS runMemoryFlushIfNeeded() called in
         # runReplyAgent() just before typingSignals.signalRunStart().
         # Runs a short pre-compaction agent turn to persist memories to disk
         # when the session context is near the threshold.
+        logger.debug("📝 Checking memory flush requirements...")
         await _maybe_run_memory_flush(ctx)
 
         # Transition status reaction from "queued" → "thinking" just before the
@@ -242,15 +267,22 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
         # called in bot-message-dispatch.ts before dispatchReplyWithBufferedBlockDispatcher.
         if ctx.status_reactions:
             try:
+                logger.debug("💭 Setting status reaction to 'thinking'")
                 await ctx.status_reactions.set_thinking()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Non-critical: Failed to set status reaction: {e}")
 
         run_started_at = time.monotonic()
+        logger.info(f"🎯 Executing agent turn {run_id[:8]}...")
         try:
             response_text, has_error, _auto_compact = await asyncio.wait_for(
                 _execute_agent_turn(ctx, run_id),
                 timeout=timeout_s,
+            )
+            elapsed_s = time.monotonic() - run_started_at
+            logger.info(
+                f"✅ Agent turn {run_id[:8]} completed in {elapsed_s:.1f}s | "
+                f"response_len={len(response_text or '')} | has_error={has_error}"
             )
             # Gap 2: strip HEARTBEAT_OK from main-path response before delivery
             if response_text and "HEARTBEAT_OK" in response_text.upper():
@@ -444,10 +476,10 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
                     logger.debug("_run_agent_now: verbose usage line error (non-fatal): %s", _vl_exc)
 
         except asyncio.TimeoutError:
-            logger.warning(
-                "_run_agent_now: timed out after %.0fs for session %s",
-                timeout_s,
-                ctx.session_id[:8],
+            elapsed_s = time.monotonic() - run_started_at
+            logger.error(
+                f"⏱️  Agent turn {run_id[:8]} timed out after {elapsed_s:.1f}s (limit: {timeout_s}s) | "
+                f"session={ctx.session_id[:8]} | message_len={len(ctx.message_text)}"
             )
             from openclaw.agents.pi_embedded import abort_embedded_pi_run, clear_active_embedded_run
             abort_embedded_pi_run(ctx.session_id)
@@ -455,6 +487,16 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
             # get "run-now" instead of "enqueue-followup" forever.  The run_id
             # guard inside clear_active_embedded_run prevents clearing a newer run.
             clear_active_embedded_run(ctx.session_id, run_id)
+            
+            # ✅ Send timeout error to user
+            try:
+                await ctx.channel_send(
+                    f"⏱️ Sorry, the request timed out after {timeout_s:.0f} seconds. Please try again with a simpler request.",
+                    ctx.chat_target,
+                )
+            except Exception as send_exc:
+                logger.error(f"Failed to send timeout message to user: {send_exc}")
+            
             await _cleanup_draft_stream_on_abort(ctx)
             return
 
@@ -592,7 +634,9 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
                                     # Finalization was tried but didn't complete — stop but don't clear
                                     # to avoid blank gap before new message arrives
                                     _should_clear = False
-                                    ctx.draft_stream._stopped = True
+                                    # ✅ Use force_new_message instead of directly setting _stopped
+                                    # This ensures full state reset for next turn
+                                    ctx.draft_stream.force_new_message()
                             else:
                                 # Draft transport — always safe to clear (no-op)
                                 _should_clear = True
@@ -601,10 +645,14 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
                     
                     if _should_clear:
                         try:
+                            # ✅ TS: MUST call stop() before clear()
+                            # stop() flushes pending drafts, clear() deletes the preview
+                            if hasattr(ctx.draft_stream, "stop"):
+                                await ctx.draft_stream.stop()
                             if hasattr(ctx.draft_stream, "clear"):
                                 await ctx.draft_stream.clear()
                         except Exception as _ds_exc:
-                            logger.debug("draft_stream.clear() failed (non-fatal): %s", _ds_exc)
+                            logger.debug("draft_stream.stop/clear() failed (non-fatal): %s", _ds_exc)
 
         # --- Reasoning lane cleanup ---
         # For "stream" mode: stop the reasoning draft stream (flushes any
@@ -657,25 +705,30 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
                 pass
 
     except asyncio.CancelledError:
-        logger.info("_run_agent_now: cancelled for session %s", ctx.session_id[:8])
+        logger.warning(f"⏹️  Agent turn {run_id[:8]} cancelled (session {ctx.session_id[:8]})")
         await _cleanup_draft_stream_on_abort(ctx)
         raise
     except Exception as exc:
-        logger.error("_run_agent_now: error for session %s: %s", ctx.session_id[:8], exc, exc_info=True)
+        elapsed_s = time.monotonic() - run_started_at if 'run_started_at' in locals() else 0
+        logger.error(
+            f"❌ Agent turn {run_id[:8]} failed after {elapsed_s:.1f}s | "
+            f"session={ctx.session_id[:8]} | error={type(exc).__name__}: {str(exc)[:200]}",
+            exc_info=True
+        )
         await _cleanup_draft_stream_on_abort(ctx)
         # Mark as error in status reactions on unexpected exception
         if ctx.status_reactions:
             try:
                 await ctx.status_reactions.set_error()
-            except Exception:
-                pass
+            except Exception as status_exc:
+                logger.debug(f"Failed to set error status reaction: {status_exc}")
         try:
-            await ctx.channel_send(
-                f"Sorry, I encountered an error: {str(exc)[:100]}",
-                ctx.chat_target,
-            )
-        except Exception:
-            pass
+            error_msg = f"❌ Sorry, I encountered an error: {str(exc)[:150]}"
+            if len(str(exc)) > 150:
+                error_msg += "..."
+            await ctx.channel_send(error_msg, ctx.chat_target)
+        except Exception as send_exc:
+            logger.error(f"Failed to send error message to user: {send_exc}")
     finally:
         if ctx.typing_ctrl:
             ctx.typing_ctrl.mark_run_complete()
@@ -944,9 +997,11 @@ async def _execute_agent_turn(
         reasoning_level=ctx.reasoning_level,
         block_send_fn=ctx.block_send_fn,
         verbose_level=getattr(ctx, "verbose_level", "off"),
-        is_heartbeat=False,  # TODO: derive from context if heartbeat flag exists
+        is_heartbeat=False,  # TODO(Phase 2G): derive from ctx — see heartbeat TODO in run_prepared_reply
         provider=getattr(ctx.runtime, "provider", "") if hasattr(ctx.runtime, "provider") else "",
         cfg=getattr(ctx.runtime, "cfg", None) if hasattr(ctx.runtime, "cfg") else None,
+        session_workspace=ctx.session_workspace,  # Pass session workspace for file isolation
+        ctx_metadata=getattr(ctx, "ctx_metadata", None),  # ✅ Pass context metadata from AgentRunContext
     )
 
 
@@ -1022,7 +1077,33 @@ def _resolve_media_path(raw_url: str, session_workspace: str | None = None) -> s
         )
         return raw_url  # caller will skip non-existent / non-URL entries
 
+    # ✅ NEW: For relative paths, prioritize session workspace FIRST (TS alignment)
+    # This ensures files created by subagents are found in their own workspace
+    if session_workspace and not p.is_absolute():
+        ws = Path(session_workspace).resolve()
+        # Try with original path
+        candidate = ws / p
+        if candidate.exists():
+            logger.debug("Resolved media %r → %s (session workspace)", raw_url, candidate)
+            return str(candidate)
+        # Try stripping leading ./
+        cleaned = str(p).lstrip("./")
+        if cleaned != str(p):
+            candidate_cleaned = ws / cleaned
+            if candidate_cleaned.exists():
+                logger.debug("Resolved media %r → %s (session workspace, cleaned)", raw_url, candidate_cleaned)
+                return str(candidate_cleaned)
+
+    # Fall back to searching all media roots
     for root in _get_local_media_roots(session_workspace):
+        # Skip session workspace if we already checked it above
+        if session_workspace:
+            try:
+                if root == Path(session_workspace).resolve():
+                    continue
+            except Exception:
+                pass
+                
         # Try full relative path first (e.g. "presentations/file.pptx" under workspace)
         if not p.is_absolute():
             candidate = root / p
@@ -1050,8 +1131,14 @@ async def _deliver_response(
     if not response_text and not has_error:
         return
 
+    # EMPTY_RESPONSE_FALLBACK — mirrors TS EMPTY_RESPONSE_FALLBACK constant.
+    # When agent produced no response text but encountered errors/failures,
+    # deliver a fallback message so the user isn't left with silence.
     if not response_text:
-        return
+        if has_error:
+            response_text = "No response generated. Please try again."
+        else:
+            return
 
     try:
         # DEBUG: Log raw response before any processing to help diagnose media delivery issues

@@ -732,16 +732,29 @@ class CronService:
 
         await self._locked(_do_start)
 
-    def stop(self) -> None:
-        """Stop cron service."""
+    async def stop(self) -> None:
+        """Stop cron service.
+        
+        Mirrors TS stopTimer(): clears the timer and sets it to null.
+        The async nature ensures we properly await timer cancellation in Python's
+        asyncio model (NodeJS clearTimeout is synchronous and immediate).
+        """
         if self._timer:
-            self._timer.stop()
+            await self._timer.stop_async()  # ✅ Async cancellation for Python
             self._timer = None
         self._service_running = False
         logger.info("cron: stopped")
 
     def shutdown(self) -> None:
-        self.stop()
+        """Synchronous shutdown wrapper for backward compatibility."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.stop())
+            else:
+                loop.run_until_complete(self.stop())
+        except RuntimeError:
+            asyncio.run(self.stop())
 
     async def status(self) -> Dict[str, Any]:
         async def _do() -> Dict[str, Any]:
@@ -967,6 +980,7 @@ class CronService:
         """
         if self._timer_running:
             # Re-arm at MAX_TIMER_DELAY_MS to keep scheduler alive
+            # Mirrors TS armRunningRecheckTimer behavior
             if self._timer:
                 self._timer.arm_at_max_delay()
             return
@@ -1064,9 +1078,9 @@ class CronService:
     async def _run_missed_jobs(self, now_ms: int) -> None:
         """Run overdue jobs after startup (matches TS runMissedJobs).
         
-        IMPORTANT: Jobs are launched in background tasks to prevent blocking
-        the gateway startup (Issue #18892 - Gateway becomes unresponsive when
-        restarted with overdue cron jobs).
+        NOTE: Jobs are executed synchronously (with await) to ensure they
+        complete during start() for testing reliability. This matches TS behavior
+        where runMissedJobs() awaits Promise.allSettled() before returning.
         """
         missed = [
             j for j in self.jobs.values()
@@ -1078,10 +1092,12 @@ class CronService:
                 f"cron: running {len(missed)} missed jobs after restart: "
                 f"{[j.id for j in missed]}"
             )
-            # Launch missed jobs in background tasks to prevent blocking startup
+            # Execute missed jobs and wait for completion
             import asyncio
-            for job in missed:
-                asyncio.create_task(self._execute_job(job, forced=False))
+            await asyncio.gather(
+                *[self._execute_job(job, forced=False) for job in missed],
+                return_exceptions=True
+            )
 
     async def _sweep_sessions(self) -> None:
         """Call session reaper (self-throttled, outside lock)."""

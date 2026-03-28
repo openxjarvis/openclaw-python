@@ -834,21 +834,13 @@ def build_reasoning_format_section(
 def build_skills_section_workspace(
     workspace_dir: Path | None = None,
     config: Any | None = None,
-    read_tool_name: str = "read_file"
+    read_tool_name: str = "read",
 ) -> list[str]:
-    """
-    Build the Skills section dynamically from the workspace (runtime variant).
+    """Build the Skills section dynamically from the workspace.
 
-    Use build_skills_section(skills_prompt, is_minimal, read_tool_name) for the
-    TS section-builder API.
-
-    Args:
-        workspace_dir: Workspace directory
-        config: OpenClaw configuration
-        read_tool_name: Name of the read tool to reference
-    
-    Returns:
-        List of prompt lines for skills section
+    Loads skills via ``build_workspace_skills_prompt`` then wraps the result
+    with ``build_skills_section`` (which adds the ``## Skills (mandatory)``
+    header and usage instructions, matching TS ``buildSkillsSection``).
     """
     if not workspace_dir:
         return []
@@ -859,14 +851,17 @@ def build_skills_section_workspace(
         skills_prompt = build_workspace_skills_prompt(
             workspace_dir=workspace_dir,
             config=config,
-            read_tool_name=read_tool_name
+            read_tool_name=read_tool_name,
         )
         
-        if skills_prompt:
-            # Already formatted with ## Available Skills header
-            return [skills_prompt, ""]
+        if not skills_prompt or not skills_prompt.strip():
+            return []
         
-        return []
+        return build_skills_section(
+            skills_prompt=skills_prompt,
+            is_minimal=False,
+            read_tool_name=read_tool_name,
+        )
     
     except ImportError:
         logger.warning("Skills module not available")

@@ -35,6 +35,7 @@ from .nodes import NodesTool
 from .patch import ApplyPatchTool
 from .process import ProcessTool
 from .sessions import SessionsHistoryTool, SessionsListTool, SessionsSendTool, SessionsSpawnTool
+from .subagents import SubagentsTool
 from .tts import TTSTool
 from .voice_call import VoiceCallTool
 from .web import WebFetchTool, WebSearchTool
@@ -49,6 +50,7 @@ class ToolRegistry:
         channel_registry: Any | None = None,
         workspace_dir: Any | None = None,
         config: Any | None = None,
+        gateway: Any | None = None,  # ✅ New: Gateway reference for tools
         auto_register: bool = True,
     ):
         self._tools: dict[str, AgentTool] = {}
@@ -56,6 +58,7 @@ class ToolRegistry:
         self._channel_registry = channel_registry
         self._workspace_dir = workspace_dir
         self._config = config
+        self._gateway = gateway  # ✅ Store gateway reference
         if auto_register:
             self._register_default_tools()
 
@@ -116,7 +119,11 @@ class ToolRegistry:
                 ),
                 SessionsSpawnTool(
                     self._session_manager,
-                    gateway=getattr(self._session_manager, '_gateway', None)
+                    gateway=self._gateway
+                ),
+                SubagentsTool(
+                    agent_session_key=current_session_key,
+                    gateway=self._gateway,
                 ),
             ]:
                 self._tools[t.name] = t
@@ -160,6 +167,23 @@ class ToolRegistry:
         # Special features & patch tool
         for t in [NodesTool(), CanvasTool(), VoiceCallTool(), ApplyPatchTool()]:
             self._tools[t.name] = t
+
+        # Session status tool
+        try:
+            from .session_status import SESSION_STATUS_TOOL
+            self._tools[SESSION_STATUS_TOOL.name] = SESSION_STATUS_TOOL
+        except Exception:
+            pass
+
+        # PDF analysis tool
+        try:
+            from pathlib import Path as _Path
+            from .pdf import PdfAnalysisTool
+            _pdf_ws = _Path(self._workspace_dir) if self._workspace_dir else None
+            pdf_tool = PdfAnalysisTool(workspace_dir=_pdf_ws)
+            self._tools[pdf_tool.name] = pdf_tool
+        except Exception:
+            pass
 
     def _register_unsafe(self, tool: AgentTool) -> None:
         """Register a tool without duplicate check (used internally)."""

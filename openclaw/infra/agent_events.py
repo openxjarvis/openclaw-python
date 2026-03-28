@@ -91,9 +91,12 @@ def clear_agent_run_context(run_id: str) -> None:
 
     Mirrors TS ``clearAgentRunContext``.  Call after the run completes to
     prevent unbounded growth of the registry.
+    
+    Note: This does NOT clear _seq_by_run, matching TS behavior where
+    seqByRun is not cleared. If the same runId is reused, seq will continue
+    from the previous count.
     """
     _run_context_by_id.pop(run_id, None)
-    _seq_by_run.pop(run_id, None)
 
 
 def reset_agent_run_context_for_test() -> None:
@@ -111,28 +114,49 @@ def emit_agent_event(event: dict[str, Any]) -> None:
 
     Synchronous and non-blocking — mirrors TS ``emitAgentEvent``.
     Automatically enriches the event with ``seq``, ``ts``, and
-    ``session_key`` from the registered run context (if available).
+    ``sessionKey`` from the registered run context (if available).
 
     Listener exceptions are caught and logged so one bad listener cannot
     break the entire event pipeline.
 
     Args:
-        event: Arbitrary event payload dict. Convention:
-               ``{"run_id": str, "stream": str, "data": dict, ...}``.
-               ``type`` is accepted as an alias for older callers.
+        event: Agent event payload dict with TS-compatible fields:
+               - ``runId`` (required): Unique run identifier
+               - ``stream`` (required): "lifecycle" | "tool" | "assistant" | "error"
+               - ``data`` (required): Arbitrary event data
+               - ``sessionKey`` (optional): Session key (enriched from context if missing)
+               
+               For backward compatibility, also accepts ``run_id`` (converted to ``runId``).
+    
+    Returns:
+        None. Event is enriched with ``seq`` and ``ts`` and broadcast to listeners.
     """
-    run_id = event.get("run_id") or event.get("runId") or ""
+    # Normalize field names: convert snake_case to camelCase for TS compatibility
+    run_id = event.get("runId") or event.get("run_id") or ""
+    
+    # Ensure runId is in the event (prefer camelCase for TS compatibility)
+    if run_id and "runId" not in event:
+        event = {**event, "runId": run_id}
+    
     if run_id:
         next_seq = _seq_by_run.get(run_id, 0) + 1
         _seq_by_run[run_id] = next_seq
         context = _run_context_by_id.get(run_id)
-        # Enrich with session_key from context if not already set
-        if context and not event.get("session_key") and not event.get("sessionKey"):
+        
+        # Enrich with sessionKey from context if not already set
+        # Use sessionKey (TS style) not session_key
+        if context and not event.get("sessionKey") and not event.get("session_key"):
             session_key = context.get("session_key")
             if session_key:
-                event = {**event, "session_key": session_key, "seq": next_seq, "ts": int(time.time() * 1000)}
+                event = {**event, "sessionKey": session_key, "seq": next_seq, "ts": int(time.time() * 1000)}
+            else:
+                event = {**event, "seq": next_seq, "ts": int(time.time() * 1000)}
         else:
-            event = {**event, "seq": next_seq, "ts": int(time.time() * 1000)}
+            # If sessionKey or session_key already present, ensure we use sessionKey
+            if "session_key" in event and "sessionKey" not in event:
+                event = {**event, "sessionKey": event["session_key"], "seq": next_seq, "ts": int(time.time() * 1000)}
+            else:
+                event = {**event, "seq": next_seq, "ts": int(time.time() * 1000)}
 
     for listener in list(_listeners):
         try:

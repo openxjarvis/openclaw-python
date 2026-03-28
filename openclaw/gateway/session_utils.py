@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Literal, Optional, NamedTuple
 from dataclasses import dataclass
 
 from openclaw.agents.session_entry import SessionEntry
-from openclaw.config.sessions.store import load_session_store
+from openclaw.config.sessions.store_utils import load_session_store
 from openclaw.config.sessions.paths import (
     get_default_store_path,
     resolve_session_store_path,

@@ -33,6 +33,15 @@ Usage in handlers (backward-compat run_turn interface)::
 from __future__ import annotations
 
 from openclaw.config.paths import resolve_state_dir
+from openclaw.infra.agent_events import (
+    emit_agent_event,
+    register_agent_run_context,
+    clear_agent_run_context,
+    AGENT_STREAM_LIFECYCLE,
+    AGENT_STREAM_TOOL,
+    AGENT_STREAM_ASSISTANT,
+    AGENT_STREAM_ERROR,
+)
 
 import asyncio
 import inspect
@@ -385,8 +394,16 @@ class PiAgentRuntime:
         self,
         session_id: str,
         extra_tools: list[Any] | None = None,
+        session_workspace: str | None = None,
     ) -> Any:
-        """Get or create a pi_coding_agent.AgentSession for session_id."""
+        """Get or create a pi_coding_agent.AgentSession for session_id.
+        
+        Args:
+            session_id: OpenClaw session UUID
+            extra_tools: Additional tools to inject
+            session_workspace: Session-specific workspace directory (overrides self.cwd if provided).
+                              Mirrors TS behavior of using session workspace for non-sandbox runs.
+        """
         if session_id in self._pool:
             return self._pool[session_id]
 
@@ -405,7 +422,8 @@ class PiAgentRuntime:
             # Load and limit history (Phase 1: Emergency fix for token overflow)
             history_messages = []
             try:
-                session_dir = resolve_state_dir() / "agents" / "main" / "sessions"
+                _agent_id = (session_id.split(":")[0] if ":" in session_id else "main") or "main"
+                session_dir = resolve_state_dir() / "agents" / _agent_id / "sessions"
                 transcript_path = session_dir / f"{session_id}.jsonl"
                 
                 if transcript_path.exists():
@@ -486,8 +504,19 @@ class PiAgentRuntime:
             except Exception as e:
                 logger.warning(f"Failed to load API keys from auth-profiles.json: {e}")
 
+            # Mirrors TS attempt.ts effectiveWorkspace resolution:
+            #   sandbox OFF  → effectiveWorkspace = resolvedWorkspace (agent workspace root)
+            #   sandbox ON   → effectiveWorkspace = sandbox.workspaceDir (per-session subdir)
+            # In our case, channel_manager already resolves session_workspace
+            # to either the workspace root (sandbox off) or a session subdir (sandbox on).
+            effective_cwd = session_workspace or self.cwd
+            logger.debug(
+                "pi_session cwd for %s: session_workspace=%s, self.cwd=%s → %s",
+                session_id[:8], session_workspace, self.cwd, effective_cwd,
+            )
+
             pi_session = PiAgentSession(
-                cwd=self.cwd,
+                cwd=effective_cwd,
                 model=model,
                 session_id=session_id,
                 auth_storage=auth_storage,  # ✅ Pass auth_storage
@@ -1026,8 +1055,9 @@ class PiAgentRuntime:
 
     def _build_agent_ctx(self, session_id: str) -> dict[str, Any]:
         """Build PluginHookAgentContext for hook calls."""
+        _agent_id = (session_id.split(":")[0] if ":" in session_id else "main") or "main"
         return {
-            "agent_id": "main",
+            "agent_id": _agent_id,
             "session_key": session_id,
             "session_id": session_id,
             "model": self.model_str,
@@ -1069,6 +1099,41 @@ class PiAgentRuntime:
         except ValueError:
             pass
 
+    def _emit_to_infra(self, run_id: str, event_type: Any, data: dict[str, Any]) -> None:
+        """Emit event to infra/agent_events layer (mirrors TS emitAgentEvent).
+        
+        This broadcasts to the global agent event bus which Gateway listens to.
+        The event will be enriched with seq, ts, and sessionKey automatically.
+        
+        Maps EventType to stream for TS compatibility:
+        - EventType.ERROR → "error"
+        - EventType.TEXT / AGENT_TEXT → "assistant"
+        - EventType.TOOL_* → "tool"
+        - Other → "lifecycle"
+        
+        Args:
+            run_id: Run identifier
+            event_type: EventType enum value
+            data: Event data payload
+        """
+        from openclaw.events import EventType
+        
+        # Map EventType to TS stream
+        if event_type == EventType.ERROR:
+            stream = AGENT_STREAM_ERROR
+        elif event_type in (EventType.TEXT, EventType.AGENT_TEXT, EventType.TEXT_DELTA):
+            stream = AGENT_STREAM_ASSISTANT
+        elif event_type in (EventType.TOOL_EXECUTION_START, EventType.TOOL_EXECUTION_UPDATE, EventType.TOOL_EXECUTION_END):
+            stream = AGENT_STREAM_TOOL
+        else:
+            stream = AGENT_STREAM_LIFECYCLE
+        
+        emit_agent_event({
+            "runId": run_id,
+            "stream": stream,
+            "data": data,
+        })
+
     async def _dispatch_event(self, event: Any) -> None:
         """Call every registered listener with *event*.
 
@@ -1099,6 +1164,7 @@ class PiAgentRuntime:
         session_key: str | None = None,
         stream_callback: Any | None = None,
         streaming_behavior: str | None = None,
+        session_workspace: str | None = None,
     ) -> AsyncIterator[Any]:
         """Stream agent events for one conversation turn.
 
@@ -1108,6 +1174,19 @@ class PiAgentRuntime:
 
         Args:
             session:       openclaw Session object (provides session_id)
+            message:       User message text
+            tools:         List of tools available to the agent
+            model:         Model ID to use (overrides runtime default)
+            system_prompt: System prompt to prepend
+            images:        List of image URLs or data URIs
+            run_id:        Unique run identifier (for event correlation)
+            session_key:   Session key for routing/logging
+            stream_callback: Legacy callback for raw events
+            streaming_behavior: "steer" or "followUp" for concurrent run control
+            session_workspace: Session-specific workspace directory (optional).
+                              If provided and sandbox is disabled, pi_session will
+                              use this as cwd instead of the agent workspace.
+                              Mirrors TS behavior of passing session workspace to AgentSession.
             message:       User message text
             tools:         Optional tool list (openclaw AgentToolBase instances)
             model:         Optional per-call model override (skips fallbacks)
@@ -1122,6 +1201,13 @@ class PiAgentRuntime:
         extra_tools = list(tools) if tools else None
         _run_id = run_id or str(_uuid.uuid4())
         _session_key = session_key or session_id
+
+        # Register run context for agent event enrichment (mirrors TS registerAgentRunContext)
+        register_agent_run_context(_run_id, {
+            "session_key": _session_key,
+            "verbose_level": "full",  # Can be configured later
+            "is_heartbeat": False,  # Can be set based on context
+        })
 
         # Register as active run so steer/abort can find this turn
         from openclaw.agents.pi_embedded import (
@@ -1236,6 +1322,18 @@ class PiAgentRuntime:
         from openclaw.agents.pi_stream import _resolve_model
         from openclaw.events import Event, EventType
 
+        # --- Skill env overrides (mirrors TS applySkillEnvOverridesFromSnapshot) ---
+        _restore_skill_env = lambda: None  # noqa: E731
+        try:
+            from openclaw.agents.skills.env_overrides import apply_skill_env_overrides_from_snapshot
+            _skill_snapshot_for_env = getattr(session, "skills_snapshot", None)
+            _restore_skill_env = apply_skill_env_overrides_from_snapshot(
+                snapshot=_skill_snapshot_for_env,
+                config=self.config,
+            )
+        except Exception:
+            pass
+
         # --- Outer retry loop (mirrors TS runEmbeddedPiAgent while-loop) ---
         # Handles: auth profile rotation, context overflow compaction/truncation,
         # thinking-level fallback. The inner loop handles model quota failover.
@@ -1334,16 +1432,22 @@ class PiAgentRuntime:
 
                     # Get or create the session, then switch model if needed
                     try:
-                        pi_session = self._get_or_create_pi_session(session_id, extra_tools)
+                        pi_session = self._get_or_create_pi_session(
+                            session_id,
+                            extra_tools,
+                            session_workspace=session_workspace,
+                        )
                     except Exception as exc:
                         logger.error(f"Session creation failed: {exc}", exc_info=True)
                         await _release_attempt_lock()
-                        yield Event(
+                        error_event = Event(
                             type=EventType.ERROR,
                             source="pi-runtime",
                             session_id=session_id,
                             data={"message": f"Session creation failed: {exc}"},
                         )
+                        self._emit_to_infra(_run_id, EventType.ERROR, error_event.data)
+                        yield error_event
                         return
 
                     # Register as the active embedded run — enables steer/abort from outside
@@ -1409,6 +1513,29 @@ class PiAgentRuntime:
 
                         # Trim tool call names before any other processing
                         _trim_tool_call_names_in_event(pi_event)
+
+                        # Real-time tool call tracing (runs synchronously, never buffered)
+                        _oc_etype = (
+                            pi_event.get("type") if isinstance(pi_event, dict)
+                            else getattr(pi_event, "type", None)
+                        )
+                        if _oc_etype == "tool_execution_start":
+                            _tc_name = (
+                                pi_event.get("tool_name", "") if isinstance(pi_event, dict)
+                                else getattr(pi_event, "tool_name", "")
+                            )
+                            _tc_args = (
+                                pi_event.get("args", {}) or {} if isinstance(pi_event, dict)
+                                else getattr(pi_event, "args", {}) or {}
+                            )
+                            if isinstance(_tc_args, str):
+                                import json as _json
+                                try:
+                                    _tc_args = _json.loads(_tc_args)
+                                except Exception:
+                                    _tc_args = {}
+                            _path_hint = f" path={_tc_args.get('path')}" if isinstance(_tc_args, dict) and _tc_args.get("path") else ""
+                            logger.info("🔧 [%s] Tool ▶ %s%s", session_id[:8], _tc_name, _path_hint)
 
                         # pi can emit both AgentEvent objects and plain dicts
                         if isinstance(pi_event, dict):
@@ -1788,10 +1915,31 @@ class PiAgentRuntime:
                                     prompt_kwargs["streaming_behavior"] = streaming_behavior
                                 
                                 # Call prompt with appropriate parameters
-                                if prompt_kwargs:
-                                    await _pi_session.prompt(message, pi_images, **prompt_kwargs)
-                                else:
-                                    await _pi_session.prompt(message, pi_images)
+                                # ✅ FIX: Add timeout to prevent infinite API hangs (especially with images)
+                                # Mirrors TS behavior where API clients have built-in timeouts.
+                                # 300s to handle large-context tool-heavy tasks (e.g. pptx + multiple bash calls).
+                                _api_timeout = 300.0
+                                try:
+                                    if prompt_kwargs:
+                                        await asyncio.wait_for(
+                                            _pi_session.prompt(message, pi_images, **prompt_kwargs),
+                                            timeout=_api_timeout
+                                        )
+                                    else:
+                                        await asyncio.wait_for(
+                                            _pi_session.prompt(message, pi_images),
+                                            timeout=_api_timeout
+                                        )
+                                except asyncio.TimeoutError:
+                                    logger.error(
+                                        f"[{session_id[:8]}] pi_session.prompt timed out after {_api_timeout:.0f}s | "
+                                        f"message_len={len(message)} | images={len(pi_images or [])} | model={candidate_model}"
+                                    )
+                                    raise RuntimeError(
+                                        f"API call timed out after {_api_timeout:.0f} seconds. "
+                                        "This usually indicates a network issue or the model is overloaded. "
+                                        "Please try again."
+                                    )
                             finally:
                                 if _active_handle is not None:
                                     _active_handle.is_streaming = False
@@ -1826,35 +1974,75 @@ class PiAgentRuntime:
                             event_queue.put_nowait(_SENTINEL)
 
                     prompt_task = asyncio.create_task(_run_prompt())
-                    collected_events: list[Any] = []
-                    _stream_accumulated: str = ""
 
+                    # Helper: process a single event (plugin hooks + dispatch + infra emit).
+                    async def _process_event(ev: Any) -> None:
+                        ev_type = getattr(ev, "type", None)
+                        ev_data = getattr(ev, "data", {}) or {}
+                        if self._hook_runner:
+                            if ev_type == EventType.TOOL_EXECUTION_START and self._hook_runner.has_hooks("before_tool_call"):
+                                try:
+                                    asyncio.create_task(self._hook_runner.run_before_tool_call(
+                                        {
+                                            "tool_name": ev_data.get("tool_name", ""),
+                                            "params": ev_data.get("arguments", {}),
+                                            "tool_call_id": ev_data.get("tool_call_id"),
+                                        },
+                                        self._build_agent_ctx(session_id),
+                                    ))
+                                except Exception:
+                                    pass
+                            elif ev_type == EventType.TOOL_EXECUTION_END and self._hook_runner.has_hooks("after_tool_call"):
+                                try:
+                                    asyncio.create_task(self._hook_runner.run_after_tool_call(
+                                        {
+                                            "tool_name": ev_data.get("tool_name", ""),
+                                            "params": ev_data.get("arguments", {}),
+                                            "tool_call_id": ev_data.get("tool_call_id"),
+                                            "result": ev_data.get("result"),
+                                            "error": ev_data.get("error"),
+                                            "is_error": ev_data.get("is_error", False),
+                                        },
+                                        self._build_agent_ctx(session_id),
+                                    ))
+                                except Exception:
+                                    pass
+                        await self._dispatch_event(ev)
+                        if ev_type:
+                            self._emit_to_infra(_run_id, ev_type, ev_data)
+
+                    # When fallback candidates remain, buffer events so a quota-error
+                    # retry doesn't leak partial results to the caller. On the last
+                    # attempt (or sole candidate), yield events immediately from the
+                    # queue — this enables real-time draft stream updates in the
+                    # caller (agent_runner_execution.py), mirroring TS where
+                    # onPartialReply fires in real-time from the event subscriber.
+                    _may_retry = (attempt < len(candidates) - 1)
+                    collected_events: list[Any] = []
+                    _streamed_live = False
                     try:
                         while True:
                             try:
                                 event = await event_queue.get()
                                 if event is _SENTINEL:
                                     break
-                                collected_events.append(event)
-
-                                # Real-time streaming: call stream_callback with each
-                                # text delta as it arrives, before the model run ends.
-                                # This drives TelegramDraftStream / SlackDraftStream
-                                # so the preview updates live during generation.
-                                if stream_callback is not None:
-                                    _ev_type = getattr(event, "type", None)
-                                    _ev_data = getattr(event, "data", {}) or {}
-                                    if _ev_type == EventType.TEXT:
-                                        _delta = _ev_data.get("text", "")
-                                        if _delta:
-                                            _stream_accumulated += _delta
-                                            try:
-                                                _cb_result = stream_callback(_stream_accumulated)
-                                                if asyncio.iscoroutine(_cb_result):
-                                                    asyncio.create_task(_cb_result)
-                                            except Exception:
-                                                pass
-
+                                if _may_retry:
+                                    collected_events.append(event)
+                                else:
+                                    _streamed_live = True
+                                    try:
+                                        await _process_event(event)
+                                        yield event
+                                    except Exception as dispatch_exc:
+                                        logger.error(f"[{session_id[:8]}] Event dispatch error: {dispatch_exc}", exc_info=True)
+                                        err_ev = Event(
+                                            type=EventType.ERROR,
+                                            source="pi-runtime",
+                                            session_id=session_id,
+                                            data={"message": f"Event dispatch failed: {dispatch_exc}"},
+                                        )
+                                        self._emit_to_infra(_run_id, EventType.ERROR, err_ev.data)
+                                        yield err_ev
                             except Exception as queue_exc:
                                 logger.error(f"[{session_id[:8]}] Event queue get error: {queue_exc}", exc_info=True)
                                 break
@@ -1868,70 +2056,37 @@ class PiAgentRuntime:
                                 pass
 
                     # If a quota error was detected and we have more fallbacks, retry
-                    if _quota_error and attempt < len(candidates) - 1:
+                    if _quota_error and _may_retry:
                         last_error = _quota_error[0]
-                        # Evict the session so the fallback model gets a fresh session
-                        # that won't be confused by the failed turn's internal state
                         self.evict_session(session_id)
                         await _release_attempt_lock()
                         continue
 
-                    # No quota error (or no more fallbacks) — yield collected events
+                    # Yield buffered events (only non-empty when _may_retry was True)
                     if is_fallback and not _quota_error:
-                        # Inform the client which fallback model was used
-                        yield Event(
+                        fallback_event = Event(
                             type=EventType.TEXT,
                             source="pi-runtime",
                             session_id=session_id,
                             data={"text": f"[Using fallback model: {candidate_model}]\n"},
                         )
+                        self._emit_to_infra(_run_id, EventType.TEXT, fallback_event.data)
+                        yield fallback_event
 
                     for ev in collected_events:
                         try:
-                            # --- Plugin Hooks: before_tool_call / after_tool_call ---
-                            # Fired observationally (not blocking) when tool execution events arrive.
-                            # Mirrors TS pi-tools.before-tool-call.ts and pi-embedded-subscribe.handlers.tools.ts.
-                            if self._hook_runner:
-                                ev_type = getattr(ev, "type", None)
-                                ev_data = getattr(ev, "data", {}) or {}
-                                if ev_type == EventType.TOOL_EXECUTION_START and self._hook_runner.has_hooks("before_tool_call"):
-                                    try:
-                                        asyncio.create_task(self._hook_runner.run_before_tool_call(
-                                            {
-                                                "tool_name": ev_data.get("tool_name", ""),
-                                                "params": ev_data.get("arguments", {}),
-                                                "tool_call_id": ev_data.get("tool_call_id"),
-                                            },
-                                            self._build_agent_ctx(session_id),
-                                        ))
-                                    except Exception:
-                                        pass
-                                elif ev_type == EventType.TOOL_EXECUTION_END and self._hook_runner.has_hooks("after_tool_call"):
-                                    try:
-                                        asyncio.create_task(self._hook_runner.run_after_tool_call(
-                                            {
-                                                "tool_name": ev_data.get("tool_name", ""),
-                                                "params": ev_data.get("arguments", {}),
-                                                "tool_call_id": ev_data.get("tool_call_id"),
-                                                "result": ev_data.get("result"),
-                                                "error": ev_data.get("error"),
-                                                "is_error": ev_data.get("is_error", False),
-                                            },
-                                            self._build_agent_ctx(session_id),
-                                        ))
-                                    except Exception:
-                                        pass
-
-                            await self._dispatch_event(ev)
+                            await _process_event(ev)
                             yield ev
                         except Exception as dispatch_exc:
                             logger.error(f"[{session_id[:8]}] Event dispatch error: {dispatch_exc}", exc_info=True)
-                            yield Event(
+                            dispatch_error_event = Event(
                                 type=EventType.ERROR,
                                 source="pi-runtime",
                                 session_id=session_id,
                                 data={"message": f"Event dispatch failed: {dispatch_exc}"},
                             )
+                            self._emit_to_infra(_run_id, EventType.ERROR, dispatch_error_event.data)
+                            yield dispatch_error_event
 
                     # Phase 2: Update session token statistics after successful run
                     try:
@@ -2101,9 +2256,10 @@ class PiAgentRuntime:
                                 "reserveTokens": compaction_config.get("reserveTokens", 16384),
                                 "keepRecentTokens": compaction_config.get("keepRecentTokens", 20000),
                             }
+                            _compaction_ctx_window = locals().get("context_window", 1_048_576)
                             result = await asyncio.wait_for(
                                 self._execute_compaction(
-                                    session_id, pi_session_for_compact, 1_048_576, compaction_settings
+                                    session_id, pi_session_for_compact, _compaction_ctx_window, compaction_settings
                                 ),
                                 timeout=300.0,
                             )
@@ -2127,14 +2283,26 @@ class PiAgentRuntime:
             # end of outer retry loop
 
             if last_error:
-                yield Event(
+                final_error_event = Event(
                     type=EventType.ERROR,
                     source="pi-runtime",
                     session_id=session_id,
                     data={"message": str(last_error)},
                 )
+                self._emit_to_infra(_run_id, EventType.ERROR, final_error_event.data)
+                yield final_error_event
 
         finally:
+            # Revert skill env overrides (mirrors TS restoreSkillEnv in attempt.ts finally)
+            try:
+                _restore_skill_env()
+            except Exception:
+                pass
+
+            # Clear agent run context (mirrors TS clearAgentRunContext)
+            # Note: This does NOT clear seq counter, matching TS behavior
+            clear_agent_run_context(_run_id)
+            
             # Deregister active run — runs on normal exit AND GeneratorExit/cancellation
             if _active_handle is not None:
                 clear_active_embedded_run(session_id, _active_handle.run_id)
@@ -2163,6 +2331,19 @@ class PiAgentRuntime:
                 await pi_session.abort()
             except Exception as exc:
                 logger.warning("Abort session %s: %s", session_id[:8], exc)
+    
+    # ------------------------------------------------------------------
+    # Check if agent is busy (for heartbeat detection)
+    # ------------------------------------------------------------------
+    
+    def is_busy(self) -> bool:
+        """Return True if any session has an active embedded run.
+        
+        Used by heartbeat to detect if agent is processing and should drop
+        the heartbeat message rather than queue it (mirrors TS getQueueSize check).
+        """
+        from openclaw.agents.pi_embedded import get_active_embedded_run_count
+        return get_active_embedded_run_count() > 0
 
 
 __all__ = ["PiAgentRuntime"]

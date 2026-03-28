@@ -214,9 +214,12 @@ async def ensure_skill_snapshot(
 
     try:
         from openclaw.agents.skills.workspace import build_workspace_skill_snapshot
+        from openclaw.agents.skills.refresh import get_skills_snapshot_version as _get_ver
         skill_snapshot = build_workspace_skill_snapshot(
             workspace_path or workspace_dir,
             config=cfg,
+            skill_filter=skill_filter,
+            snapshot_version=current_version,
         )
 
         # Track the version we just built

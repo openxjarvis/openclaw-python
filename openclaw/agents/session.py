@@ -517,9 +517,10 @@ class Session(BaseModel):
                     entry = json.loads(line)
                     entry_type = entry.get("type")
                     if entry_type == "session":
-                        # Header — restore cwd / session_key / agent_id if present
-                        if entry.get("cwd") and self.workspace_dir == resolve_state_dir() / "workspace":
-                            self.workspace_dir = Path(entry["cwd"])
+                        # Header — restore session_key / agent_id if present.
+                        # NOTE: Do NOT restore cwd from old session files.
+                        # TS never reads back cwd from JSONL to override workspace_dir.
+                        # Doing so causes stale per-session slug paths to pollute workspace.
                         if entry.get("sessionKey") and not self.session_key:
                             self.session_key = entry["sessionKey"]
                         if entry.get("agentId") and not self.agent_id:

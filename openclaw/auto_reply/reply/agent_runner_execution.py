@@ -8,7 +8,7 @@ with:
 - Cross-model fallback chain (runWithModelFallback) on auth/rate-limit failures
 - Session corruption recovery after compaction failures
 - Session recovery after role-ordering conflicts (Gemini)
-- Transient HTTP error retry (up to 3 attempts with backoff)
+- Transient HTTP error retry (1 retry after 2.5s, aligns with TS didRetryTransientHttpError)
 - Tool result serialization to prevent out-of-order delivery
 - Structured error events
 """
@@ -22,8 +22,8 @@ from typing import Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
-# Maximum transient HTTP retry attempts
-MAX_TRANSIENT_RETRIES = 3
+# Maximum transient HTTP retry attempts — aligns with TS didRetryTransientHttpError (one retry).
+MAX_TRANSIENT_RETRIES = 2
 
 # Patterns that indicate a transient server error worth retrying
 _TRANSIENT_HTTP_PATTERNS = [
@@ -189,6 +189,7 @@ async def run_with_model_fallback(
                 reasoning_stream_callback=reasoning_stream_callback,
                 reasoning_level=reasoning_level,
                 block_send_fn=block_send_fn,
+                ctx_metadata=cfg,  # ✅ Pass cfg as ctx_metadata for fallback path
             )
             if attempts:
                 logger.info(
@@ -408,6 +409,8 @@ async def run_agent_turn_with_fallback(
     is_heartbeat: bool = False,
     provider: str = "",  # used for CLI provider check
     cfg: dict | None = None,  # used for CLI provider check
+    session_workspace: str | None = None,  # session-specific workspace directory
+    ctx_metadata: dict | None = None,  # ✅ NEW: Context metadata from InboundMessage (stream mode config, reasoning coordinator, etc.)
 ) -> tuple[str, bool, bool]:
     """Execute an agent turn with automatic retry on transient errors.
 
@@ -416,7 +419,7 @@ async def run_agent_turn_with_fallback(
     Mirrors TS ``runAgentTurnWithFallback``.
 
     Error handling priority:
-    1. Transient HTTP errors (500/502/503/504): retry up to MAX_TRANSIENT_RETRIES.
+    1. Transient HTTP errors (500/502/503/504): 1 retry after 2.5s (TS: didRetryTransientHttpError).
     2. Compaction failures: reset session, re-raise.
     3. Role-ordering conflicts (Gemini): reset session, re-raise.
     4. Other errors: re-raise immediately.
@@ -496,6 +499,79 @@ async def run_agent_turn_with_fallback(
 
     session_id = getattr(session, "session_id", "") or ""
     response_text = ""
+    
+    # ✅ Get reasoning coordinator from context metadata (passed from channel.py)
+    # Used for reasoning block separation (forceNewMessage timing)
+    ctx_metadata = ctx_metadata or {}
+    reasoning_coordinator = ctx_metadata.get("_reasoning_coordinator")
+    if reasoning_coordinator:
+        logger.info(f"[{session_id[:8]}] [TEST] Reasoning coordinator loaded from context")
+    else:
+        logger.info(f"[{session_id[:8]}] [TEST] No reasoning coordinator in context")
+    
+    # ✅ FIX: Create BlockReplyPipeline when block_send_fn is provided
+    # Mirrors TS createBlockReplyPipeline in agent-runner.ts lines 157-174
+    block_reply_pipeline = None
+    if block_send_fn:
+        try:
+            from openclaw.auto_reply.reply.block_streaming import (
+                BlockStreamingPipeline,
+                resolve_block_streaming_config,
+            )
+            
+            # ✅ NEW: Get disable_block_streaming flag from context metadata
+            # Mirrors TS bot-message-dispatch.ts L305-313 disableBlockStreaming decision
+            # This flag is set by channel.py based on stream mode configuration:
+            # - draft优先: can_stream_answer_draft=true → disable_block_streaming=true
+            # - reasoning强制: reasoning=on → disable_block_streaming=false
+            disable_block_streaming = ctx_metadata.get("_disable_block_streaming")
+            
+            logger.info(
+                f"[{session_id[:8]}] [TEST] Block streaming config: "
+                f"disable_flag={disable_block_streaming}, "
+                f"reasoning_level={ctx_metadata.get('_reasoning_level')}, "
+                f"can_draft_answer={ctx_metadata.get('_can_stream_answer_draft')}"
+            )
+            
+            # Resolve block streaming config (defaults: min=800, max=1200, idle=1000ms)
+            # Provider is typically "telegram" or "discord" from channel context
+            stream_config = resolve_block_streaming_config(
+                cfg=cfg,
+                channel="telegram",  # TODO: Pass actual provider from context if available
+                account_id=None,
+                disable_block_streaming=disable_block_streaming,
+            )
+            
+            logger.debug(
+                f"[{session_id[:8]}] Block streaming config: "
+                f"enabled={stream_config.enabled}, "
+                f"disable_flag={disable_block_streaming}, "
+                f"reasoning_level={ctx_metadata.get('_reasoning_level', 'off')}, "
+                f"can_draft_answer={ctx_metadata.get('_can_stream_answer_draft', False)}"
+            )
+            
+            # Create pipeline with coalescer
+            # Coalescer will automatically:
+            # - Flush when accumulated >= maxChars (1200)
+            # - Flush after idleMs (1000ms) of no new text
+            # - Flush on force (tool start, turn end)
+            block_reply_pipeline = BlockStreamingPipeline(
+                cfg=stream_config,
+                on_block=block_send_fn,
+            )
+            coalesce_cfg = (
+                stream_config.coalesce_config or
+                stream_config.chunk_config
+            )
+            logger.debug(
+                f"[{session_id[:8]}] BlockStreamingPipeline created: "
+                f"min={getattr(coalesce_cfg, 'min_chars', 800)}, "
+                f"max={getattr(coalesce_cfg, 'max_chars', 1200)}, "
+                f"idle={getattr(coalesce_cfg, 'idle_ms', 1000)}ms"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create BlockStreamingPipeline: {e}", exc_info=True)
+            block_reply_pipeline = None
     has_error = False
     auto_compaction_completed = False
     attempt = 0
@@ -530,6 +606,8 @@ async def run_agent_turn_with_fallback(
                 "images": images,
                 "run_id": run_id,
                 "session_key": session_key,
+                "streaming_behavior": "followUp",  # Always queue if agent is already processing
+                "session_workspace": session_workspace,  # Pass session workspace for file isolation
             }
             # Only pass stream_callback for real-time streaming when reasoning is off.
             # When reasoning is on, text must be split first (done post-run below),
@@ -559,6 +637,18 @@ async def run_agent_turn_with_fallback(
                             chunk = chunk.get("text", "")
                         if chunk:
                             response_text += str(chunk)
+                            
+                            # ✅ FIX: Push chunk to BlockStreamingPipeline
+                            # Pipeline's coalescer will automatically flush when:
+                            # - Accumulated text >= maxChars (1200)
+                            # - idleMs (1000ms) elapsed since last chunk
+                            # Mirrors TS: text delta → coalescer.push → auto flush on thresholds
+                            if block_reply_pipeline:
+                                try:
+                                    await block_reply_pipeline.push(str(chunk))
+                                except Exception as _enq_err:
+                                    logger.debug(f"Pipeline push error (non-fatal): {_enq_err}")
+                            
                             # Refresh typing TTL as text arrives — mirrors TS
                             # typing.startTypingOnText() on each text delta
                             if typing_signaler:
@@ -566,46 +656,97 @@ async def run_agent_turn_with_fallback(
                                     await typing_signaler.signal_text_delta(str(chunk))
                                 except Exception:
                                     pass
-                            # Stream preview callbacks — split text into answer and
-                            # reasoning lanes when reasoningLevel != "off".
-                            # When block streaming is active, pass only the current
-                            # segment's text (since last block send) to the draft
-                            # stream, so the preview shows only the new content.
-                            # Mirrors TS onPartialReply → ingestDraftLaneSegments().
-                            _segment_text = response_text[_block_sent_len:] if _block_sent_len else response_text
+                            
+                            # ✅ FIX: Stream preview callbacks receive FULL accumulated text
+                            # Mirrors TS onPartialReply which receives cleanedText (full snapshot),
+                            # NOT delta. Draft stream's own throttling prevents excessive updates.
+                            # Split text into answer and reasoning lanes when reasoningLevel != "off".
                             if reasoning_level != "off" and (
                                 stream_callback is not None or reasoning_stream_callback is not None
                             ):
                                 try:
                                     from openclaw.channels.telegram.reasoning import split_telegram_reasoning_text
-                                    _r_text, _a_text = split_telegram_reasoning_text(_segment_text)
+                                    _r_text, _a_text = split_telegram_reasoning_text(response_text)
+                                    logger.info(
+                                        f"[{session_id[:8]}] Reasoning split: r_len={len(_r_text)}, a_len={len(_a_text)}"
+                                    )
+                                    
+                                    # ✅ NEW: Reasoning block separation logic
+                                    # Mirrors TS bot-message-dispatch.ts L586-598 onReasoningStream callback
                                     if reasoning_stream_callback is not None and _r_text:
+                                        # Check if reasoning coordinator wants to split on next stream
+                                        # This happens after reasoning final is delivered, to start fresh preview
+                                        if reasoning_coordinator and reasoning_coordinator.should_split_reasoning_on_next_stream():
+                                            logger.info(f"[{session_id[:8]}] Reasoning block separation triggered")
+                                            reasoning_coordinator.clear_split_flag()
+                                            _reasoning_draft_stream = ctx_metadata.get("_reasoning_draft_stream")
+                                            if _reasoning_draft_stream:
+                                                _reasoning_draft_stream.force_new_message()
+                                                logger.info(f"[{session_id[:8]}] Reasoning draft stream force_new_message() called")
+                                        
+                                        # Note reasoning hint for coordinator
+                                        if reasoning_coordinator:
+                                            reasoning_coordinator.note_reasoning_hint()
+                                        
+                                        logger.info(f"[{session_id[:8]}] Calling reasoning_stream_callback")
                                         _r_result = reasoning_stream_callback(_r_text)
                                         if asyncio.iscoroutine(_r_result):
                                             asyncio.create_task(_r_result)
+                                        logger.info(f"[{session_id[:8]}] reasoning_stream_callback called successfully")
+                                        
+                                        # Mark reasoning delivered for coordinator
+                                        if reasoning_coordinator:
+                                            reasoning_coordinator.note_reasoning_delivered()
+                                    
                                     if stream_callback is not None and _a_text:
+                                        logger.info(
+                                            f"[{session_id[:8]}] Calling stream_callback with {len(_a_text)} chars: "
+                                            f"{_a_text[:50]}..."
+                                        )
                                         _a_result = stream_callback(_a_text)
                                         if asyncio.iscoroutine(_a_result):
                                             asyncio.create_task(_a_result)
-                                except Exception:
-                                    pass
+                                        logger.info(f"[{session_id[:8]}] stream_callback called successfully")
+                                except Exception as e:
+                                    logger.error(
+                                        f"[{session_id[:8]}] stream_callback ERROR (reasoning branch): "
+                                        f"{type(e).__name__}: {e}",
+                                        exc_info=True
+                                    )
                             elif stream_callback is not None:
                                 try:
-                                    result = stream_callback(_segment_text)
+                                    # ✅ Pass FULL accumulated text, not segment
+                                    logger.info(
+                                        f"[{session_id[:8]}] Calling stream_callback with {len(response_text)} chars: "
+                                        f"{response_text[:50]}..."
+                                    )
+                                    result = stream_callback(response_text)
                                     # Support both sync and async callbacks
                                     if asyncio.iscoroutine(result):
                                         asyncio.create_task(result)
-                                except Exception:
-                                    pass
+                                    logger.info(f"[{session_id[:8]}] stream_callback called successfully")
+                                except Exception as e:
+                                    logger.error(
+                                        f"[{session_id[:8]}] stream_callback ERROR: {type(e).__name__}: {e}",
+                                        exc_info=True
+                                    )
                     elif evt_type in (
                         EventType.AGENT_TOOL_USE, EventType.TOOL_EXECUTION_START,
                         "tool_use", "tool_call", "agent.tool_use", "tool_execution_start",
                     ):
-                        # Block reply dispatch — send any accumulated text before this
-                        # tool call as a separate visible message. Mirrors TS sendBlockReply
-                        # in dispatch-from-config.ts: each text block before a tool call
-                        # is delivered immediately so users see the agent's reasoning steps.
-                        if block_send_fn:
+                        # ✅ FIX: Force flush pipeline before tool execution
+                        # Ensures all accumulated text is sent as a block before the tool starts.
+                        # This preserves message boundaries: "thought" → "tool" → "result"
+                        # Mirrors TS: handleToolExecutionStart → flushBlockReplyBuffer → onBlockReplyFlush
+                        if block_reply_pipeline:
+                            try:
+                                await block_reply_pipeline.finish()
+                                _block_sent_len = len(response_text)
+                                logger.debug(f"[{session_id[:8]}] Block pipeline flushed before tool (sent_len={_block_sent_len})")
+                            except Exception as _flush_err:
+                                logger.debug(f"Pipeline flush error (non-fatal): {_flush_err}")
+                        elif block_send_fn:
+                            # Legacy path (if pipeline creation failed)
                             _unsent = response_text[_block_sent_len:].strip()
                             if _unsent:
                                 _block_sent_len = len(response_text)
@@ -660,10 +801,36 @@ async def run_agent_turn_with_fallback(
                     logger.error("Event processing error: %s", evt_exc)
                     has_error = True
 
+            # ✅ FIX: Force flush pipeline at turn end
+            # Ensures any remaining buffered text is sent as the final block.
+            # Mirrors TS: agent-runner.ts lines 400-402 (blockReplyPipeline.flush + stop)
+            if block_reply_pipeline:
+                try:
+                    await block_reply_pipeline.finish()
+                    _block_sent_len = len(response_text)
+                    logger.debug(f"[{session_id[:8]}] Block pipeline final flush (sent_len={_block_sent_len})")
+                except Exception as _final_flush_err:
+                    logger.debug(f"Pipeline final flush error (non-fatal): {_final_flush_err}")
+
             # When block streaming was active, return only the undelivered remainder
             # (text after the last block send). Blocks already sent as individual
             # messages should not be re-sent by _deliver_response().
             final_text = response_text[_block_sent_len:].strip() if _block_sent_len else response_text
+            
+            # ✅ NEW: Mark split_reasoning_on_next_stream after reasoning final
+            # Mirrors TS bot-message-dispatch.ts L529-534 where reasoning final triggers split flag
+            # This ensures the next reasoning block starts a fresh preview message
+            if reasoning_coordinator and reasoning_level != "off":
+                # Check if we had reasoning content delivered
+                if reasoning_coordinator._reasoning_delivered:
+                    # Mark that next reasoning stream should split
+                    reasoning_coordinator.mark_split_reasoning_on_next_stream()
+                    logger.debug(
+                        f"[{session_id[:8]}] Marked split_reasoning_on_next_stream after final "
+                        f"(will reset on next turn)"
+                    )
+                # Reset for next turn
+                reasoning_coordinator.reset_for_next_step()
             
             # CRITICAL FIX: Extract MEDIA: tokens from pi_coding_agent's final messages.
             # The pi_runtime injects MEDIA tokens when it sees agent_end, but those
@@ -733,12 +900,11 @@ async def run_agent_turn_with_fallback(
                 raise
 
             if _is_transient_http_error(exc) and attempt < MAX_TRANSIENT_RETRIES:
-                backoff = 2.0 ** (attempt - 1)
                 logger.warning(
-                    "Transient HTTP error (attempt %d/%d) — retrying in %.1fs: %s",
-                    attempt, MAX_TRANSIENT_RETRIES, backoff, exc,
+                    "Transient HTTP error (attempt %d/%d) — retrying in 2.5s: %s",
+                    attempt, MAX_TRANSIENT_RETRIES, exc,
                 )
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(2.5)
                 continue
 
             # Non-retryable error

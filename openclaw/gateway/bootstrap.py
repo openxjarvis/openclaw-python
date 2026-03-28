@@ -9,10 +9,49 @@ import asyncio
 import logging
 import os
 import platform
+import sys
 from pathlib import Path
 from typing import Any
 
 from openclaw.config.paths import resolve_state_dir
+
+
+# ✅ Setup global exception handler early (before any async code runs)
+def _setup_global_exception_handler():
+    """Install a global exception handler for uncaught exceptions.
+    
+    Mirrors TypeScript process.on('uncaughtException') and process.on('unhandledRejection').
+    This ensures we always log unexpected errors instead of silently failing.
+    """
+    _original_excepthook = sys.excepthook
+    _original_unraisablehook = sys.unraisablehook
+    _logger = logging.getLogger("openclaw.gateway.bootstrap")
+    
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        # Allow KeyboardInterrupt to propagate normally
+        if issubclass(exc_type, KeyboardInterrupt):
+            _original_excepthook(exc_type, exc_value, exc_traceback)
+            return
+        
+        _logger.critical(
+            "🔥 UNCAUGHT EXCEPTION",
+            exc_info=(exc_type, exc_value, exc_traceback)
+        )
+    
+    def handle_unraisable(unraisable):
+        _logger.error(
+            f"🔥 UNRAISABLE EXCEPTION in {unraisable.object}: {unraisable.exc_value}",
+            exc_info=(type(unraisable.exc_value), unraisable.exc_value, unraisable.exc_traceback)
+        )
+        if _original_unraisablehook:
+            _original_unraisablehook(unraisable)
+    
+    sys.excepthook = handle_exception
+    sys.unraisablehook = handle_unraisable
+
+# Install handler immediately when module is imported
+_setup_global_exception_handler()
+
 
 # Module-level imports so tests can patch openclaw.gateway.bootstrap.load_config etc.
 try:
@@ -333,15 +372,31 @@ class GatewayBootstrap:
                 from ..agents.subagent_registry import get_global_registry
                 _registry = get_global_registry()
                 _registry.set_hook_runner(self._hook_runner)
-                # Wire gateway reference so announce/cleanup flows can call handlers directly
-                _registry.set_gateway(self)
             except Exception as _sub_exc:
-                logger.debug(f"Could not wire hook_runner/gateway into SubagentRegistry: {_sub_exc}")
+                logger.debug(f"Could not wire hook_runner into SubagentRegistry: {_sub_exc}")
         except Exception as e:
             logger.warning(f"Plugin loading skipped: {e}")
             from ..plugins.types import create_empty_plugin_registry
             self.plugin_registry = create_empty_plugin_registry()
+        
+        # ✅ CRITICAL: Wire gateway reference OUTSIDE the plugin try-except
+        # This ensures subagent announce/completion flows work even if plugin loading fails
+        try:
+            from ..agents.subagent_registry import get_global_registry
+            _registry = get_global_registry()
+            _registry.set_gateway(self)
+            logger.info("✅ Gateway reference wired to SubagentRegistry")
+        except Exception as _gw_exc:
+            logger.warning(f"❌ Failed to wire gateway into SubagentRegistry: {_gw_exc}")
+        
         results["steps_completed"] += 1
+        
+        # Step 7.1: Check sandbox configuration and Docker availability
+        logger.info("Step 7.1: Checking sandbox requirements")
+        try:
+            await self._check_sandbox_requirements()
+        except Exception as e:
+            logger.warning(f"Sandbox check failed: {e}")
         
         # Step 7.5: Start gateway sidecar services (TS alignment)
         logger.info("Step 7.5: Starting gateway sidecar services")
@@ -461,6 +516,7 @@ class GatewayBootstrap:
             from ..agents.tools.registry import ToolRegistry
             self.tool_registry = ToolRegistry(
                 session_manager=self.session_manager,
+                gateway=self,  # ✅ Pass gateway reference (self is the Gateway instance)
                 auto_register=True,
             )
             
@@ -1211,16 +1267,70 @@ class GatewayBootstrap:
         """Start maintenance timer tasks"""
         
         async def session_cleanup():
-            """Periodic session cleanup"""
+            """Periodic session cleanup - runs every hour"""
             while True:
                 try:
                     await asyncio.sleep(3600)  # Every hour
-                    logger.debug("Running session cleanup")
-                    # Cleanup old sessions
+                    logger.debug("Running periodic session maintenance")
+                    
+                    # Import maintenance functions
+                    from openclaw.agents.session_maintenance import apply_session_maintenance
+                    from openclaw.config.paths import resolve_state_dir
+                    
+                    state_dir = resolve_state_dir()
+                    
+                    # Get all agents from config
+                    agents_config = getattr(self.config, "agents", None)
+                    if not agents_config:
+                        continue
+                    
+                    agent_list = agents_config.list if hasattr(agents_config, 'list') else []
+                    
+                    for agent_entry in agent_list:
+                        agent_id = agent_entry.id
+                        # Convert to dict for easier access
+                        agent_cfg = agent_entry.model_dump() if hasattr(agent_entry, 'model_dump') else agent_entry.__dict__
+                        
+                        try:
+                            # Resolve paths
+                            sessions_dir = state_dir / "sessions" / agent_id
+                            store_path = sessions_dir / "sessions.json"
+                            workspace_root = state_dir / "workspace"
+                            
+                            if not sessions_dir.exists():
+                                continue
+                            
+                            # Get maintenance config
+                            session_cfg = agent_cfg.get("session", {})
+                            maintenance_config = session_cfg.get("maintenance")
+                            
+                            # Apply maintenance with workspace cleanup
+                            results = apply_session_maintenance(
+                                agent_id=agent_id,
+                                store_path=store_path,
+                                sessions_dir=sessions_dir,
+                                config=maintenance_config,
+                                active_session_key=None,
+                                workspace_root=workspace_root,
+                            )
+                            
+                            # Log results
+                            if results.get("pruned", 0) > 0 or results.get("capped", 0) > 0:
+                                logger.info(
+                                    f"Session maintenance for {agent_id}: "
+                                    f"pruned={results['pruned']}, capped={results['capped']}, "
+                                    f"workspaces_cleaned={results.get('workspaces_cleaned', 0)}, "
+                                    f"orphaned_cleaned={results.get('orphaned_workspaces_cleaned', 0)}, "
+                                    f"rotated={results.get('rotated', False)}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Session maintenance failed for {agent_id}: {e}")
+                    
                 except asyncio.CancelledError:
+                    logger.debug("Session cleanup task cancelled")
                     break
                 except Exception as e:
-                    logger.error(f"Session cleanup error: {e}")
+                    logger.error(f"Session cleanup error: {e}", exc_info=True)
         
         async def health_check():
             """Periodic health check"""
@@ -1272,6 +1382,91 @@ class GatewayBootstrap:
                 )
             except Exception as exc:
                 logger.warning(f"gateway_stop hook failed: {exc}")
+    
+    async def _check_sandbox_requirements(self) -> None:
+        """Check if sandbox configuration is valid and Docker is available.
+        
+        If sandbox mode is enabled but Docker is unavailable, logs a warning.
+        Does not prevent Gateway startup (allows users without Docker to run).
+        """
+        try:
+            # Get sandbox config
+            sandbox_cfg = None
+            if self.config and self.config.agents and self.config.agents.defaults:
+                sandbox_cfg = self.config.agents.defaults.sandbox
+            
+            if not sandbox_cfg:
+                logger.debug("No sandbox configuration found")
+                return
+            
+            sandbox_mode = sandbox_cfg.mode if hasattr(sandbox_cfg, "mode") else "off"
+            
+            if sandbox_mode == "off":
+                logger.info("Sandbox mode: off (operations run directly in main process)")
+                return
+            
+            # Sandbox is enabled, check Docker availability
+            logger.info(f"Sandbox mode: {sandbox_mode} (requires Docker)")
+            
+            # Import is_docker_available from sandbox.docker module
+            from ..agents.sandbox.docker import is_docker_available
+            
+            docker_available = await is_docker_available()
+            
+            if not docker_available:
+                logger.warning(
+                    "⚠️  Sandbox mode is '%s' but Docker command is NOT available",
+                    sandbox_mode
+                )
+                logger.warning(
+                    "   Docker is required for sandbox mode to function."
+                )
+                logger.warning(
+                    "   Isolated sessions (cron jobs, sub-agents) will fail without Docker."
+                )
+                logger.warning(
+                    "   Options:"
+                )
+                logger.warning(
+                    "   1. Install Docker (recommended): https://docs.docker.com/get-docker/"
+                )
+                logger.warning(
+                    "   2. Or disable sandbox in openclaw.json:"
+                )
+                logger.warning(
+                    '      {"agents": {"defaults": {"sandbox": {"mode": "off"}}}}'
+                )
+                return
+            
+            logger.info("✅ Docker command is available")
+            
+            # Check if Docker daemon is running (optional check)
+            try:
+                import docker
+                client = docker.from_env()
+                client.ping()
+                logger.info("✅ Docker daemon is running")
+                
+                # Log sandbox configuration details
+                scope = sandbox_cfg.scope if hasattr(sandbox_cfg, "scope") else "session"
+                access = sandbox_cfg.workspaceAccess if hasattr(sandbox_cfg, "workspaceAccess") else "rw"
+                logger.info(f"   Sandbox scope: {scope}")
+                logger.info(f"   Workspace access: {access}")
+                
+            except Exception as daemon_err:
+                logger.warning(
+                    "⚠️  Docker command available but daemon is not running: %s",
+                    daemon_err
+                )
+                logger.warning(
+                    "   Sandbox features will be unavailable until Docker daemon starts."
+                )
+                logger.warning(
+                    "   Start Docker Desktop or run: sudo systemctl start docker"
+                )
+                
+        except Exception as e:
+            logger.debug(f"Sandbox requirements check failed: {e}")
 
     def _log_startup(self) -> None:
         """Log gateway startup information"""

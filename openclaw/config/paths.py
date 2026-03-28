@@ -270,6 +270,26 @@ def resolve_preferred_openclaw_tmp_dir() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Sandbox workspace root (matches TS DEFAULT_SANDBOX_WORKSPACE_ROOT)
+# ---------------------------------------------------------------------------
+
+def resolve_default_sandbox_workspace_root(
+    env: Optional[Dict[str, str]] = None,
+    homedir: Optional[Callable[[], str]] = None,
+) -> Path:
+    """
+    Resolve the default sandbox workspace root directory.
+
+    Mirrors TS DEFAULT_SANDBOX_WORKSPACE_ROOT = path.join(STATE_DIR, "sandboxes")
+    from openclaw/src/agents/sandbox/constants.ts.
+
+    Per-session/agent sandbox subdirs are placed here (not inside workspace/).
+    """
+    state_dir = resolve_state_dir(env=env, homedir=homedir)
+    return Path(state_dir) / "sandboxes"
+
+
+# ---------------------------------------------------------------------------
 # Gateway lock directory (matches TS resolveGatewayLockDir)
 # ---------------------------------------------------------------------------
 

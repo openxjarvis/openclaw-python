@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from openclaw.routing.session_key import (
@@ -91,6 +92,25 @@ class SpawnSubagentResult:
     error: str | None = None
     mode: SpawnSubagentMode | None = None  # TS: SpawnSubagentResult.mode
     attachments: dict[str, Any] | None = None  # TS: SpawnSubagentResult.attachments
+
+
+def _get_subagent_config_value(cfg: Any, key: str, default: Any = None) -> Any:
+    """Read a value from agents.defaults.subagents.{key} in either dict or Pydantic config."""
+    if isinstance(cfg, dict):
+        return (
+            cfg.get("agents", {})
+            .get("defaults", {})
+            .get("subagents", {})
+            .get(key, default)
+        )
+    try:
+        subagents_cfg = cfg.agents.defaults.subagents
+        if isinstance(subagents_cfg, dict):
+            return subagents_cfg.get(key, default)
+        val = getattr(subagents_cfg, key, None)
+        return val if val is not None else default
+    except (AttributeError, TypeError):
+        return default
 
 
 def split_model_ref(ref: str | None) -> dict[str, str | None]:
@@ -456,22 +476,7 @@ async def spawn_subagent_direct(
         gateway=gateway,
     )
     
-    max_spawn_depth = 1  # Default
-    if hasattr(cfg, "agents") and hasattr(cfg.agents, "defaults"):
-        defaults = cfg.agents.defaults
-        if hasattr(defaults, "subagents"):
-            subagents_cfg = defaults.subagents
-            if isinstance(subagents_cfg, dict):
-                max_spawn_depth = subagents_cfg.get("maxSpawnDepth", 1)
-            elif hasattr(subagents_cfg, "maxSpawnDepth"):
-                max_spawn_depth = subagents_cfg.maxSpawnDepth or 1
-    elif isinstance(cfg, dict):
-        max_spawn_depth = (
-            cfg.get("agents", {})
-            .get("defaults", {})
-            .get("subagents", {})
-            .get("maxSpawnDepth", 1)
-        )
+    max_spawn_depth = _get_subagent_config_value(cfg, "maxSpawnDepth", 1)
     
     if caller_depth >= max_spawn_depth:
         return SpawnSubagentResult(
@@ -479,33 +484,7 @@ async def spawn_subagent_direct(
             error=f"sessions_spawn is not allowed at this depth (current depth: {caller_depth}, max: {max_spawn_depth})",
         )
     
-    # Active children limit (mirrors TS lines 118-125)
-    max_children = 5  # Default
-    archive_after_minutes = 60  # Default
-    if hasattr(cfg, "agents") and hasattr(cfg.agents, "defaults"):
-        defaults = cfg.agents.defaults
-        if hasattr(defaults, "subagents"):
-            subagents_cfg = defaults.subagents
-            if isinstance(subagents_cfg, dict):
-                max_children = subagents_cfg.get("maxChildrenPerAgent", 5)
-                archive_after_minutes = subagents_cfg.get("archiveAfterMinutes", 60)
-            elif hasattr(subagents_cfg, "maxChildrenPerAgent"):
-                max_children = subagents_cfg.maxChildrenPerAgent or 5
-                if hasattr(subagents_cfg, "archiveAfterMinutes"):
-                    archive_after_minutes = subagents_cfg.archiveAfterMinutes or 60
-    elif isinstance(cfg, dict):
-        max_children = (
-            cfg.get("agents", {})
-            .get("defaults", {})
-            .get("subagents", {})
-            .get("maxChildrenPerAgent", 5)
-        )
-        archive_after_minutes = (
-            cfg.get("agents", {})
-            .get("defaults", {})
-            .get("subagents", {})
-            .get("archiveAfterMinutes", 60)
-        )
+    max_children = _get_subagent_config_value(cfg, "maxChildrenPerAgent", 5)
     
     # Count active children (requires registry)
     from openclaw.agents.subagent_registry import get_global_registry
@@ -941,6 +920,104 @@ async def spawn_subagent_direct(
     child_idem = str(uuid.uuid4())
     child_run_id = child_idem
     
+    # Resolve subagent workspace — mirrors TS sandbox resolution.
+    # When sandbox is OFF (default), subagents share the agent workspace root.
+    # Per-session subdirs only when sandbox ON + workspaceAccess≠rw.
+    # Sandbox subdirs go in ~/.openclaw/sandboxes/<slug>/ (NOT inside workspace/).
+    child_session_workspace: str | None = None
+    try:
+        from openclaw.config.paths import resolve_state_dir, resolve_default_sandbox_workspace_root
+        from openclaw.config.loader import load_config as _load_cfg_for_sandbox
+
+        # Resolve agent workspace root — prefer config-based resolution
+        workspace_root = resolve_state_dir() / "workspace"
+        _sb_cfg = None
+        try:
+            _cfg_tmp = _load_cfg_for_sandbox()
+            # Try resolve_agent_workspace_dir for the child agent
+            try:
+                from openclaw.agents.agent_scope import resolve_agent_workspace_dir as _rawd
+                _child_agent_id_ws = target_agent_id  # defined earlier in spawn_subagent_direct
+                workspace_root = Path(_rawd(_cfg_tmp, _child_agent_id_ws))
+            except Exception:
+                pass
+            if isinstance(_cfg_tmp, dict):
+                _sb_cfg = (
+                    _cfg_tmp.get("agents", {})
+                    .get("defaults", {})
+                    .get("sandbox")
+                ) or _cfg_tmp.get("sandbox")
+            else:
+                _agents = getattr(_cfg_tmp, "agents", None)
+                _defaults = getattr(_agents, "defaults", None) if _agents else None
+                _sb_cfg = getattr(_defaults, "sandbox", None) if _defaults else None
+                if not _sb_cfg:
+                    _sb_cfg = getattr(_cfg_tmp, "sandbox", None)
+        except Exception:
+            pass
+
+        _sb_mode = "off"
+        _sb_ws_access = "none"
+        if _sb_cfg:
+            _sb_mode = str(
+                _sb_cfg.get("mode", "off") if isinstance(_sb_cfg, dict)
+                else getattr(_sb_cfg, "mode", "off")
+            ).strip().lower()
+            _sb_ws_access = str(
+                _sb_cfg.get("workspaceAccess", "none") if isinstance(_sb_cfg, dict)
+                else getattr(_sb_cfg, "workspaceAccess", None)
+                or getattr(_sb_cfg, "workspace_access", "none")
+            ).strip().lower()
+
+        _sb_enabled = _sb_mode not in ("off", "")
+        if _sb_enabled and _sb_ws_access != "rw":
+            from openclaw.agents.session_workspace import (
+                resolve_session_workspace_dir,
+                resolve_sandbox_scope_key,
+            )
+            # Sandbox subdirs live in ~/.openclaw/sandboxes/ (mirrors TS DEFAULT_SANDBOX_WORKSPACE_ROOT)
+            _sandbox_root_cfg = (
+                _sb_cfg.get("workspaceRoot") if isinstance(_sb_cfg, dict)
+                else getattr(_sb_cfg, "workspaceRoot", None)
+            ) if _sb_cfg else None
+            _sandbox_root = Path(_sandbox_root_cfg).expanduser() if _sandbox_root_cfg else resolve_default_sandbox_workspace_root()
+            _scope = str(
+                _sb_cfg.get("scope", "session") if isinstance(_sb_cfg, dict)
+                else getattr(_sb_cfg, "scope", "session")
+            ) if _sb_cfg else "session"
+            _scope_key = resolve_sandbox_scope_key(_scope, child_session_key)
+            if _scope == "shared":
+                child_session_workspace = str(_sandbox_root)
+            else:
+                child_session_workspace = str(resolve_session_workspace_dir(
+                    workspace_root=_sandbox_root,
+                    session_key=_scope_key,
+                ))
+        else:
+            child_session_workspace = str(workspace_root)
+    except Exception as ws_err:
+        logger.warning(f"Failed to resolve workspace for subagent: {ws_err}")
+
+    # Bootstrap sandbox workspace for subagent (mirrors TS ensureSandboxWorkspaceLayout +
+    # syncSkillsToWorkspace called during subagent context resolution in context.ts).
+    try:
+        if child_session_workspace and str(child_session_workspace) != str(workspace_root if 'workspace_root' in dir() else ''):
+            _main_ws = str(workspace_root) if 'workspace_root' in locals() else None
+            if _main_ws and _main_ws != child_session_workspace:
+                from openclaw.agents.sandbox.workspace import ensure_sandbox_workspace
+                from openclaw.agents.skills.workspace import sync_skills_to_workspace
+                await ensure_sandbox_workspace(
+                    workspace_dir=child_session_workspace,
+                    seed_from=_main_ws,
+                )
+                await sync_skills_to_workspace(
+                    source_workspace_dir=_main_ws,
+                    target_workspace_dir=child_session_workspace,
+                )
+                logger.debug("Subagent sandbox bootstrapped+skills synced: %s", child_session_workspace)
+    except Exception as _bs_exc:
+        logger.debug("Subagent sandbox bootstrap (non-fatal): %s", _bs_exc)
+
     if gateway is not None:
         try:
             # Use internal Gateway RPC call instead of direct handler invocation
@@ -950,6 +1027,7 @@ async def spawn_subagent_direct(
                 gateway=gateway,
                 message=child_task_message,
                 session_key=child_session_key,
+                session_workspace=child_session_workspace,
                 idempotency_key=child_idem,
                 deliver=False,
                 lane=AGENT_LANE_SUBAGENT,

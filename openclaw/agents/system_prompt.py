@@ -163,19 +163,31 @@ def build_agent_system_prompt(
     lines.extend(build_cli_quick_reference_section())
 
     # ── 6. Skills ────────────────────────────────────────────────────
-    # New API: build_skills_section now loads skills internally
+    # Mirrors TS system-prompt.ts: resolve readToolName from tool list,
+    # then build skills section with "(mandatory)" header.
+    _read_tool_name = "read"
+    for _tn in (tool_names or []):
+        if _tn.lower() == "read":
+            _read_tool_name = _tn
+            break
+    else:
+        for _tn in (tool_names or []):
+            if _tn.lower() == "read_file":
+                _read_tool_name = _tn
+                break
+
     if not is_minimal:
         if skills_prompt:
-            # Use provided skills_prompt if available (legacy)
-            lines.append("## Skills")
-            lines.append(skills_prompt.strip())
-            lines.append("")
+            lines.extend(build_skills_section(
+                skills_prompt=skills_prompt,
+                is_minimal=is_minimal,
+                read_tool_name=_read_tool_name,
+            ))
         else:
-            # Load skills dynamically
             lines.extend(build_skills_section_workspace(
                 workspace_dir=workspace_dir,
-                config=None,  # Will use default config
-                read_tool_name="read_file",
+                config=None,
+                read_tool_name=_read_tool_name,
             ))
 
     # ── 7. Memory ────────────────────────────────────────────────────

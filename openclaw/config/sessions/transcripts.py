@@ -122,9 +122,9 @@ def get_session_transcript_path(session_key: str) -> Path:
     
     parsed = parse_agent_session_key(session_key)
     if parsed:
-        agent_id = parsed["agentId"]
+        agent_id = parsed.agent_id
         # Use rest as session ID (may not be a pure UUID, but that's OK)
-        session_id = parsed["rest"].replace(":", "-")
+        session_id = parsed.rest.replace(":", "-")
     else:
         # Fallback: sanitize the full key
         agent_id = None

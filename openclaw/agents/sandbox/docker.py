@@ -16,13 +16,49 @@ from .constants import DEFAULT_SANDBOX_IMAGE, SANDBOX_AGENT_WORKSPACE_MOUNT
 logger = logging.getLogger(__name__)
 
 
-async def exec_docker(args: list[str], allow_failure: bool = False) -> dict[str, Any]:
+async def is_docker_available() -> bool:
+    """Check if docker command is available.
+    
+    Mirrors TS isDockerAvailable() in commands/doctor-sandbox.ts L65-74.
+    Returns True if `docker` command exists (indicating Docker CLI is installed).
+    Does NOT require Docker daemon to be running.
+    
+    Returns:
+        True if docker command exists
+    """
+    try:
+        # Use --version which works even if daemon is not running
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=5.0
+        )
+        # docker --version should always succeed if CLI is installed
+        return proc.returncode == 0
+    except FileNotFoundError:
+        # docker command not found in PATH
+        return False
+    except asyncio.TimeoutError:
+        logger.debug("Docker --version command timed out")
+        return False
+    except Exception as e:
+        logger.debug(f"Docker availability check failed: {e}")
+        return False
+
+
+async def exec_docker(args: list[str], allow_failure: bool = False, timeout_ms: int = 30000) -> dict[str, Any]:
     """
     Execute a Docker command
     
     Args:
         args: Docker command arguments
         allow_failure: If True, don't raise on non-zero exit
+        timeout_ms: Timeout in milliseconds (default 30000)
         
     Returns:
         Dict with stdout, stderr, code
@@ -30,6 +66,8 @@ async def exec_docker(args: list[str], allow_failure: bool = False) -> dict[str,
     Raises:
         RuntimeError: If command fails and allow_failure=False
     """
+    timeout_sec = timeout_ms / 1000
+    
     proc = await asyncio.create_subprocess_exec(
         "docker",
         *args,
@@ -37,7 +75,21 @@ async def exec_docker(args: list[str], allow_failure: bool = False) -> dict[str,
         stderr=asyncio.subprocess.PIPE,
     )
     
-    stdout_bytes, stderr_bytes = await proc.communicate()
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_sec
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        if not allow_failure:
+            raise RuntimeError(f"Docker command timed out after {timeout_ms}ms: docker {' '.join(args)}")
+        return {
+            "stdout": "",
+            "stderr": f"Command timed out after {timeout_ms}ms",
+            "code": -1,
+        }
+    
     stdout = stdout_bytes.decode() if stdout_bytes else ""
     stderr = stderr_bytes.decode() if stderr_bytes else ""
     code = proc.returncode or 0
@@ -346,7 +398,7 @@ class DockerSandbox:
             args.extend(["-v", f"{host_path}:{container_path}"])
         
         # Image and command (keep container running)
-        args.extend([self.config.image, "tail", "-f", "/dev/null"])
+        args.extend([self.config.image, "sleep", "infinity"])
         
         logger.info(f"Starting sandbox container: {self.container_name}")
         

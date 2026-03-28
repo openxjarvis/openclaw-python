@@ -1,21 +1,69 @@
 """
-Telegram channel onboarding adapter (aligned with TypeScript telegram.ts)
+Telegram channel onboarding adapter — mirrors TS
+src/channels/plugins/onboarding/telegram.ts
 """
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from .types import ChannelOnboardingAdapter, ChannelOnboardingStatus, DmPolicy
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
+
+
+def _can_use_env_token() -> str | None:
+    """Check if TELEGRAM_BOT_TOKEN is set in environment."""
+    return os.environ.get(TELEGRAM_BOT_TOKEN_ENV)
+
+
+async def fetch_telegram_chat_id(token: str, username: str) -> int | None:
+    """Resolve a @username to a numeric Telegram user ID via getUpdates.
+
+    Mirrors TS fetchTelegramChatId().
+    """
+    try:
+        import httpx
+
+        clean = username.lstrip("@")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"https://api.telegram.org/bot{token}/getUpdates")
+            data = resp.json()
+            for update in data.get("result", []):
+                msg = update.get("message", {})
+                user = msg.get("from", {})
+                if user.get("username", "").lower() == clean.lower():
+                    return user.get("id")
+    except Exception as e:
+        logger.debug("fetch_telegram_chat_id failed: %s", e)
+    return None
+
 
 class TelegramOnboardingAdapter(ChannelOnboardingAdapter):
-    """Onboarding adapter for Telegram channel"""
-    
-    def __init__(self):
+    """Onboarding adapter for Telegram channel.
+
+    Mirrors TS telegramOnboardingAdapter from
+    src/channels/plugins/onboarding/telegram.ts.
+    """
+
+    def __init__(self) -> None:
         super().__init__("telegram")
+
+    @property
+    def quickstart_score(self) -> int:
+        """Higher = more likely to be pre-selected in quickstart.
+
+        TS: 1 if configured, 10 if not (newcomer-friendly).
+        """
+        return 10
+
+    @property
+    def selection_hint(self) -> str:
+        """Short label for the channel picker."""
+        return "recommended · newcomer-friendly"
     
     async def get_status(self, config: dict[str, Any]) -> ChannelOnboardingStatus:
         """Check Telegram configuration status"""
@@ -48,32 +96,56 @@ class TelegramOnboardingAdapter(ChannelOnboardingAdapter):
         config: dict[str, Any],
         prompter: Any,
     ) -> dict[str, Any]:
-        """Interactive Telegram configuration"""
-        
-        # Show help
+        """Interactive Telegram configuration.
+
+        Mirrors TS configure() — detects env var, validates token format.
+        """
         await self._show_token_help(prompter)
-        
-        # Prompt for bot token
-        token = await prompter.text(
-            message="Enter Telegram bot token",
-            placeholder="123456:ABC...",
-            validate=lambda v: None if v and len(v) > 10 else "Token required"
-        )
-        
-        # Update config
+
+        env_token = _can_use_env_token()
+        token: str | None = None
+
+        if env_token:
+            use_env = True
+            try:
+                use_env = await prompter.confirm(
+                    message=f"Found {TELEGRAM_BOT_TOKEN_ENV} in environment. Use it?",
+                    default=True,
+                )
+            except Exception:
+                pass
+            if use_env:
+                token = env_token
+                print(f"✓ Using token from {TELEGRAM_BOT_TOKEN_ENV}")
+
+        if not token:
+            token = await prompter.text(
+                message="Enter Telegram bot token",
+                placeholder="123456:ABC...",
+                validate=lambda v: None if v and len(v) > 10 else "Token required",
+            )
+
         channels = config.get("channels", {})
         telegram_config = channels.get("telegram", {})
-        
+
         telegram_config["enabled"] = True
-        telegram_config["token"] = token
-        telegram_config["dmPolicy"] = "pairing"  # Default: pairing (aligns with TS)
-        telegram_config["groupPolicy"] = "allowlist"  # Default: allowlist (aligns with TS)
-        
+        telegram_config["botToken"] = token
+        telegram_config["dmPolicy"] = "pairing"
+        telegram_config["groupPolicy"] = "allowlist"
+
         channels["telegram"] = telegram_config
         config["channels"] = channels
-        
+
         logger.info("Telegram configured with bot token")
-        
+        return config
+
+    async def disable(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Disable Telegram channel. Mirrors TS adapter disable()."""
+        channels = config.get("channels", {})
+        tg = channels.get("telegram", {})
+        tg["enabled"] = False
+        channels["telegram"] = tg
+        config["channels"] = channels
         return config
     
     async def configure_dm_policy(

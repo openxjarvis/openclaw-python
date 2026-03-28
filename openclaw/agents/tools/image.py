@@ -124,7 +124,12 @@ class ImageTool(AgentTool):
 
             # Load media — pass url_or_path positionally so load_media's
             # source/url_or_path first-arg works regardless of name.
-            media = await load_media(image_input, max_bytes)
+            # ✅ FIX: Pass workspace_root to resolve relative paths correctly
+            media = await load_media(
+                image_input, 
+                max_bytes,
+                workspace_root=self.workspace_root
+            )
 
             # Validate that we received an image
             kind = media.kind or MediaKind.UNKNOWN

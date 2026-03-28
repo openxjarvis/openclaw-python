@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from openclaw.agents.session_entry import SessionEntry
 
@@ -64,6 +64,7 @@ def save_session_store_to_path(
     store: Dict[str, SessionEntry],
     skip_maintenance: bool = False,
     active_session_key: Optional[str] = None,
+    agent_id: Optional[str] = None,
 ) -> None:
     """
     Save session store to file path.
@@ -75,6 +76,7 @@ def save_session_store_to_path(
         store: Dict mapping canonical session keys to SessionEntry objects
         skip_maintenance: Skip prune/cap operations (default: False)
         active_session_key: Protected session key (won't be pruned/capped)
+        agent_id: Agent ID for loading maintenance config
     """
     # Convert to Path if string
     if isinstance(store_path, str):
@@ -89,20 +91,47 @@ def save_session_store_to_path(
             from openclaw.agents.session_maintenance import (
                 prune_stale_entries,
                 cap_entry_count,
+                resolve_maintenance_config,
             )
+            from openclaw.config.loader import load_config
             
-            # Default config: prune after 30 days, cap at 500 entries
-            pruned = prune_stale_entries(store)
-            capped = cap_entry_count(
-                store,
-                max_entries=500,
-                active_session_key=active_session_key,
-            )
+            # Load maintenance config from agent configuration
+            maintenance_config = None
+            if agent_id:
+                try:
+                    cfg = load_config()
+                    agents_cfg = getattr(cfg, "agents", None)
+                    if agents_cfg:
+                        agent_list = agents_cfg.list if hasattr(agents_cfg, 'list') else []
+                        for a in agent_list:
+                            if a.id == agent_id:
+                                agent_dict = a.model_dump() if hasattr(a, 'model_dump') else a.__dict__
+                                session_cfg = agent_dict.get("session", {})
+                                maintenance_config = session_cfg.get("maintenance")
+                                break
+                except Exception:
+                    pass
             
-            if pruned > 0 or capped > 0:
-                logger.info(
-                    f"Session maintenance applied: pruned={pruned}, capped={capped}"
+            # Resolve config with defaults
+            resolved = resolve_maintenance_config(maintenance_config)
+            mode = resolved["mode"]
+            
+            # Apply maintenance directly to the passed-in store (in-place modification)
+            if mode != "off":
+                pruned = prune_stale_entries(
+                    store,
+                    override_max_age_ms=resolved["pruneAfterMs"],
                 )
+                capped = cap_entry_count(
+                    store,
+                    max_entries=resolved["maxEntries"],
+                    active_session_key=active_session_key,
+                )
+                
+                if pruned > 0 or capped > 0:
+                    logger.info(
+                        f"Session maintenance applied: pruned={pruned}, capped={capped}"
+                    )
         except Exception as e:
             logger.warning(f"Session maintenance failed: {e}")
     

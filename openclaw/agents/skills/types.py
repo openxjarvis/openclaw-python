@@ -223,17 +223,19 @@ class SkillEligibilityContext:
 class SkillSnapshot:
     """
     Skills snapshot for prompt (matches TS SkillSnapshot).
-    
+
     Attributes:
         prompt: Formatted skills prompt
-        skills: List of skill info (name, primaryEnv)
-        resolved_skills: Resolved skill objects
-        version: Snapshot version
+        skills: List of skill info dicts (name, primaryEnv?, requiredEnv?)
+        skill_filter: Normalized agent-level filter used to build this snapshot; None = unrestricted
+        resolved_skills: Resolved skill objects (for fast re-use without disk I/O)
+        version: Snapshot version (bumped by the skills file watcher)
     """
     prompt: str
-    skills: list[dict[str, str]]
+    skills: list[dict[str, Any]]
+    skill_filter: list[str] | None = None
     resolved_skills: list[Skill] | None = None
-    version: int = 1
+    version: int | None = None
 
 
 @dataclass

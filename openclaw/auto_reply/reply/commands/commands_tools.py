@@ -369,7 +369,11 @@ async def _subagents_spawn(session_key: str, cfg: dict[str, Any], rest_tokens: l
         return ReplyPayload(text="Task cannot be empty")
     
     try:
-        from openclaw.agents.subagent_spawn import spawn_subagent_direct, SpawnSubagentParams
+        from openclaw.agents.subagent_spawn import (
+            spawn_subagent_direct,
+            SpawnSubagentParams,
+            SpawnSubagentContext,
+        )
         from openclaw.routing.session_key import normalize_main_key
         
         requester = normalize_main_key(session_key) if session_key else session_key
@@ -384,17 +388,13 @@ async def _subagents_spawn(session_key: str, cfg: dict[str, Any], rest_tokens: l
             expectsCompletionMessage=True,
         )
         
-        # Context from current session
-        context = {
-            "agentSessionKey": requester,
-            "agentChannel": getattr(ctx, "OriginatingChannel", None) or getattr(ctx, "Channel", None),
-            "agentAccountId": getattr(ctx, "AccountId", None),
-            "agentTo": getattr(ctx, "To", None),
-            "agentThreadId": getattr(ctx, "MessageThreadId", None),
-            "agentGroupId": None,
-            "agentGroupChannel": None,
-            "agentGroupSpace": None,
-        }
+        context = SpawnSubagentContext(
+            agentSessionKey=requester,
+            agentChannel=getattr(ctx, "OriginatingChannel", None) or getattr(ctx, "Channel", None),
+            agentAccountId=getattr(ctx, "AccountId", None),
+            agentTo=getattr(ctx, "To", None),
+            agentThreadId=getattr(ctx, "MessageThreadId", None),
+        )
         
         result = await spawn_subagent_direct(params, context)
         

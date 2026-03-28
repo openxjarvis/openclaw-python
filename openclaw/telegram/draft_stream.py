@@ -1,4 +1,7 @@
-"""Draft streaming for Telegram.
+"""DEPRECATED: This legacy module is not imported by any production code.
+Use openclaw.channels.telegram.draft_stream instead.
+
+Draft streaming for Telegram.
 
 Allows real-time updates of messages while the agent is generating responses.
 Matches TypeScript src/telegram/draft-stream.ts

@@ -1280,20 +1280,112 @@ async def get_reply_from_config(
             return result
 
     # ------------------------------------------------------------------
-    # 5. Skill commands (/skill:name)
+    # 5. Skill dispatch (slash command + keyword detection + SKILL.md injection)
+    #
+    # NOTE: For messages arriving via channel_manager (Telegram, etc.), skill
+    # dispatch runs in channel_manager.py BEFORE ReplyContext is created, because
+    # channel_manager bypasses get_reply entirely for the Telegram path.
+    #
+    # This block handles the process_message.py / dispatch_from_config.py path
+    # (non-channel_manager flows) — logic is identical to channel_manager.py.
     # ------------------------------------------------------------------
-    skill_pattern = re.compile(r"^/skill:([a-zA-Z0-9_-]+)(?:\s+(.*))?$", re.DOTALL)
-    skill_match = skill_pattern.match(effective_body.strip())
-    if skill_match:
-        skill_name = skill_match.group(1)
-        skill_args = (skill_match.group(2) or "").strip()
-        try:
-            from openclaw.auto_reply.skill_commands import run_skill_command
-            result = await run_skill_command(skill_name, skill_args, ctx, cfg)
-            if result is not None:
-                return ReplyPayload(text=str(result))
-        except Exception as exc:
-            logger.warning(f"Skill command /{skill_name} failed: {exc}")
+    def _apply_body_rewrite(new_body: str) -> None:
+        nonlocal effective_body
+        effective_body = new_body
+        if hasattr(ctx, "Body"):
+            ctx.Body = new_body
+        if hasattr(ctx, "BodyForAgent"):
+            ctx.BodyForAgent = new_body
+
+    _skill_was_dispatched = False
+
+    try:
+        import re as _re_gr
+        from openclaw.agents.skills.workspace import load_workspace_skill_entries, filter_skill_entries
+        from pathlib import Path as _GPath
+        from openclaw.config.paths import resolve_state_dir as _rsd_gr
+
+        _ws_gr = str(_workspace_dir_raw or (_rsd_gr() / "workspace"))
+        _cfg_dict_gr = (
+            cfg if isinstance(cfg, dict)
+            else (cfg.model_dump() if hasattr(cfg, "model_dump") else {})
+        )
+        _sk_entries_gr = load_workspace_skill_entries(_ws_gr, _cfg_dict_gr)
+        _sk_eligible_gr = filter_skill_entries(_sk_entries_gr, _cfg_dict_gr, _merged_skill_filter)
+        _always_gr = [e for e in _sk_eligible_gr if e.metadata and e.metadata.always]
+
+        def _read_sk_gr(loc: object) -> str | None:
+            if not loc:
+                return None
+            try:
+                return _GPath(str(loc)).read_text(encoding="utf-8").strip() or None
+            except Exception:
+                return None
+
+        def _build_sk_rewrite_gr(name: str, user_input: str, content: str | None) -> str:
+            parts = [f'Use the "{name}" skill for this request.']
+            if content:
+                parts.append(
+                    "The skill instructions from SKILL.md are preloaded below"
+                    " — follow them exactly:\n\n" + content
+                )
+            if user_input and user_input.strip():
+                parts.append(f"User input:\n{user_input.strip()}")
+            return "\n\n".join(parts)
+
+        _msg_gr = effective_body.strip()
+
+        # Path 1: Slash command dispatch (mirrors TS resolveSkillCommandInvocation)
+        if _msg_gr.startswith("/"):
+            _sm = _re_gr.match(r"^/([^\s]+)(?:\s+([\s\S]+))?$", _msg_gr)
+            if _sm:
+                _cn = _sm.group(1).lower()
+                _ca = (_sm.group(2) or "").strip()
+                if _cn == "skill" and _ca:
+                    _sr = _re_gr.match(r"^([^\s]+)(?:\s+([\s\S]+))?$", _ca)
+                    if _sr:
+                        _cn = _sr.group(1).lower()
+                        _ca = (_sr.group(2) or "").strip()
+                for _ae in _always_gr:
+                    if _ae.skill.name.lower() == _cn:
+                        _sc = _read_sk_gr(getattr(_ae.skill, "location", None))
+                        _inp = _ca if _ca else _msg_gr
+                        _apply_body_rewrite(_build_sk_rewrite_gr(_ae.skill.name, _inp, _sc))
+                        _skill_was_dispatched = True
+                        logger.info(
+                            "Skill slash-cmd /%s → rewrite%s",
+                            _ae.skill.name, " (SKILL.md injected)" if _sc else "",
+                        )
+                        break
+
+        # Path 2: Keyword detection (Gemini workaround — TS relies on Claude instruction-following)
+        if not _skill_was_dispatched:
+            _SKILL_KW: dict[str, list[str]] = {
+                "pptx": ["ppt", ".pptx", "presentation", "slide", "deck",
+                         "幻灯片", "演示文稿", "演示", "pptx"],
+                "docx": [".docx", "word document", "word doc", "docx"],
+                "pdf": [".pdf", "pdf file", "pdf document"],
+                "xlsx": [".xlsx", ".xls", "excel", "spreadsheet", "表格", "xlsx"],
+            }
+            _bl = _msg_gr.lower()
+            for _ae in _always_gr:
+                _kws = _SKILL_KW.get(_ae.skill.name)
+                if not _kws:
+                    continue
+                for _kw in _kws:
+                    if _kw in _bl:
+                        _sc = _read_sk_gr(getattr(_ae.skill, "location", None))
+                        _apply_body_rewrite(_build_sk_rewrite_gr(_ae.skill.name, _msg_gr, _sc))
+                        _skill_was_dispatched = True
+                        logger.info(
+                            "Skill keyword '%s' → skill '%s'%s",
+                            _kw, _ae.skill.name, " (SKILL.md injected)" if _sc else "",
+                        )
+                        break
+                if _skill_was_dispatched:
+                    break
+    except Exception as _sk_exc:
+        logger.debug("Skill dispatch (non-fatal): %s", _sk_exc)
 
     # ------------------------------------------------------------------
     # 6. Build inbound context (matches TS get-reply-run.ts)
@@ -1418,6 +1510,7 @@ async def get_reply_from_config(
                     is_first_turn_in_session=is_new_session,
                     workspace_dir=str(_workspace_dir_for_skills),
                     cfg=cfg,
+                    skill_filter=_merged_skill_filter,
                 )
         except Exception as _ss_exc:
             logger.debug("ensure_skill_snapshot failed: %s", _ss_exc)

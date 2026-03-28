@@ -120,8 +120,8 @@ async def _ensure_session_runtime_cleanup(
                 pi_runtime = getattr(gateway, "pi_runtime", None)
                 if pi_runtime is not None and hasattr(pi_runtime, "abort_session"):
                     await pi_runtime.abort_session(session_id)
-                elif pi_runtime is not None and hasattr(pi_runtime, "_sessions"):
-                    pi_session = pi_runtime._sessions.get(session_id)
+                elif pi_runtime is not None and hasattr(pi_runtime, "_pool"):
+                    pi_session = pi_runtime._pool.get(session_id)
                     if pi_session is not None and hasattr(pi_session, "abort"):
                         pi_session.abort()
         except Exception as exc:
@@ -617,8 +617,8 @@ class SessionsResetMethod:
                 channel_manager = connection.gateway.channel_manager
                 if channel_manager and channel_manager.session_manager:
                     session_manager = channel_manager.session_manager
-                    if old_session_id and old_session_id in getattr(session_manager, "_sessions", {}):
-                        del session_manager._sessions[old_session_id]
+                    if old_session_id and old_session_id in getattr(session_manager, "_pool", {}):
+                        del session_manager._pool[old_session_id]
                     session_manager._session_store_loaded_at = 0.0
         except Exception as exc:
             logger.warning(f"Failed to invalidate session cache: {exc}")
@@ -751,6 +751,20 @@ class SessionsDeleteMethod:
                 del store_dict[target.canonical_key]
 
         update_session_store(target.store_path, mutator)
+
+        # Clean up session workspace
+        try:
+            from openclaw.agents.session_workspace_cleanup import cleanup_session_workspace
+            from openclaw.config.paths import resolve_state_dir
+            
+            workspace_root = resolve_state_dir() / "workspace"
+            cleanup_session_workspace(
+                workspace_root=workspace_root,
+                session_key=target.canonical_key,
+                dry_run=False,
+            )
+        except Exception as ws_exc:
+            logger.debug(f"Session workspace cleanup skipped: {ws_exc}")
 
         # Fire lifecycle hooks — mirrors TS triggerInternalHook("session:delete") chain
         try:

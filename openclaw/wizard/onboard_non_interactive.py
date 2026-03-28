@@ -184,8 +184,15 @@ async def run_non_interactive_onboarding(
         logger.error(f"Failed to save config: {e}")
         return {"success": False, "error": str(e)}
 
-    # TS alignment: onboarding completion is tracked via workspace-state.json
-    # (see openclaw/agents/ensure_workspace.py for workspace-state.json management)
+    # Mark onboarding complete via workspace-state.json (mirrors TS)
+    try:
+        from openclaw.wizard.onboarding import mark_onboarding_complete
+        from openclaw.config.paths import resolve_state_dir
+
+        ws = workspace or (resolve_state_dir() / "workspace")
+        mark_onboarding_complete(ws)
+    except Exception as e:
+        logger.warning("Could not mark onboarding complete: %s", e)
 
     print("\nNon-interactive onboarding complete!")
     print("\nNext steps:")

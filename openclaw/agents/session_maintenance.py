@@ -306,4 +306,302 @@ __all__ = [
     "DEFAULT_SESSION_PRUNE_AFTER_MS",
     "DEFAULT_SESSION_MAX_ENTRIES",
     "DEFAULT_SESSION_ROTATE_BYTES",
+    "archive_removed_transcripts",
+    "cleanup_archived_transcripts",
+    "rotate_session_store",
+    "apply_session_maintenance",
 ]
+
+
+def archive_removed_transcripts(
+    sessions_dir: Path,
+    removed_session_ids: list[str],
+    removed_session_keys: list[str] | None = None,
+    workspace_root: Path | None = None,
+    reason: str = "deleted",
+    cleanup_workspaces: bool = True,
+) -> list[str]:
+    """
+    Archive transcript files for removed sessions and optionally clean up workspaces.
+    
+    Matches TS archiveSessionTranscripts() concept with added workspace cleanup.
+    
+    Args:
+        sessions_dir: Sessions directory
+        removed_session_ids: List of session IDs to archive
+        removed_session_keys: Optional list of session keys for workspace cleanup
+        workspace_root: Workspace root directory for cleanup
+        reason: Archive reason suffix
+        cleanup_workspaces: Whether to clean up session workspaces
+    
+    Returns:
+        List of archived file paths
+    """
+    from openclaw.gateway.session_utils import archive_session_transcripts
+    
+    archived_files = []
+    for session_id in removed_session_ids:
+        try:
+            archived = archive_session_transcripts(
+                session_id=session_id,
+                store_path=str(sessions_dir),
+                reason=reason,
+                restrict_to_store_dir=True,
+            )
+            archived_files.extend(archived)
+        except Exception:
+            pass
+    
+    # Clean up session workspaces if requested
+    if cleanup_workspaces and workspace_root and removed_session_keys:
+        from openclaw.agents.session_workspace_cleanup import cleanup_session_workspace
+        
+        for session_key in removed_session_keys:
+            try:
+                cleanup_session_workspace(
+                    workspace_root=workspace_root,
+                    session_key=session_key,
+                    dry_run=False,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to clean workspace for {session_key}: {e}")
+    
+    return archived_files
+
+
+def cleanup_archived_transcripts(
+    directories: list[Path],
+    older_than_ms: int,
+    reason: str = "deleted",
+    now_ms: Optional[int] = None,
+) -> int:
+    """
+    Clean up old archived transcripts.
+    
+    Matches TS cleanupArchivedSessionTranscripts() concept.
+    
+    Args:
+        directories: Directories to clean
+        older_than_ms: Age threshold in milliseconds
+        reason: Archive reason to match
+        now_ms: Current timestamp (defaults to now)
+    
+    Returns:
+        Number of files deleted
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    
+    cutoff_ms = now_ms - older_than_ms
+    deleted_count = 0
+    
+    for directory in directories:
+        if not directory.exists():
+            continue
+        
+        # Find archived files matching pattern: *.{reason}.{timestamp}
+        pattern = f"*.{reason}.*"
+        for file_path in directory.glob(pattern):
+            if not file_path.is_file():
+                continue
+            
+            # Extract timestamp from filename
+            try:
+                parts = file_path.name.split(".")
+                # Find timestamp after reason
+                for i, part in enumerate(parts):
+                    if part == reason and i + 1 < len(parts):
+                        timestamp_str = parts[i + 1]
+                        timestamp_ms = int(timestamp_str)
+                        
+                        if timestamp_ms < cutoff_ms:
+                            file_path.unlink()
+                            deleted_count += 1
+                        break
+            except Exception:
+                continue
+    
+    return deleted_count
+
+
+def rotate_session_store(
+    store_path: Path,
+    max_bytes: int,
+) -> bool:
+    """
+    Rotate sessions.json if it exceeds size threshold.
+    
+    Matches TS concept of rotating large session stores.
+    
+    Args:
+        store_path: Path to sessions.json
+        max_bytes: Size threshold for rotation
+    
+    Returns:
+        True if rotated, False otherwise
+    """
+    if not store_path.exists():
+        return False
+    
+    try:
+        size = store_path.stat().st_size
+        if size <= max_bytes:
+            return False
+        
+        # Rotate: sessions.json -> sessions.json.rotate.{timestamp}
+        timestamp_ms = int(time.time() * 1000)
+        rotated_name = f"{store_path.name}.rotate.{timestamp_ms}"
+        rotated_path = store_path.parent / rotated_name
+        
+        store_path.rename(rotated_path)
+        return True
+    except Exception:
+        return False
+
+
+def apply_session_maintenance(
+    agent_id: str,
+    store_path: Path,
+    sessions_dir: Path,
+    config: Optional[SessionMaintenanceConfig] = None,
+    active_session_key: Optional[str] = None,
+    workspace_root: Optional[Path] = None,
+) -> dict:
+    """
+    Apply session maintenance based on configuration.
+    
+    Main entry point that orchestrates all maintenance operations.
+    Matches TS applySessionMaintenance() concept with added workspace cleanup.
+    
+    Args:
+        agent_id: Agent ID for context
+        store_path: Path to sessions.json
+        sessions_dir: Sessions directory
+        config: Maintenance configuration
+        active_session_key: Currently active session to preserve
+        workspace_root: Workspace root for session workspace cleanup
+    
+    Returns:
+        Dictionary with maintenance results
+    """
+    resolved = resolve_maintenance_config(config)
+    mode = resolved["mode"]
+    
+    if mode == "off":
+        return {"mode": "off", "applied": False}
+    
+    # Load current store
+    from openclaw.config.sessions.store import load_session_store, update_session_store
+    
+    store = load_session_store(str(store_path))
+    
+    results = {
+        "mode": mode,
+        "applied": mode == "enforce",
+        "pruned": 0,
+        "capped": 0,
+        "archived": 0,
+        "rotated": False,
+        "disk_cleanup": None,
+        "workspaces_cleaned": 0,
+        "orphaned_workspaces_cleaned": 0,
+    }
+    
+    removed_session_ids = []
+    removed_session_keys = []
+    
+    def track_removal(key: str, entry):
+        session_id = entry.get("sessionId") if isinstance(entry, dict) else getattr(entry, "sessionId", None)
+        if session_id:
+            removed_session_ids.append(session_id)
+        # Track the session key too for workspace cleanup
+        removed_session_keys.append(key)
+    
+    # 1. Prune stale entries
+    if mode == "enforce":
+        pruned = prune_stale_entries(
+            store,
+            override_max_age_ms=resolved["pruneAfterMs"],
+            on_pruned=track_removal,
+        )
+        results["pruned"] = pruned
+    
+    # 2. Cap entry count
+    if mode == "enforce":
+        capped = cap_entry_count(
+            store,
+            max_entries=resolved["maxEntries"],
+            active_session_key=active_session_key,
+            on_capped=track_removal,
+        )
+        results["capped"] = capped
+    
+    # 3. Archive removed transcripts and clean up workspaces
+    if mode == "enforce" and removed_session_ids:
+        archived_files = archive_removed_transcripts(
+            sessions_dir,
+            removed_session_ids,
+            removed_session_keys=removed_session_keys,
+            workspace_root=workspace_root,
+            reason="deleted",
+            cleanup_workspaces=True,
+        )
+        results["archived"] = len(archived_files)
+        results["workspaces_cleaned"] = len(removed_session_keys)
+    
+    # 4. Cleanup old archived transcripts
+    if mode == "enforce" and resolved["resetArchiveRetentionMs"]:
+        cleanup_archived_transcripts(
+            directories=[sessions_dir],
+            older_than_ms=resolved["resetArchiveRetentionMs"],
+            reason="deleted",
+        )
+    
+    # 5. Rotate sessions.json if too large
+    if mode == "enforce":
+        rotated = rotate_session_store(store_path, resolved["rotateBytes"])
+        results["rotated"] = rotated
+    
+    # 6. Enforce disk budget
+    if mode == "enforce" and resolved["maxDiskBytes"]:
+        disk_result = enforce_session_disk_budget(
+            sessions_dir,
+            max_disk_bytes=resolved["maxDiskBytes"],
+            high_water_bytes=resolved["highWaterBytes"],
+            active_session_key=active_session_key,
+        )
+        results["disk_cleanup"] = disk_result
+    
+    # 7. Clean up orphaned workspaces (best effort)
+    if mode == "enforce" and workspace_root:
+        try:
+            from openclaw.agents.session_workspace_cleanup import cleanup_orphaned_workspaces
+            
+            # Get active session keys from store
+            active_keys = set(store.keys())
+            
+            orphan_stats = cleanup_orphaned_workspaces(
+                workspace_root=workspace_root,
+                active_session_keys=active_keys,
+                older_than_hours=24,  # Only delete workspaces older than 24h
+                dry_run=False,
+            )
+            results["orphaned_workspaces_cleaned"] = orphan_stats.get("deleted", 0)
+            
+            if orphan_stats.get("deleted", 0) > 0:
+                logger.info(
+                    f"Cleaned up {orphan_stats['deleted']} orphaned session workspaces"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to clean orphaned workspaces: {e}")
+    
+    # Save updated store if enforcement mode
+    if mode == "enforce":
+        def save_mutator(store_dict):
+            store_dict.clear()
+            store_dict.update(store)
+        
+        update_session_store(str(store_path), save_mutator)
+    
+    return results
+

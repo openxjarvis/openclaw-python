@@ -151,13 +151,11 @@ class SubagentRegistry:
         
         now = int(time.time() * 1000)
         
-        # Calculate archive timestamp (matches TS lines 982-986)
         archive_at_ms = None
         if spawn_mode != "session":
-            # TODO: Read from config agents.defaults.subagents.archiveAfterMinutes
-            archive_after_minutes = 60  # Default
-            if archive_after_minutes > 0:
-                archive_at_ms = now + (archive_after_minutes * 60_000)
+            archive_after_ms = self._resolve_archive_after_ms()
+            if archive_after_ms > 0:
+                archive_at_ms = now + archive_after_ms
         
         record = SubagentRunRecord(
             run_id=run_id,
@@ -191,7 +189,11 @@ class SubagentRegistry:
         # Start wait for completion (matches TS line 1018)
         import asyncio
         timeout_ms = run_timeout_seconds * 1000 if run_timeout_seconds else 300_000  # Default 5 min
-        asyncio.create_task(self._wait_for_completion(run_id, timeout_ms))
+        try:
+            asyncio.create_task(self._wait_for_completion(run_id, timeout_ms))
+        except RuntimeError:
+            # No event loop running (e.g., in tests) - skip task creation
+            logger.debug(f"No event loop available for wait_for_completion task for run {run_id}")
         
         return record
     
@@ -392,8 +394,12 @@ class SubagentRegistry:
             return
         
         import asyncio
-        self._sweeper_task = asyncio.create_task(self._sweeper_loop())
-        logger.debug("SubagentRegistry sweeper started")
+        try:
+            self._sweeper_task = asyncio.create_task(self._sweeper_loop())
+            logger.debug("SubagentRegistry sweeper started")
+        except RuntimeError:
+            # No event loop running (e.g., in tests) - skip sweeper
+            logger.debug("No event loop available for sweeper task")
     
     async def _sweeper_loop(self) -> None:
         """Periodic cleanup of archived runs (matches TS sweepSubagentRuns)."""
@@ -729,6 +735,7 @@ class SubagentRegistry:
                 requester_origin=entry.requester_origin or {},
                 requester_display_key=entry.requester_display_key or entry.requester_session_key,
                 task=entry.task,
+                gateway=self._gateway,  # ✅ Pass gateway reference
                 timeout_ms=60_000,  # 60 second timeout
                 cleanup=entry.cleanup,
                 wait_for_completion=False,
@@ -798,6 +805,25 @@ class SubagentRegistry:
         if record:
             record.suppress_announce_reason = "steer-restart"
     
+    def clear_subagent_run_steer_restart(self, run_id: str) -> bool:
+        """
+        Clear steer-restart suppression from a subagent run.
+        
+        Called when a steer attempt fails to restore normal announce behavior.
+        Matches TS clearSubagentRunSteerRestart() lines 880-901.
+        """
+        key = (run_id or "").strip()
+        if not key:
+            return False
+        record = self._runs.get(key)
+        if not record:
+            return False
+        if record.suppress_announce_reason != "steer-restart":
+            return True
+        record.suppress_announce_reason = None
+        self._persist_runs()
+        return True
+
     def replace_subagent_run_after_steer(
         self,
         old_run_id: str,

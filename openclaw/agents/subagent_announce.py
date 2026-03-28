@@ -253,6 +253,7 @@ async def run_subagent_announce_flow(
     requester_session_key: str,
     requester_origin: dict,
     task: str,
+    gateway: any = None,  # ✅ New: Gateway reference for direct calls
     timeout_ms: int | None = None,
     cleanup: str = "keep",
     round_one_reply: str | None = None,
@@ -279,6 +280,7 @@ async def run_subagent_announce_flow(
         requester_session_key: Parent/requester session key
         requester_origin: Delivery context (channel, to, accountId, threadId)
         task: Task description/label
+        gateway: Gateway reference for direct calls (preferred over RPC)
         timeout_ms: Timeout in milliseconds
         cleanup: "keep" or "delete" session after announce
         round_one_reply: Initial reply text (for cron jobs, this is the result)
@@ -402,35 +404,61 @@ async def run_subagent_announce_flow(
         
         # Send to parent session via gateway (matches TS)
         try:
-            from openclaw.gateway.rpc_client import GatewayRPCClient
-            
-            client = GatewayRPCClient()
-            
-            # Call agent method to inject message into parent session
-            # Matches TS: callGateway({ method: "agent", params: {...} })
-            await client.call(
-                method="agent",
-                params={
-                    "message": announce_text,
-                    "sessionKey": requester_session_key,
-                    "channel": "internal",  # Internal message channel
-                    "lane": "nested",       # Nested lane for subagent messages
-                    "deliver": False,       # Don't deliver to external channels
-                    # Add internal events if needed
-                    "internalEvents": [{
-                        "type": "subagent_completed",
+            # ✅ Prefer direct gateway call (mirrors TS gateway.agent() call)
+            if gateway:
+                from openclaw.gateway.internal_call import call_agent_internal
+                
+                await call_agent_internal(
+                    gateway=gateway,
+                    message=announce_text,
+                    session_key=requester_session_key,
+                    deliver=False,  # Don't deliver to external channels
+                    internal_events=[{
+                        "type": "task_completion",
                         "runId": child_run_id,
                         "childSessionKey": child_session_key,
                         "taskLabel": record.label or task,
                         "status": record.status,
-                    }] if record.status == "completed" else None,
-                },
-            )
-            
-            logger.info(
-                f"[subagent-announce] Successfully announced run={child_run_id} "
-                f"→ {requester_session_key}"
-            )
+                        "result": result[:200] if result else None,  # Truncate for event
+                    }] if record.status == "completed" else [],
+                    timeout_ms=10_000,
+                )
+                
+                logger.info(
+                    f"[subagent-announce] Successfully announced run={child_run_id} "
+                    f"→ {requester_session_key} (direct gateway call)"
+                )
+            else:
+                # Fallback to RPC client if gateway not available
+                from openclaw.gateway.rpc_client import GatewayRPCClient
+                
+                client = GatewayRPCClient()
+                
+                # Call agent method to inject message into parent session
+                # Matches TS: callGateway({ method: "agent", params: {...} })
+                await client.call(
+                    method="agent",
+                    params={
+                        "message": announce_text,
+                        "sessionKey": requester_session_key,
+                        "channel": "internal",  # Internal message channel
+                        "lane": "nested",       # Nested lane for subagent messages
+                        "deliver": False,       # Don't deliver to external channels
+                        # Add internal events if needed
+                        "internalEvents": [{
+                            "type": "subagent_completed",
+                            "runId": child_run_id,
+                            "childSessionKey": child_session_key,
+                            "taskLabel": record.label or task,
+                            "status": record.status,
+                        }] if record.status == "completed" else None,
+                    },
+                )
+                
+                logger.info(
+                    f"[subagent-announce] Successfully announced run={child_run_id} "
+                    f"→ {requester_session_key} (RPC)"
+                )
             
             record.announce_sent = True
             record.announce_pending = False

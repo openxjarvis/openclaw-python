@@ -76,22 +76,50 @@ class CronTimer:
         self._task = asyncio.create_task(self._wait(MAX_TIMER_DELAY_MS / 1000))
 
     def stop(self) -> None:
-        """Stop the timer."""
+        """Stop the timer synchronously.
+        
+        Cancels the running task if any. The task's _wait() method will catch
+        CancelledError and exit cleanly without invoking the callback.
+        """
         if self._task and not self._task.done():
             self._task.cancel()
         self._task = None
         self.next_fire_ms = None
         logger.info("cron: timer stopped")
+    
+    async def stop_async(self) -> None:
+        """Stop the timer and wait for it to actually stop.
+        
+        This ensures the timer callback won't execute after stop() returns.
+        Use this in async contexts like Gateway shutdown.
+        """
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task  # ✅ Wait for task to actually finish
+            except asyncio.CancelledError:
+                pass  # Expected
+            except Exception as e:
+                logger.debug(f"cron: timer task exception during stop: {e}")
+        self._task = None
+        self.next_fire_ms = None
+        logger.info("cron: timer stopped (async)")
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     async def _wait(self, delay_seconds: float) -> None:
+        """Wait and fire timer callback.
+        
+        Catches CancelledError when task is cancelled during stop().
+        Mirrors NodeJS setTimeout behavior but with async cancellation.
+        """
         try:
             await asyncio.sleep(delay_seconds)
             await self._on_timer()
         except asyncio.CancelledError:
+            # Normal - task was cancelled during stop()
             logger.debug("cron: timer cancelled")
         except Exception as e:
             logger.error(f"cron: timer tick failed: {e}", exc_info=True)

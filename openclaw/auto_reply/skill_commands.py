@@ -263,14 +263,20 @@ def resolve_skill_command_invocation(
         return {"command": skill_command, "args": args}
     
     # Handle direct skill command: /skillname <args>
+    # Entries may be dicts or SkillCommandSpec dataclasses — use getattr for safety
     command = next(
-        (entry for entry in skill_commands if entry["name"].lower() == command_name),
+        (
+            entry for entry in skill_commands
+            if (
+                entry.get("name", "") if isinstance(entry, dict) else getattr(entry, "name", "")
+            ).lower() == command_name
+        ),
         None,
     )
-    
+
     if not command:
         return None
-    
+
     args = match.group(2).strip() if match.group(2) else None
     return {"command": command, "args": args}
 

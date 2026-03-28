@@ -139,7 +139,7 @@ class SandboxFsBridge:
         self, file_path: str, cwd: str | None = None
     ) -> bytes:
         """Read a file from the container, returning raw bytes."""
-        target = self.resolve_path(file_path, cwd)
+        target = await self.assert_path_safety(file_path, cwd)
         result = await self._run_command(
             'set -eu; cat -- "$1"',
             args=[target.container_path],
@@ -155,21 +155,25 @@ class SandboxFsBridge:
         encoding: str = "utf-8",
         mkdir: bool = True,
     ) -> None:
-        """Write *data* to *file_path* inside the container."""
+        """Write *data* to *file_path* inside the container.
+
+        Uses atomic write (mktemp + mv) to prevent partial writes.
+        Mirrors TS fs-bridge.ts atomic write pattern.
+        """
         target = await self.assert_path_safety(file_path, cwd)
         self._ensure_write_access(target, "write files")
 
         if isinstance(data, str):
             data = data.encode(encoding)
 
-        if mkdir:
-            script = (
-                'set -eu; dir=$(dirname -- "$1"); '
-                'if [ "$dir" != "." ]; then mkdir -p -- "$dir"; fi; '
-                'cat >"$1"'
-            )
-        else:
-            script = 'set -eu; cat >"$1"'
+        # Atomic: write to temp file, then move into place
+        script = (
+            'set -eu; dir=$(dirname -- "$1"); '
+            'if [ "$dir" != "." ]; then mkdir -p -- "$dir"; fi; '
+            'tmp=$(mktemp -- "$1.XXXXXX"); '
+            'cat >"$tmp"; '
+            'mv -- "$tmp" "$1"'
+        )
 
         await self._run_command(script, args=[target.container_path], stdin=data)
 
@@ -189,6 +193,8 @@ class SandboxFsBridge:
         """Remove *file_path* inside the container."""
         target = await self.assert_path_safety(file_path, cwd)
         self._ensure_write_access(target, "remove files")
+        # Recheck safety via canonical path inside container before mutating
+        await self._recheck_path_safety(target.container_path)
 
         flags: list[str] = []
         if force:
@@ -208,6 +214,8 @@ class SandboxFsBridge:
         dst = await self.assert_path_safety(to_path, cwd)
         self._ensure_write_access(src, "rename files")
         self._ensure_write_access(dst, "rename files")
+        await self._recheck_path_safety(src.container_path)
+        await self._recheck_path_safety(dst.container_path)
         script = (
             'set -eu; dir=$(dirname -- "$2"); '
             'if [ "$dir" != "." ]; then mkdir -p -- "$dir"; fi; '
@@ -303,6 +311,24 @@ class SandboxFsBridge:
             "stderr": stderr_text,
             "code": code,
         }
+
+    async def _recheck_path_safety(self, container_path: str) -> None:
+        """Resolve canonical path inside the container and verify mount boundary.
+
+        Mirrors TS recheckBeforeCommand which runs `readlink -f` inside
+        the container to detect symlink-based escape attempts.
+        """
+        result = await self._run_command(
+            'set -eu; readlink -f -- "$1" 2>/dev/null || echo "$1"',
+            args=[container_path],
+            allow_failure=True,
+        )
+        canonical = (result.get("stdout") or container_path).strip()
+        mount_boundary = self.container_workdir.rstrip("/")
+        if not canonical.startswith(mount_boundary + "/") and canonical != mount_boundary:
+            raise PermissionError(
+                f"Canonical path escapes mount boundary: {container_path} -> {canonical}"
+            )
 
     def _ensure_write_access(self, target: SandboxResolvedPath, action: str) -> None:
         if self.workspace_access != "rw" or not target.writable:

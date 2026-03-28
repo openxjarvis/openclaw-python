@@ -13,6 +13,7 @@ nest_asyncio.apply()
 
 import json
 import logging
+import os
 import secrets
 import urllib.parse
 from datetime import datetime
@@ -34,6 +35,70 @@ from .onboard_finalize import finalize_onboarding
 from . import prompter  # Import prompter module for model selection
 
 logger = logging.getLogger(__name__)
+
+
+def _get_version() -> str:
+    try:
+        from openclaw import __version__
+        return __version__
+    except Exception:
+        return "unknown"
+
+
+def _validate_config(config_dict: dict) -> list[str]:
+    """Validate config and return list of issues. Mirrors TS config validation."""
+    issues = []
+    if not config_dict:
+        return issues
+    agents = config_dict.get("agents", {})
+    if agents and isinstance(agents, dict):
+        defaults = agents.get("defaults", {})
+        if defaults and isinstance(defaults, dict):
+            model = defaults.get("model")
+            if model and isinstance(model, str) and "/" not in model:
+                issues.append(f"agents.defaults.model: '{model}' missing provider prefix (expected provider/model)")
+    gateway = config_dict.get("gateway", {})
+    if gateway and isinstance(gateway, dict):
+        port = gateway.get("port")
+        if port is not None and (not isinstance(port, int) or port < 1 or port > 65535):
+            issues.append(f"gateway.port: invalid port value '{port}'")
+    return issues
+
+
+def _handle_reset(scope: str, workspace_dir: Optional[Path] = None) -> None:
+    """Handle --reset with scope. Mirrors TS handleReset() from onboard-helpers.ts.
+    
+    Scopes:
+      - "config": Delete config file only
+      - "config+creds": Delete config + credentials
+      - "full": Delete config + credentials + sessions + workspace
+    """
+    import shutil
+    from ..config.paths import resolve_config_path, resolve_config_dir
+    
+    config_path = resolve_config_path()
+    config_dir = resolve_config_dir()
+    
+    if config_path.exists():
+        config_path.unlink()
+        print(f"✓ Removed config: {config_path}")
+    
+    if scope == "config":
+        return
+    
+    creds_dir = config_dir / "credentials"
+    if creds_dir.exists():
+        shutil.rmtree(creds_dir, ignore_errors=True)
+        print(f"✓ Removed credentials: {creds_dir}")
+    
+    sessions_dir = config_dir / "sessions"
+    if sessions_dir.exists():
+        shutil.rmtree(sessions_dir, ignore_errors=True)
+        print(f"✓ Removed sessions: {sessions_dir}")
+    
+    if scope == "full" and workspace_dir and workspace_dir.exists():
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+        print(f"✓ Removed workspace: {workspace_dir}")
 
 
 def _config_to_dict(config: "OpenClawConfig") -> dict:
@@ -109,10 +174,22 @@ async def run_onboarding_wizard(
     install_daemon: Optional[bool] = None,
     skip_health: bool = False,
     skip_ui: bool = False,
+    skip_skills: bool = False,
+    skip_channels: bool = False,
     non_interactive: bool = False,
     accept_risk: bool = False,
     flow: Optional[str] = None,
     config_path: Optional[Path] = None,
+    mode: Optional[str] = None,
+    reset: bool = False,
+    reset_scope: Optional[str] = None,
+    gateway_port: Optional[int] = None,
+    gateway_bind: Optional[str] = None,
+    gateway_auth: Optional[str] = None,
+    gateway_token: Optional[str] = None,
+    gateway_password: Optional[str] = None,
+    remote_url: Optional[str] = None,
+    remote_token: Optional[str] = None,
 ) -> dict:
     """
     Run onboarding wizard
@@ -132,6 +209,7 @@ async def run_onboarding_wizard(
         install_daemon: Whether to install Gateway service (None=auto-decide based on flow)
         skip_health: Skip health check after installation
         skip_ui: Skip UI selection prompts
+        skip_skills: Skip skills setup (aligned with TS skipSkills)
         non_interactive: Run without prompts (requires accept_risk=True)
         accept_risk: Accept risk acknowledgement
         flow: Onboarding flow type: "quickstart" or "advanced"
@@ -147,6 +225,10 @@ async def run_onboarding_wizard(
     print("\nThis wizard will help you set up OpenClaw for the first time.")
     print("You can exit anytime with Ctrl+C")
     
+    # Step 0: Handle --reset before anything else (mirrors TS handleReset)
+    if reset:
+        _handle_reset(reset_scope or "config", workspace_dir)
+
     # Step 1: Risk confirmation
     if non_interactive:
         if not accept_risk:
@@ -156,9 +238,31 @@ async def run_onboarding_wizard(
         if not _confirm_risks():
             return {"completed": False, "skipped": True, "reason": "User declined"}
     
+    # Step 1.5: Determine local vs remote mode (mirrors TS onboarding.ts L320-357)
+    onboard_mode = mode  # "local" | "remote" | None
+    if onboard_mode == "remote" or remote_url:
+        onboard_mode = "remote"
+        print("\n📡 Remote mode: configuring client to connect to a remote gateway")
+        from .onboard_helpers import prompt_remote_gateway_config
+        from copy import deepcopy
+        base_cfg = OpenClawConfig()
+        base_cfg = await prompt_remote_gateway_config(base_cfg, type("P", (), {
+            "text": staticmethod(lambda p: input(f"{p.get('message', '')}: ")),
+            "password": staticmethod(lambda p: __import__('getpass').getpass(f"{p.get('message', '')}: ")),
+            "note": staticmethod(lambda *a, **kw: None),
+        })())
+        from .onboard_helpers import _apply_wizard_metadata
+        base_cfg_dict = base_cfg.model_dump(exclude_none=True, by_alias=True)
+        save_config(OpenClawConfig(**base_cfg_dict))
+        print("✓ Remote configuration saved!")
+        return {"completed": True, "skipped": False, "mode": "remote"}
+
     # Step 2: Mode selection
     if flow:
         flow_normalized = flow.lower().strip()
+        # TS: const normalizedExplicitFlow = explicitFlowRaw === "manual" ? "advanced" : explicitFlowRaw;
+        if flow_normalized == "manual":
+            flow_normalized = "advanced"
         if flow_normalized in ["quickstart", "advanced"]:
             mode = flow_normalized
             print(f"\n✓ Using {mode} mode")
@@ -168,10 +272,19 @@ async def run_onboarding_wizard(
     else:
         mode = _select_mode()
     
-    # Step 3: Load or create config
+    # Step 3: Load or create config  
     try:
         existing_config_dict = load_config(as_dict=True)
         print("\n✓ Found existing configuration")
+        
+        # Validate config (mirrors TS snapshot.exists && !snapshot.valid check)
+        config_issues = _validate_config(existing_config_dict)
+        if config_issues:
+            print("\n⚠️  Configuration has issues:")
+            for issue in config_issues:
+                print(f"  - {issue}")
+            print("\n  Run `uv run openclaw doctor` to repair, then re-run onboarding.")
+            print("  Continuing with existing config anyway...\n")
         
         if mode == "quickstart":
             print("QuickStart mode: Using existing configuration as base")
@@ -188,8 +301,8 @@ async def run_onboarding_wizard(
                 # Convert dict to OpenClawConfig object
                 claw_config = OpenClawConfig(**existing_config_dict) if existing_config_dict else OpenClawConfig()
             else:  # keep
-                print("Keeping existing configuration...")
-                return {"completed": True, "skipped": False, "kept_existing": True}
+                print("Using existing configuration as base...")
+                claw_config = OpenClawConfig(**existing_config_dict) if existing_config_dict else OpenClawConfig()
     except Exception as e:
         logger.info(f"No existing config: {e}")
         print("\nCreating new configuration...")
@@ -501,10 +614,10 @@ async def run_onboarding_wizard(
         WizardConfig, MessagesConfig, CommandsConfig, HooksConfig,
         InternalHooksConfig, CompactionConfig, SubagentsConfig,
         AgentDefaults, AgentsConfig, GatewayTailscaleConfig, GatewayNodesConfig,
-        PluginsConfig, PluginEntryConfig,
+        PluginsConfig, PluginEntryConfig, SandboxConfig,
     )
 
-    # --- agents.defaults: compaction, maxConcurrent, subagents ---
+    # --- agents.defaults: compaction, maxConcurrent, subagents, sandbox ---
     if not claw_config.agents:
         claw_config.agents = AgentsConfig()
     if not claw_config.agents.defaults:
@@ -518,6 +631,24 @@ async def run_onboarding_wizard(
         _defs.subagents = SubagentsConfig(maxConcurrent=8)
     elif _defs.subagents.maxConcurrent is None:
         _defs.subagents.maxConcurrent = 8
+    
+    # Initialize sandbox with TS-aligned defaults (mode="all", scope="session", workspaceAccess="rw")
+    # Mirrors TS behavior where sandbox is enabled by default for workspace isolation
+    if _defs.sandbox is None:
+        _defs.sandbox = SandboxConfig(mode="all", scope="session", workspaceAccess="rw")
+
+    # --- session: TS onboarding defaults ---
+    from openclaw.config.schema import SessionConfig, ToolsConfig
+    if not claw_config.session:
+        claw_config.session = SessionConfig()
+    if not claw_config.session.dmScope or claw_config.session.dmScope == "main":
+        claw_config.session.dmScope = "per-channel-peer"  # ONBOARDING_DEFAULT_DM_SCOPE
+    
+    # --- tools: TS onboarding defaults ---
+    if not claw_config.tools:
+        claw_config.tools = ToolsConfig()
+    if not claw_config.tools.profile or claw_config.tools.profile == "full":
+        claw_config.tools.profile = "messaging"  # ONBOARDING_DEFAULT_TOOLS_PROFILE
 
     # --- gateway: tailscale + nodes defaults ---
     if not claw_config.gateway:
@@ -551,7 +682,8 @@ async def run_onboarding_wizard(
     if not claw_config.wizard:
         claw_config.wizard = WizardConfig(
             lastRunAt=datetime.now(timezone.utc).isoformat(),
-            lastRunVersion="0.6.0",
+            lastRunVersion=_get_version(),
+            lastRunCommit=os.environ.get("GIT_COMMIT") or os.environ.get("GIT_SHA") or None,
             lastRunCommand="onboard",
             lastRunMode=_last_run_mode,
         )
@@ -680,26 +812,44 @@ async def run_onboarding_wizard(
     except Exception as e:
         logger.warning(f"Failed to ensure workspace: {e}")
     
-    # Skills and hooks setup (TS order: after workspace, before finalize)
+    # Skills setup (TS order: skills first, then hooks)
+    # Step 9.4a: Skills setup
+    if not skip_skills:
+        try:
+            cfg_dict = _config_to_dict(claw_config)
+            skills_result = await setup_skills(workspace_dir=ws_dir, config=cfg_dict, mode=mode)
+            
+            # Merge skills config updates back into claw_config
+            if skills_result.get("config"):
+                _merge_config_from_dict(claw_config, skills_result["config"])
+                try:
+                    save_config(claw_config)
+                    print("✓ Skills configuration saved!")
+                except Exception as e:
+                    logger.warning(f"Failed to save skills config: {e}")
+        except Exception as e:
+            logger.error(f"Skills setup failed: {e}", exc_info=True)
+            print(f"⚠️  Skills setup failed: {e}")
+            print("You can configure skills later with: uv run openclaw configure skills")
+    else:
+        print("\n✓ Skills setup skipped")
+    
+    # Step 9.4b: Hooks setup
     try:
         cfg_dict = _config_to_dict(claw_config)
         hooks_result = await setup_hooks(workspace_dir=ws_dir, config=cfg_dict, mode=mode)
-        skills_result = await setup_skills(workspace_dir=ws_dir, config=cfg_dict, mode=mode)
         
-        # Merge skills/hooks config updates back into claw_config
-        if skills_result.get("config"):
-            _merge_config_from_dict(claw_config, skills_result["config"])
+        # Merge hooks config updates back into claw_config
         if hooks_result.get("config"):
             _merge_config_from_dict(claw_config, hooks_result["config"])
-        
-        if skills_result.get("config") or hooks_result.get("config"):
             try:
                 save_config(claw_config)
-                print("✓ Skills/hooks configuration saved!")
+                print("✓ Hooks configuration saved!")
             except Exception as e:
-                logger.warning(f"Failed to save skills/hooks config: {e}")
+                logger.warning(f"Failed to save hooks config: {e}")
     except Exception as e:
-        logger.warning(f"Skills/hooks setup failed: {e}")
+        logger.error(f"Hooks setup failed: {e}", exc_info=True)
+        print(f"⚠️  Hooks setup failed: {e}")
     
     # Step 9.5: Install Gateway service (if requested)
     gateway_installed = False

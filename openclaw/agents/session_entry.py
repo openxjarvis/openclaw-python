@@ -195,6 +195,11 @@ class SessionEntry(BaseModel):
     lastHeartbeatText: Optional[str] = Field(None, description="Last heartbeat text for deduplication")
     lastHeartbeatSentAt: Optional[int] = Field(None, description="Last heartbeat timestamp (ms)")
     
+    # Fallback notice (model fallback metadata)
+    fallback_notice_selected_model: Optional[str] = Field(None, alias="fallbackNoticeSelectedModel")
+    fallback_notice_active_model: Optional[str] = Field(None, alias="fallbackNoticeActiveModel")
+    fallback_notice_reason: Optional[str] = Field(None, alias="fallbackNoticeReason")
+    
     class Config:
         populate_by_name = True
         # Allow both camelCase and snake_case field names
@@ -317,6 +322,9 @@ def merge_session_entry(existing: SessionEntry | None, patch: dict[str, Any]) ->
         "model_provider": "modelProvider",
         "model_override": "modelOverride",
         "provider_override": "providerOverride",
+        "fallback_notice_selected_model": "fallbackNoticeSelectedModel",
+        "fallback_notice_active_model": "fallbackNoticeActiveModel",
+        "fallback_notice_reason": "fallbackNoticeReason",
     }
     normalised_patch: dict[str, Any] = {}
     for key, value in patch.items():

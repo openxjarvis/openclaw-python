@@ -409,6 +409,7 @@ def discover_plugins(
 def discover_openclaw_plugins(
     workspace_dir: str | Path | None = None,
     extra_paths: list[str] | None = None,
+    **kwargs,  # ✅ Accept and ignore extra kwargs like 'config'
 ) -> PluginDiscoveryResult:
     """
     Discover OpenClaw plugins from standard locations and extra paths.
@@ -419,6 +420,7 @@ def discover_openclaw_plugins(
     Args:
         workspace_dir: Workspace directory (optional)
         extra_paths: Additional plugin search paths
+        **kwargs: Additional arguments (ignored for compatibility)
         
     Returns:
         PluginDiscoveryResult with candidates and diagnostics

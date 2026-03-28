@@ -1,18 +1,93 @@
-"""Onboarding finalization - TUI/UI launch"""
+"""Onboarding finalization — mirrors TS src/wizard/onboarding.finalize.ts
+
+Handles post-wizard steps: daemon install, health check with polling,
+Control UI launch, TUI hatch, shell completion, and next-steps display.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import subprocess
+import webbrowser
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-async def launch_tui(gateway_url: str = "ws://localhost:18789") -> None:
-    """Launch TUI application"""
-    print("\n🚀 Launching Terminal UI...")
+async def wait_for_gateway_reachable(
+    port: int = 18789,
+    token: Optional[str] = None,
+    timeout: float = 30.0,
+    interval: float = 1.0,
+) -> bool:
+    """Poll gateway health endpoint until reachable or timeout.
 
+    Mirrors TS waitForGatewayReachable() from onboard-helpers.ts.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                resp = await client.get(f"http://127.0.0.1:{port}/health", headers=headers)
+                if resp.status_code < 500:
+                    return True
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+    return False
+
+
+def resolve_control_ui_links(
+    port: int = 18789,
+    bind: str = "loopback",
+    token: Optional[str] = None,
+) -> dict[str, str]:
+    """Build bind-aware Control UI URLs. Mirrors TS resolveControlUiLinks()."""
+    if bind in ("lan", "auto", "tailnet"):
+        import socket
+
+        try:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+        except Exception:
+            ip = "0.0.0.0"
+        base = f"http://{ip}:{port}"
+    else:
+        base = f"http://localhost:{port}"
+
+    links: dict[str, str] = {"ui": base}
+    if token:
+        links["ui_with_token"] = f"{base}?token={token}"
+    return links
+
+
+def _detect_headless() -> bool:
+    """Return True when running on a headless server (no DISPLAY / no macOS)."""
+    import os
+    import sys
+
+    if sys.platform == "darwin":
+        return False
+    return not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")
+
+
+def format_ssh_hint(port: int = 18789) -> str:
+    """SSH port-forwarding hint for headless servers."""
+    return (
+        f"  SSH tunnel: ssh -L {port}:localhost:{port} user@this-server\n"
+        f"  Then open:  http://localhost:{port}"
+    )
+
+
+async def launch_tui(gateway_url: str = "ws://localhost:18789") -> None:
+    """Launch TUI application."""
+    print("\n🚀 Launching Terminal UI...")
     try:
         from openclaw.tui import run_tui, TUIOptions
         from urllib.parse import urlparse
@@ -26,150 +101,142 @@ async def launch_tui(gateway_url: str = "ws://localhost:18789") -> None:
         print(f"  ❌ Failed to launch TUI: {e}")
 
 
-async def open_web_ui(port: int = 8080) -> None:
-    """Open Web UI in browser"""
-    print(f"\n🌐 Opening Web UI at http://localhost:{port}/...")
-    
-    url = f"http://localhost:{port}/"
-    
-    # Try to open in browser
-    import webbrowser
+async def open_web_ui(port: int = 18789, token: Optional[str] = None) -> None:
+    """Open Control UI in browser with bind-aware URL."""
+    links = resolve_control_ui_links(port=port, token=token)
+    url = links.get("ui_with_token") or links["ui"]
+
+    print(f"\n🌐 Opening Control UI at {links['ui']}...")
     try:
         webbrowser.open(url)
-        print(f"  ✅ Web UI opened in browser")
-        print(f"  🔗 URL: {url}")
+        print("  ✅ Opened in browser")
     except Exception as e:
         logger.error(f"Failed to open browser: {e}")
         print(f"  ℹ️  Manually open: {url}")
 
 
-async def finalize_onboarding(mode: str = "quickstart", skip_ui: bool = False) -> dict:
-    """Finalize onboarding and optionally launch UI
-    
-    Args:
-        mode: "quickstart" or "advanced"
-        skip_ui: Skip UI launch prompt
-        
-    Returns:
-        Dict with finalization result
+def setup_shell_completion() -> None:
+    """Install shell completion if not already present.
+
+    Mirrors TS setupOnboardingShellCompletion().
+    """
+    try:
+        from openclaw.cli.completion import install_completion
+
+        install_completion(quiet=True)
+        print("✓ Shell completion installed")
+    except Exception:
+        logger.debug("Shell completion setup skipped (non-fatal)")
+
+
+async def finalize_onboarding(
+    mode: str = "quickstart",
+    skip_ui: bool = False,
+    port: int = 18789,
+    bind: str = "loopback",
+    token: Optional[str] = None,
+    gateway_running: bool = False,
+    workspace_dir: Optional[Path] = None,
+) -> dict:
+    """Finalize onboarding and optionally launch UI.
+
+    Mirrors TS finalizeOnboardingWizard() from onboarding.finalize.ts.
     """
     print("\n" + "=" * 60)
     print("🎉 ONBOARDING COMPLETE!")
     print("=" * 60)
-    
+
+    # Shell completion (mirrors TS finalize step)
+    setup_shell_completion()
+
+    # Wait for gateway if it should be running
+    if gateway_running:
+        print("\n⏳ Waiting for gateway to become reachable...")
+        reachable = await wait_for_gateway_reachable(port=port, token=token, timeout=15)
+        if reachable:
+            print("✓ Gateway is reachable")
+        else:
+            print("⚠ Gateway not yet reachable — it may still be starting")
+
+    # Control UI links
+    links = resolve_control_ui_links(port=port, bind=bind, token=token)
+    print(f"\n🌐 Control UI: {links['ui']}")
+
+    # SSH hint for headless
+    if _detect_headless():
+        print(f"\n💡 Headless server detected:")
+        print(format_ssh_hint(port))
+
+    # BOOTSTRAP.md hatch message (mirrors TS "Wake up, my friend!")
+    ws = workspace_dir or Path.home()
+    bootstrap_path = ws / "BOOTSTRAP.md"
+    if bootstrap_path.exists():
+        print("\n🐣 Your agent has a BOOTSTRAP.md — send it a message to hatch!")
+
     if skip_ui:
         print("\n⏭️  Skipping UI launch")
         return {"ui_launched": False, "skipped": True}
-    
+
+    # Hatch choice (mirrors TS finalize hatch/web/tui/later)
     print("\n🎯 How do you want to interact with OpenClaw?")
-    print("  1. Web UI (browser-based) - Recommended 🌐")
+    print("  1. Web UI (browser-based) — Recommended 🌐")
     print("  2. Terminal UI (TUI)")
-    print("  3. CLI only (no UI)")
+    print("  3. CLI only")
     print("  4. Later")
-    
+
     if mode == "quickstart":
-        choice = "1"  # Auto-select Web UI in quickstart (更稳定)
-        print(f"\n⚡ QuickStart: Opening Web UI (option 1)")
+        choice = "1"
+        print(f"\n⚡ QuickStart: Opening Web UI")
     else:
-        choice = input("\nSelect option [1-4]: ").strip()
-    
+        choice = input("\nSelect option [1-4]: ").strip() or "1"
+
     if choice == "1":
-        # Open Web UI (Gateway 内置)
-        print("\n🌐 Opening Web UI...")
-        print("  📡 Gateway is running on ws://localhost:18789")
-        print("  🌍 Web UI URL: http://localhost:18789")
-        print()
-        print("  ✨ The Gateway includes a built-in Web UI")
-        print("  💡 Tip: Keep this terminal open to keep Gateway running")
-        print()
-        
-        # 打开浏览器
-        import webbrowser
-        try:
-            webbrowser.open("http://localhost:18789")
-            print("  ✅ Browser opened successfully")
-        except Exception as e:
-            logger.error(f"Failed to open browser: {e}")
-            print(f"  ℹ️  Please manually open: http://localhost:18789")
-        
-        print("\n  📖 Web UI Features:")
+        await open_web_ui(port=port, token=token)
+
+        print("\n  📖 Control UI Features:")
         print("     - Chat with your agent")
         print("     - View sessions & history")
         print("     - Manage agents & skills")
         print("     - Configure channels")
         print()
         print("  ⏹️  Press Ctrl+C to stop Gateway")
-        
-        # 等待用户按 Ctrl+C
+
         try:
             import signal
-            print()
-            signal.pause()  # Wait for interrupt
+
+            signal.pause()
         except (KeyboardInterrupt, AttributeError):
             print("\n  👋 Gateway will continue running in background")
-        
-        return {"ui_launched": True, "ui_type": "web", "url": "http://localhost:18789"}
-    
+
+        return {"ui_launched": True, "ui_type": "web", "url": links["ui"]}
+
     elif choice == "2":
-        # Launch TUI
         print("\n🚀 Starting Terminal UI...")
-        print("  💡 Use Ctrl+D or type 'exit' to close TUI")
-        print("  💡 Use /help for commands")
-        
-        # 添加连接检查
-        print("\n  🔍 Checking gateway connection...")
         try:
-            import websocket
-            ws = websocket.create_connection("ws://localhost:18789", timeout=5)
-            ws.close()
-            print("  ✅ Gateway connected")
-        except ImportError:
-            print("  ⚠️  websocket-client not installed")
-            print("  💡 Install: pip install websocket-client")
-            return {"ui_launched": False, "error": "websocket_missing"}
-        except Exception as e:
-            print(f"  ⚠️  Gateway connection issue: {e}")
-            print("  💡 Tip: Make sure gateway is running on port 18789")
-            return {"ui_launched": False, "error": "gateway_not_reachable"}
-        
-        # Note: TUI will block until user exits
-        try:
-            await launch_tui()
+            await launch_tui(f"ws://localhost:{port}")
         except KeyboardInterrupt:
             print("\n👋 TUI closed")
         except Exception as e:
-            logger.error(f"TUI error: {e}")
             print(f"\n  ⚠️  TUI error: {e}")
-            print("  💡 Try Web UI instead: http://localhost:18789")
-        
+            print(f"  💡 Try Web UI instead: {links['ui']}")
         return {"ui_launched": True, "ui_type": "tui"}
-    
+
     elif choice == "3":
         print("\n✅ CLI-only mode selected")
-        print("   Use 'openclaw' commands to interact")
-        print()
-        print("   Gateway is running at: http://localhost:18789")
-        print()
-        print("   Examples:")
-        print("     openclaw status")
-        print("     openclaw agent run -m 'Hello!'")
-        print("     openclaw agents list")
-        print()
-        print("   Open Web UI anytime:")
-        print("     http://localhost:18789")
-        
+        print(f"   Control UI: {links['ui']}")
         return {"ui_launched": False, "mode": "cli"}
-    
+
     else:
-        print("\n⏭️  You can access OpenClaw later:")
-        print()
-        print("     Web UI:  http://localhost:18789  (recommended)")
-        print("     TUI:     openclaw tui")
-        print("     CLI:     openclaw --help")
-        print()
-        print("   Gateway URL: http://localhost:18789")
-        
+        print(f"\n⏭️  Access OpenClaw later at: {links['ui']}")
         return {"ui_launched": False, "mode": "later"}
 
 
-__all__ = ["finalize_onboarding", "launch_tui", "open_web_ui"]
+__all__ = [
+    "finalize_onboarding",
+    "launch_tui",
+    "open_web_ui",
+    "wait_for_gateway_reachable",
+    "resolve_control_ui_links",
+    "setup_shell_completion",
+    "format_ssh_hint",
+]

@@ -36,10 +36,13 @@ class SessionWriteLock:
     manager raises ``SessionWriteLockError``.
     """
 
-    def __init__(self, session_file: str | Path) -> None:
+    def __init__(self, session_file: str | Path, max_hold_ms: int = _DEFAULT_MAX_HOLD_MS) -> None:
         self._session_file = Path(session_file)
         self._lock_file = self._session_file.with_suffix(".lock")
         self._asyncio_lock = asyncio.Lock()
+        self._max_hold_ms = max_hold_ms
+        # Stale threshold: 2x max_hold to be conservative (align with TS 30min default)
+        self._stale_threshold_s = (max_hold_ms / 1000) * 2
 
     @property
     def lock_file(self) -> Path:
@@ -81,18 +84,44 @@ class SessionWriteLock:
             os.close(fd)
             return True
         except FileExistsError:
-            # Check for stale lock (older than 5 minutes)
+            # Check for stale lock - based on max_hold_ms (dynamic, not fixed 300s)
             try:
                 mtime = self._lock_file.stat().st_mtime
-                if time.time() - mtime > 300:
-                    logger.warning(f"Removing stale lock file: {self._lock_file}")
+                age_s = time.time() - mtime
+                
+                # Only consider stale if age > threshold (2x max_hold_ms by default)
+                if age_s > self._stale_threshold_s:
+                    # Check if PID is still alive before removing lock
+                    if self._is_lock_owner_alive():
+                        logger.debug(f"Lock holder still alive (age={age_s:.0f}s), waiting...")
+                        return False
+                    
+                    logger.warning(f"Removing stale lock file (age={age_s:.0f}s): {self._lock_file}")
                     self._lock_file.unlink(missing_ok=True)
                     return self._try_lock()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Failed to check stale lock: {e}")
                 pass
             return False
         except Exception as exc:
             logger.debug(f"Lock attempt failed: {exc}")
+            return False
+    
+    def _is_lock_owner_alive(self) -> bool:
+        """Check if the PID in the lock file is still running.
+        
+        Returns True if the process is alive, False otherwise or if check fails.
+        Mirrors TS session-write-lock.ts PID existence check.
+        """
+        try:
+            pid_bytes = self._lock_file.read_bytes()
+            pid = int(pid_bytes.decode().strip())
+            
+            # Check if process exists using psutil (already in dependencies)
+            import psutil
+            return psutil.pid_exists(pid)
+        except Exception:
+            # If we can't determine, assume not alive (conservative for stale cleanup)
             return False
 
     def _release(self) -> None:
@@ -121,12 +150,12 @@ _lock_registry: dict[str, SessionWriteLock] = {}
 _registry_lock = asyncio.Lock()
 
 
-async def _get_or_create_lock(session_file: str | Path) -> SessionWriteLock:
+async def _get_or_create_lock(session_file: str | Path, max_hold_ms: int = _DEFAULT_MAX_HOLD_MS) -> SessionWriteLock:
     """Return (or create) the canonical lock for *session_file*."""
     key = str(Path(session_file).resolve())
     async with _registry_lock:
         if key not in _lock_registry:
-            _lock_registry[key] = SessionWriteLock(session_file)
+            _lock_registry[key] = SessionWriteLock(session_file, max_hold_ms=max_hold_ms)
         return _lock_registry[key]
 
 
@@ -147,7 +176,7 @@ def acquire_session_write_lock(
         async with acquire_session_write_lock(session_file, max_hold_ms=30_000):
             ...
     """
-    lock = SessionWriteLock(session_file)
+    lock = SessionWriteLock(session_file, max_hold_ms=max_hold_ms)
     return AcquireContext(lock, max_hold_ms)
 
 
@@ -170,7 +199,7 @@ class _CachedAcquireContext:
         self._lock: Optional[SessionWriteLock] = None
 
     async def __aenter__(self) -> SessionWriteLock:
-        self._lock = await _get_or_create_lock(self._session_file)
+        self._lock = await _get_or_create_lock(self._session_file, self._max_hold_ms)
         await self._lock._acquire_inner(self._max_hold_ms)
         return self._lock
 

@@ -38,6 +38,41 @@ htmlcov/
 # Temp files
 *.tmp
 *.bak
+
+# Archived temp docs and scripts
+_archive/
+
+# Temp markdown reports (analysis, fix, complete, debug, test docs)
+*_REPORT.md
+*_COMPLETE.md
+*_ANALYSIS.md
+*_FIX*.md
+*_FIXES.md
+*_PROGRESS.md
+*_SUMMARY.md
+*_GUIDE.md
+DEBUG_*.md
+GATEWAY_*.md
+GEMINI_*.md
+SANDBOX_*.md
+STREAMING_*.md
+DRAFT_STREAM_*.md
+DRAFT_BLOCK_*.md
+SUBAGENT_*.md
+SKILLS_DESIGN_*.md
+ALIGNMENT_GAP_*.md
+BUG_FIX_*.md
+CRITICAL_*.md
+
+# Temp scripts
+create_*.py
+generate_*.py
+
+# State snapshots
+blessing_state.json
+
+# Lock file (regenerated per environment)
+uv.lock
 temp/
 tmp/
 

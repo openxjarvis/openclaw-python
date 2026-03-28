@@ -143,6 +143,7 @@ async def call_agent_internal(
     account_id: str | None = None,
     thread_id: str | None = None,
     deliver: bool = False,
+    session_workspace: str | None = None,
     timeout_ms: int = 10_000,
 ) -> dict[str, Any]:
     """
@@ -186,6 +187,8 @@ async def call_agent_internal(
         params["accountId"] = account_id
     if thread_id:
         params["threadId"] = thread_id
+    if session_workspace:
+        params["sessionWorkspace"] = session_workspace
     
     return await call_gateway_internal(
         gateway=gateway,

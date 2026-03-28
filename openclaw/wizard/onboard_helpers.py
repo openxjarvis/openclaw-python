@@ -313,10 +313,110 @@ async def prompt_remote_gateway_config(
     return updated_config
 
 
+ONBOARDING_DEFAULT_DM_SCOPE = "per-channel-peer"
+ONBOARDING_DEFAULT_TOOLS_PROFILE = "messaging"
+
+
+def apply_onboarding_local_workspace_config(
+    base_config: "OpenClawConfig",
+    workspace_dir: str,
+) -> "OpenClawConfig":
+    """Apply onboarding defaults for a local workspace.
+
+    Mirrors TS applyOnboardingLocalWorkspaceConfig() from onboard-config.ts.
+    Sets agents.defaults.workspace, gateway.mode, session.dmScope, tools.profile.
+    """
+    from ..config.schema import (
+        AgentsConfig,
+        AgentDefaults,
+        GatewayConfig,
+        SessionConfig,
+        ToolsConfig,
+    )
+    from copy import deepcopy
+
+    cfg = deepcopy(base_config)
+
+    if not cfg.agents:
+        cfg.agents = AgentsConfig()
+    if not cfg.agents.defaults:
+        cfg.agents.defaults = AgentDefaults()
+    cfg.agents.defaults.workspace = workspace_dir
+
+    if not cfg.gateway:
+        cfg.gateway = GatewayConfig()
+    cfg.gateway.mode = "local"
+
+    if not cfg.session:
+        cfg.session = SessionConfig()
+    if not cfg.session.dmScope or cfg.session.dmScope == "main":
+        cfg.session.dmScope = ONBOARDING_DEFAULT_DM_SCOPE  # type: ignore[assignment]
+
+    if not cfg.tools:
+        cfg.tools = ToolsConfig()
+    if not cfg.tools.profile or cfg.tools.profile == "full":
+        cfg.tools.profile = ONBOARDING_DEFAULT_TOOLS_PROFILE
+
+    return cfg
+
+
+def _apply_wizard_metadata(
+    config: "OpenClawConfig",
+    command: str = "onboard",
+    mode: str = "local",
+) -> "OpenClawConfig":
+    """Write wizard run metadata into config.wizard.
+
+    Mirrors TS applyWizardMetadata() from onboard-helpers.ts.
+    """
+    import os
+    from datetime import datetime, timezone
+    from ..config.schema import WizardConfig
+
+    try:
+        from openclaw import __version__
+        version = __version__
+    except Exception:
+        version = "unknown"
+
+    commit = os.environ.get("GIT_COMMIT") or os.environ.get("GIT_SHA") or None
+
+    config.wizard = WizardConfig(
+        lastRunAt=datetime.now(timezone.utc).isoformat(),
+        lastRunVersion=version,
+        lastRunCommit=commit,
+        lastRunCommand=command,
+        lastRunMode=mode,
+    )
+    return config
+
+
+def normalize_gateway_token_input(value: str | None) -> str | None:
+    """Reject literal 'undefined'/'null'/empty strings. Mirrors TS normalizeGatewayTokenInput()."""
+    if not value or not value.strip():
+        return None
+    if value.strip().lower() in ("undefined", "null"):
+        return None
+    return value
+
+
+def validate_gateway_password_input(value: str | None) -> str | None:
+    """Basic gateway password validation. Mirrors TS validateGatewayPasswordInput()."""
+    if not value or len(value.strip()) < 8:
+        return "Password must be at least 8 characters"
+    return None
+
+
 __all__ = [
     "probe_gateway_reachable",
     "warn_if_model_config_looks_off",
     "summarize_existing_config",
     "ensure_workspace_and_sessions",
     "prompt_remote_gateway_config",
+    "apply_onboarding_local_workspace_config",
+    "_apply_wizard_metadata",
+    "normalize_gateway_token_input",
+    "validate_gateway_password_input",
+    "ONBOARDING_DEFAULT_DM_SCOPE",
+    "ONBOARDING_DEFAULT_TOOLS_PROFILE",
 ]

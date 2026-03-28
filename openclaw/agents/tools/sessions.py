@@ -765,6 +765,7 @@ class SessionsSpawnTool(AgentTool):
                     success=True,
                     content=f"Subagent spawned: {result.childSessionKey}",
                     metadata={
+                        "sessionKey": result.childSessionKey,  # Primary field for backward compat
                         "childSessionKey": result.childSessionKey,
                         "runId": result.runId,
                         "mode": result.mode,
