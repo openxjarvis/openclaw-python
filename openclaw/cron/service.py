@@ -968,6 +968,39 @@ class CronService:
     async def run_job_now(self, job_id: str) -> Dict[str, Any]:
         return await self.run(job_id, mode="force")
 
+    def enqueue_run(self, job_id: str) -> Dict[str, Any]:
+        """Schedule job asynchronously and return immediately.
+
+        Creates an asyncio task to run the job and returns {ok, enqueued, runId}
+        without waiting for completion.  Mirrors TS cron.run enqueue semantics.
+        """
+        import uuid as _uuid
+
+        job = self.jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "enqueued": False, "error": f"unknown job: {job_id}"}
+
+        run_id = str(_uuid.uuid4())
+
+        async def _run_task() -> None:
+            try:
+                await self.run(job_id, mode="force")
+            except Exception as exc:
+                logger.error("enqueue_run error for %s: %s", job_id, exc)
+
+        try:
+            asyncio.ensure_future(_run_task())
+        except RuntimeError:
+            # No running event loop — fall back to creating a task once one is available
+            try:
+                loop = asyncio.get_event_loop()
+                loop.call_soon(lambda: asyncio.ensure_future(_run_task()))
+            except Exception as exc:
+                logger.warning("enqueue_run could not schedule task: %s", exc)
+                return {"ok": False, "enqueued": False, "error": str(exc)}
+
+        return {"ok": True, "enqueued": True, "runId": run_id}
+
     def wake(
         self,
         text: str,

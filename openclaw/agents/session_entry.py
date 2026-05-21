@@ -22,6 +22,8 @@ class SessionOrigin(BaseModel):
     to: Optional[str] = None
     accountId: Optional[str] = None
     threadId: Optional[str | int] = None
+    nativeChannelId: Optional[str] = None
+    nativeDirectUserId: Optional[str] = None
 
 
 class DeliveryContext(BaseModel):
@@ -158,6 +160,9 @@ class SessionSystemPromptReport(BaseModel):
     tools: dict[str, Any] = Field(
         default_factory=lambda: {"listChars": 0, "schemaChars": 0, "entries": []}
     )
+    bootstrapTruncationWarning: Optional[bool] = None
+    bootstrapTruncationFiles: Optional[list[str]] = None
+    bootstrapTruncationChars: Optional[int] = None
 
 
 class SessionEntry(BaseModel):
@@ -510,3 +515,92 @@ async def update_session_entry_tokens(
     
     # Save updated entry
     await session_manager.save_entry(entry)
+
+
+# ---------------------------------------------------------------------------
+# P2-16 Session helper functions — mirrors TS src/config/sessions/types.ts L314-437
+# ---------------------------------------------------------------------------
+
+def resolve_session_total_tokens(entry: "SessionEntry") -> int:
+    """Sum all token fields on the session entry."""
+    total = 0
+    for field_name in ("totalTokens", "inputTokens", "outputTokens"):
+        val = getattr(entry, field_name, None)
+        if isinstance(val, int) and val > 0:
+            if field_name == "totalTokens":
+                return val  # prefer totalTokens if present
+    total = (entry.inputTokens or 0) + (entry.outputTokens or 0)
+    return total
+
+
+def normalize_session_runtime_model_fields(entry: "SessionEntry") -> "SessionEntry":
+    """Normalize model-related fields on a session entry.
+
+    Ensures model/provider fields are consistent and stripped.
+    """
+    if entry.model:
+        entry.model = str(entry.model).strip() or None  # type: ignore[assignment]
+    if entry.modelProvider:
+        entry.modelProvider = str(entry.modelProvider).strip() or None  # type: ignore[assignment]
+    if entry.modelOverride:
+        entry.modelOverride = str(entry.modelOverride).strip() or None  # type: ignore[assignment]
+    if entry.providerOverride:
+        entry.providerOverride = str(entry.providerOverride).strip() or None  # type: ignore[assignment]
+    return entry
+
+
+def set_session_runtime_model(
+    entry: "SessionEntry",
+    model: str,
+    provider: "str | None" = None,
+) -> "SessionEntry":
+    """Set the runtime model on a session entry.
+
+    Args:
+        entry: The session entry to update.
+        model: Model identifier string.
+        provider: Optional provider name.
+
+    Returns:
+        The updated entry.
+    """
+    import time as _time
+
+    entry.model = str(model).strip() if model else entry.model
+    if provider:
+        entry.modelProvider = str(provider).strip()
+    entry.updatedAt = int(_time.time() * 1000)
+    return entry
+
+
+def merge_session_entry_preserve_activity(
+    base: "SessionEntry",
+    updates: dict,
+) -> "SessionEntry":
+    """Merge updates dict into base entry, preserving activity timestamps.
+
+    Activity fields (lastInteractionAt, sessionStartedAt, updatedAt) are kept
+    if the incoming updates would regress them.
+
+    Args:
+        base: The base session entry.
+        updates: Dict of fields to merge.
+
+    Returns:
+        Updated session entry.
+    """
+    activity_fields = {"lastInteractionAt", "sessionStartedAt", "updatedAt"}
+    existing_activity = {f: getattr(base, f, None) for f in activity_fields}
+
+    merged_data = base.model_dump()
+    for key, value in updates.items():
+        if key in merged_data or not key.startswith("_"):
+            merged_data[key] = value
+
+    for f in activity_fields:
+        old_val = existing_activity.get(f)
+        new_val = merged_data.get(f)
+        if old_val is not None and (new_val is None or (isinstance(new_val, int) and new_val < old_val)):
+            merged_data[f] = old_val
+
+    return SessionEntry.model_validate(merged_data)

@@ -142,12 +142,28 @@ def _matches_binding_scope(match: dict, scope_peer: Optional[RoutePeer], guild_i
     if peer_constraint["state"] == "invalid":
         return False
     if peer_constraint["state"] == "valid":
-        if (
-            scope_peer is None
-            or scope_peer.kind != peer_constraint["kind"]
-            or scope_peer.id != peer_constraint["id"]
-        ):
-            return False
+        peer_id = peer_constraint.get("id", "")
+        peer_kind = peer_constraint.get("kind", "")
+        if peer_id == "*":
+            # Wildcard peer: only check kind match (with group/channel alias)
+            if scope_peer is not None and peer_kind:
+                # Allow group ↔ channel aliases
+                aliases = {frozenset({"group", "channel"})}
+                kind_match = scope_peer.kind == peer_kind
+                if not kind_match:
+                    for alias_set in aliases:
+                        if scope_peer.kind in alias_set and peer_kind in alias_set:
+                            kind_match = True
+                            break
+                if not kind_match:
+                    return False
+        else:
+            if (
+                scope_peer is None
+                or scope_peer.kind != peer_kind
+                or scope_peer.id != peer_id
+            ):
+                return False
     if match["guild_id"] and match["guild_id"] != guild_id:
         return False
     if match["team_id"] and match["team_id"] != team_id:
@@ -353,15 +369,15 @@ def resolve_agent_route(
 
     bindings = _get_evaluated_bindings(cfg, channel_norm, account_id_norm)
 
-    # Get dmScope and identityLinks from config
-    dm_scope = "per-channel-peer"
+    # Get dmScope and identityLinks from config — default "main" mirrors TS cfg.session?.dmScope ?? "main"
+    dm_scope = "main"
     identity_links = None
     if hasattr(cfg, "session") and cfg.session:  # type: ignore[union-attr]
-        dm_scope = getattr(cfg.session, "dmScope", "per-channel-peer") or "per-channel-peer"  # type: ignore[union-attr]
+        dm_scope = getattr(cfg.session, "dmScope", "main") or "main"  # type: ignore[union-attr]
         identity_links = getattr(cfg.session, "identityLinks", None)  # type: ignore[union-attr]
     elif isinstance(cfg, dict):
         session = cfg.get("session") or {}
-        dm_scope = session.get("dmScope", "per-channel-peer") or "per-channel-peer"
+        dm_scope = session.get("dmScope", "main") or "main"
         identity_links = session.get("identityLinks")
 
     def choose(agent_id: str, matched_by: str) -> ResolvedAgentRoute:
@@ -396,19 +412,38 @@ def resolve_agent_route(
     def has_team_constraint(match: dict) -> bool:
         return bool(match.get("team_id"))
 
+    def _is_wildcard_peer(e: dict) -> bool:
+        """True if this binding has a wildcard peer (peer.id == '*')."""
+        peer = e["match"]["peer"]
+        return peer["state"] == "valid" and peer.get("id") == "*"
+
+    def _wildcard_kind_matches(binding_kind: str, peer: Optional[RoutePeer]) -> bool:
+        """True if the binding's peer kind matches the actual peer kind (with group/channel alias)."""
+        if peer is None:
+            return True
+        if not binding_kind:
+            return True
+        if binding_kind == peer.kind:
+            return True
+        aliases = {frozenset({"group", "channel"})}
+        for alias_set in aliases:
+            if binding_kind in alias_set and peer.kind in alias_set:
+                return True
+        return False
+
     # Tiers — same order as TS
     tiers = [
         {
             "matched_by": "binding.peer",
             "enabled": peer_norm is not None,
             "scope_peer": peer_norm,
-            "predicate": lambda e: e["match"]["peer"]["state"] == "valid",
+            "predicate": lambda e: e["match"]["peer"]["state"] == "valid" and e["match"]["peer"].get("id") != "*",
         },
         {
             "matched_by": "binding.peer.parent",
             "enabled": parent_peer_norm is not None and bool(parent_peer_norm.id),
             "scope_peer": parent_peer_norm if (parent_peer_norm and parent_peer_norm.id) else None,
-            "predicate": lambda e: e["match"]["peer"]["state"] == "valid",
+            "predicate": lambda e: e["match"]["peer"]["state"] == "valid" and e["match"]["peer"].get("id") != "*",
         },
         {
             "matched_by": "binding.guild+roles",
@@ -438,7 +473,13 @@ def resolve_agent_route(
             "matched_by": "binding.channel",
             "enabled": True,
             "scope_peer": peer_norm,
-            "predicate": lambda e: e["match"]["account_pattern"] == "*",
+            "predicate": lambda e: e["match"]["account_pattern"] == "*" and not _is_wildcard_peer(e),
+        },
+        {
+            "matched_by": "binding.peer",
+            "enabled": peer_norm is not None,
+            "scope_peer": peer_norm,
+            "predicate": lambda e: _is_wildcard_peer(e) and _wildcard_kind_matches(e["match"]["peer"].get("kind", ""), peer_norm),
         },
     ]
 

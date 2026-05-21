@@ -654,12 +654,47 @@ async def load_dreaming_store_stats(
     return stats
 
 
+def resolve_all_managed_dreaming_cron_statuses(workspace_dir: str) -> dict[str, bool]:
+    """Check cron service for managed dreaming jobs per phase.
+
+    Returns dict of {light: bool, deep: bool, rem: bool}.
+    """
+    result = {"light": False, "deep": False, "rem": False}
+    try:
+        from openclaw.cron.service import get_cron_service
+        svc = get_cron_service()
+        if svc is None:
+            return result
+        jobs = svc.list_jobs() if hasattr(svc, "list_jobs") else []
+        for job in jobs:
+            job_id = str(getattr(job, "id", "") or (job.get("id", "") if isinstance(job, dict) else ""))
+            payload = getattr(job, "payload", None) or (job.get("payload", {}) if isinstance(job, dict) else {})
+            if isinstance(payload, dict):
+                p_kind = payload.get("kind", "")
+            else:
+                p_kind = getattr(payload, "kind", "")
+            if p_kind != "systemEvent":
+                continue
+            event_type = payload.get("type", "") if isinstance(payload, dict) else getattr(payload, "type", "")
+            for phase in ("light", "deep", "rem"):
+                if phase in event_type.lower() or phase in job_id.lower():
+                    result[phase] = True
+    except Exception:
+        pass
+    return result
+
+
 def build_dreaming_status_payload(cfg: Any, store_stats: dict[str, Any]) -> dict[str, Any]:
     """Build dreaming section for doctor.memory.status."""
     from .config import resolve_dreaming_config
 
     resolved = resolve_dreaming_config(cfg)
     phases = resolved.phases
+
+    # Attempt to resolve real managed cron statuses
+    workspace_dir = store_stats.get("workspaceDir", "")
+    managed_cron = resolve_all_managed_dreaming_cron_statuses(str(workspace_dir))
+
     base = {
         "enabled": resolved.enabled,
         "verboseLogging": resolved.verbose_logging,
@@ -674,7 +709,7 @@ def build_dreaming_status_payload(cfg: Any, store_stats: dict[str, Any]) -> dict
                 "cron": phases.light.cron,
                 "lookbackDays": phases.light.lookback_days,
                 "limit": phases.light.limit,
-                "managedCronPresent": False,
+                "managedCronPresent": managed_cron["light"],
             },
             "deep": {
                 "enabled": phases.deep.enabled,
@@ -684,7 +719,7 @@ def build_dreaming_status_payload(cfg: Any, store_stats: dict[str, Any]) -> dict
                 "minRecallCount": phases.deep.min_recall_count,
                 "minUniqueQueries": phases.deep.min_unique_queries,
                 "recencyHalfLifeDays": phases.deep.recency_half_life_days,
-                "managedCronPresent": False,
+                "managedCronPresent": managed_cron["deep"],
                 **({"maxAgeDays": phases.deep.max_age_days} if phases.deep.max_age_days is not None else {}),
             },
             "rem": {
@@ -693,7 +728,7 @@ def build_dreaming_status_payload(cfg: Any, store_stats: dict[str, Any]) -> dict
                 "lookbackDays": phases.rem.lookback_days,
                 "limit": phases.rem.limit,
                 "minPatternStrength": phases.rem.min_pattern_strength,
-                "managedCronPresent": False,
+                "managedCronPresent": managed_cron["rem"],
             },
         },
     }

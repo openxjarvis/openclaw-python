@@ -518,6 +518,7 @@ async def run_agent_turn_with_fallback(
                 BlockStreamingPipeline,
                 resolve_block_streaming_config,
             )
+            from openclaw.auto_reply.reply.block_reply_pipeline import BlockReplyPipeline as _BlockReplyPipeline  # noqa: F401
             
             # ✅ NEW: Get disable_block_streaming flag from context metadata
             # Mirrors TS bot-message-dispatch.ts L305-313 disableBlockStreaming decision

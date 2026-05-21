@@ -318,6 +318,132 @@ class UsageTracker:
         }
 
 
+def load_provider_usage_summary() -> dict[str, Any]:
+    """Load a summary of provider usage from the global tracker.
+
+    Returns dict with totalTokens, totalCost, sessions, providers[].
+    Mirrors TS usage.status shape.
+    """
+    tracker = get_usage_tracker()
+    agg = tracker.get_aggregated_metrics()
+    by_provider: list[dict[str, Any]] = []
+    provider_names: set[str] = set(m.provider for m in tracker.metrics)
+    for provider in sorted(provider_names):
+        p_agg = tracker.get_aggregated_metrics(provider=provider)
+        by_provider.append(
+            {
+                "provider": provider,
+                "totalTokens": p_agg.total_tokens,
+                "totalCost": p_agg.total_cost_usd,
+                "requests": p_agg.total_requests,
+            }
+        )
+    session_keys: set[str] = set()
+    for m in tracker.metrics:
+        sk = getattr(m, "session_key", None)
+        if sk:
+            session_keys.add(sk)
+    return {
+        "totalTokens": agg.total_tokens,
+        "totalCost": agg.total_cost_usd,
+        "sessions": len(session_keys),
+        "providers": by_provider,
+    }
+
+
+def parse_date_range(
+    days: int | None = None,
+    utc_offset: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[datetime, datetime]:
+    """Parse a date range for usage queries.
+
+    Args:
+        days: Number of days to look back (default 7).
+        utc_offset: UTC offset in minutes (default 0).
+        start_date: ISO start date string (overrides days if provided).
+        end_date: ISO end date string (overrides days if provided).
+
+    Returns:
+        (start_dt, end_dt) tuple of aware datetimes.
+    """
+    import datetime as dt_mod
+    from datetime import timezone, timedelta
+
+    tz_offset = timedelta(minutes=utc_offset or 0)
+    tz = timezone(tz_offset)
+    now = datetime.now(tz)
+
+    if start_date:
+        start_dt = datetime.fromisoformat(start_date).replace(tzinfo=tz)
+    else:
+        lookback_days = max(1, int(days or 7))
+        start_dt = now - timedelta(days=lookback_days)
+
+    if end_date:
+        end_dt = datetime.fromisoformat(end_date).replace(tzinfo=tz)
+    else:
+        end_dt = now
+
+    return start_dt, end_dt
+
+
+def get_usage_timeseries(
+    session_key: str | None = None,
+    days: int | None = None,
+    utc_offset: int | None = None,
+) -> list[dict[str, Any]]:
+    """Get daily usage timeseries for a session or globally.
+
+    Returns list of {date, totalTokens, totalCost} dicts.
+    """
+    from datetime import timedelta
+
+    tracker = get_usage_tracker()
+    start_dt, end_dt = parse_date_range(days=days, utc_offset=utc_offset)
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for m in tracker.metrics:
+        ts = m.timestamp
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+        if dt < start_dt or dt > end_dt:
+            continue
+        date_key = dt.strftime("%Y-%m-%d")
+        if date_key not in buckets:
+            buckets[date_key] = {"date": date_key, "totalTokens": 0, "totalCost": 0.0}
+        buckets[date_key]["totalTokens"] += m.total_tokens
+        buckets[date_key]["totalCost"] += m.cost_usd
+
+    return sorted(buckets.values(), key=lambda x: x["date"])
+
+
+def get_usage_logs(
+    session_key: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Get paginated usage log entries.
+
+    Returns {items, total, limit, offset}.
+    """
+    tracker = get_usage_tracker()
+    items = tracker.metrics
+    if session_key:
+        items = [m for m in items if getattr(m, "session_key", None) == session_key]
+    total = len(items)
+    page = items[offset : offset + limit]
+    return {
+        "items": [m.to_dict() for m in page],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 # Global usage tracker
 _usage_tracker: UsageTracker | None = None
 

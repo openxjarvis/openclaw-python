@@ -24,6 +24,7 @@ class SecretRef:
     env: str | None = None
     file: str | None = None
     exec: str | None = None
+    pointer: str | None = None  # RFC 6901 JSON pointer for value extraction from file
 
     def key(self) -> str:
         return f"{self.source}:{self.provider}:{self.id}"

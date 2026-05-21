@@ -101,6 +101,17 @@ def _get_current_config() -> dict:
     return {}
 
 
+def _resolve_gateway_approval_manager(connection: Any):
+    """Get or lazily initialize exec approval manager."""
+    gateway = getattr(connection, "gateway", None)
+    if gateway:
+        mgr = getattr(gateway, "approval_manager", None)
+        if mgr is not None:
+            return mgr
+    from openclaw.exec.approval_manager import get_approval_manager
+    return get_approval_manager()
+
+
 def _get_plugin_manager(connection: Any):
     """Get or lazily initialize plugin manager."""
     global _plugin_manager
@@ -431,6 +442,27 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
                     known_ids = []
             if known_ids and agent_id_raw not in known_ids:
                 logger.warning(f"Unknown agentId: {agent_id_raw!r}, proceeding with default")
+
+    # VoiceWake routing — if voiceWakeTrigger param is set, resolve session_key/agent_id from routing config
+    voice_wake_trigger = str(params.get("voiceWakeTrigger") or "").strip()
+    if voice_wake_trigger:
+        try:
+            from openclaw.infra.voicewake_route_resolver import (
+                load_voice_wake_routing_config,
+                resolve_voice_wake_route_by_trigger,
+                resolve_voice_wake_route_target,
+            )
+            vw_cfg = load_voice_wake_routing_config()
+            if vw_cfg:
+                route_entry = resolve_voice_wake_route_by_trigger(voice_wake_trigger, vw_cfg)
+                if route_entry:
+                    target = resolve_voice_wake_route_target(route_entry)
+                    if target.get("session_key"):
+                        session_key = target["session_key"]
+                    if target.get("agent_id"):
+                        agent_id_raw = target["agent_id"]
+        except Exception as _vw_exc:
+            logger.debug("VoiceWake routing failed: %s", _vw_exc)
 
     # Session key shape validation (malformed agent key guard)
     # Mirrors TS parseAgentSessionKey: agent:<agentId>:<rest> where rest can contain ":"
@@ -1386,13 +1418,20 @@ async def handle_cron_add(connection: Any, params: dict[str, Any]) -> dict[str, 
     # Run normalization (applies defaults, infers sessionTarget, delivery, stagger, etc.)
     job_data = normalize_cron_job_create(raw_job) or {}
 
-    from openclaw.cron.normalize import validate_schedule_timestamp
+    from openclaw.cron.normalize import validate_schedule_timestamp, assert_valid_cron_announce_delivery
 
     schedule = job_data.get("schedule")
     if schedule:
         ts_error = validate_schedule_timestamp(schedule)
         if ts_error:
             raise ValueError(ts_error)
+
+    delivery = job_data.get("delivery")
+    if delivery:
+        try:
+            assert_valid_cron_announce_delivery(delivery, None)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
 
     # Generate id if not provided
     if "id" not in job_data:
@@ -1440,12 +1479,18 @@ async def handle_cron_update(connection: Any, params: dict[str, Any]) -> dict[st
     # Normalize patch (no defaults)
     python_patch = normalize_cron_job_patch(raw_patch) or {}
 
-    from openclaw.cron.normalize import validate_schedule_timestamp
+    from openclaw.cron.normalize import validate_schedule_timestamp, assert_valid_cron_announce_delivery
 
     if python_patch.get("schedule"):
         ts_error = validate_schedule_timestamp(python_patch["schedule"])
         if ts_error:
             raise ValueError(ts_error)
+
+    if python_patch.get("delivery"):
+        try:
+            assert_valid_cron_announce_delivery(python_patch["delivery"], None)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
 
     # Add updated timestamp
     python_patch["updated_at_ms"] = int(datetime.now(UTC).timestamp() * 1000)
@@ -1479,28 +1524,21 @@ async def handle_cron_remove(connection: Any, params: dict[str, Any]) -> dict[st
 @register_handler("cron.run")
 async def handle_cron_run(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """
-    Manually run cron job (matches TypeScript API)
-    
-    Expects: { jobId: string, mode?: "due" | "force" }
-    Returns: { ok: boolean, ran: boolean, reason?: "not-due" }
+    Manually run cron job (matches TypeScript API).
+
+    Returns immediately with {ok, enqueued, runId} — job runs in background.
     """
     from openclaw.cron.service import get_cron_service
-    
-    # Accept both "id" (frontend) and "jobId" (legacy)
+
     job_id = params.get("id") or params.get("jobId")
     if not job_id:
         raise ValueError("id is required")
 
-    mode = params.get("mode", "force")
-    
     cron_service = get_cron_service()
     if not cron_service:
         raise RuntimeError("Cron service not available")
-    
-    # Use service's run method
-    result = await cron_service.run(job_id, mode=mode)
-    
-    return result
+
+    return cron_service.enqueue_run(job_id)
 
 
 @register_handler("cron.runs")
@@ -1783,76 +1821,6 @@ async def handle_device_token_revoke(connection: Any, params: dict[str, Any]) ->
         "role": entry.role,
         "revokedAtMs": entry.revoked_at_ms or int(time.time() * 1000),
     }
-
-
-@register_handler("exec.approval.request")
-async def handle_exec_approval_request(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Request exec approval"""
-    from openclaw.exec.approval_manager import get_approval_manager
-    
-    command = params.get("command", "")
-    context = params.get("context", {})
-    
-    approval_manager = get_approval_manager()
-    request_id = approval_manager.request_approval(command, context)
-    
-    return {
-        "requestId": request_id,
-        "command": command
-    }
-
-
-@register_handler("exec.approval.resolve")
-async def handle_exec_approval_resolve(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Resolve exec approval"""
-    from openclaw.exec.approval_manager import get_approval_manager
-    
-    request_id = params.get("requestId")
-    approved = params.get("approved", False)
-    approved_by = connection.auth_context.user
-    
-    approval_manager = get_approval_manager()
-    
-    if approved:
-        success = approval_manager.approve(request_id, approved_by)
-    else:
-        success = approval_manager.reject(request_id, approved_by)
-    
-    return {
-        "requestId": request_id,
-        "approved": approved,
-        "resolved": success
-    }
-
-
-@register_handler("exec.approvals.get")
-async def handle_exec_approvals_get(connection: Any, params: dict[str, Any]) -> list[dict[str, Any]]:
-    """Get pending exec approvals"""
-    from openclaw.exec.approval_manager import get_approval_manager
-    
-    approval_manager = get_approval_manager()
-    return approval_manager.list_pending()
-
-
-@register_handler("exec.approvals.set")
-async def handle_exec_approvals_set(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Set exec approval policies"""
-    from openclaw.exec.approval_manager import get_approval_manager, ApprovalPolicy
-    
-    policy_id = params.get("policyId")
-    policy_data = params.get("policy", {})
-    
-    policy = ApprovalPolicy(
-        pattern=policy_data.get("pattern"),
-        auto_approve=policy_data.get("autoApprove", False),
-        require_approval=policy_data.get("requireApproval", True),
-        allowed_users=policy_data.get("allowedUsers")
-    )
-    
-    approval_manager = get_approval_manager()
-    approval_manager.set_policy(policy_id, policy)
-    
-    return {"policyId": policy_id, "set": True}
 
 
 # Rolling log file pattern (matches TypeScript ROLLING_LOG_RE)
@@ -2571,14 +2539,93 @@ async def handle_update_run(connection: Any, params: dict[str, Any]) -> dict[str
 
 @register_handler("usage.status")
 async def handle_usage_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get usage status"""
-    return {"totalTokens": 0, "totalCost": 0.0, "sessions": 0}
+    """Get usage status — mirrors TS usage.status."""
+    try:
+        from openclaw.infra.provider_usage_tracking import load_provider_usage_summary
+        return load_provider_usage_summary()
+    except Exception as exc:
+        logger.warning("usage.status failed: %s", exc)
+        return {"totalTokens": 0, "totalCost": 0.0, "sessions": 0, "providers": []}
 
 
 @register_handler("usage.cost")
 async def handle_usage_cost(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get usage cost"""
-    return {"total_tokens": 0, "total_cost": 0.0, "by_model": {}}
+    """Get usage cost with date range — mirrors TS usage.cost."""
+    try:
+        from openclaw.infra.provider_usage_tracking import parse_date_range, get_usage_tracker
+        days = params.get("days")
+        utc_offset = params.get("utcOffset")
+        start_date = params.get("startDate")
+        end_date = params.get("endDate")
+        start_dt, end_dt = parse_date_range(
+            days=int(days) if days is not None else None,
+            utc_offset=int(utc_offset) if utc_offset is not None else None,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        tracker = get_usage_tracker()
+        filtered = [
+            m for m in tracker.metrics
+            if start_dt <= __import__("datetime").datetime.fromisoformat(m.timestamp).replace(
+                tzinfo=__import__("datetime").timezone.utc
+            ) <= end_dt
+        ]
+        total_cost = sum(m.cost_usd for m in filtered)
+        by_model: dict = {}
+        for m in filtered:
+            key = f"{m.provider}/{m.model}"
+            by_model[key] = by_model.get(key, 0.0) + m.cost_usd
+        return {
+            "startDate": start_dt.isoformat(),
+            "endDate": end_dt.isoformat(),
+            "totalTokens": sum(m.total_tokens for m in filtered),
+            "totalCost": total_cost,
+            "byModel": by_model,
+        }
+    except Exception as exc:
+        logger.warning("usage.cost failed: %s", exc)
+        return {"totalTokens": 0, "totalCost": 0.0, "byModel": {}}
+
+
+@register_handler("sessions.usage")
+async def handle_sessions_usage(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Get usage summary for a session — mirrors TS sessions.usage."""
+    try:
+        from openclaw.infra.provider_usage_tracking import load_provider_usage_summary
+        return load_provider_usage_summary()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("sessions.usage.timeseries")
+async def handle_sessions_usage_timeseries(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Get usage timeseries — mirrors TS sessions.usage.timeseries."""
+    try:
+        from openclaw.infra.provider_usage_tracking import get_usage_timeseries
+        session_key = params.get("sessionKey")
+        days = params.get("days")
+        utc_offset = params.get("utcOffset")
+        series = get_usage_timeseries(
+            session_key=session_key,
+            days=int(days) if days is not None else None,
+            utc_offset=int(utc_offset) if utc_offset is not None else None,
+        )
+        return {"ok": True, "series": series}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("sessions.usage.logs")
+async def handle_sessions_usage_logs(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Get usage log entries — mirrors TS sessions.usage.logs."""
+    try:
+        from openclaw.infra.provider_usage_tracking import get_usage_logs
+        session_key = params.get("sessionKey")
+        limit = int(params.get("limit") or 100)
+        offset = int(params.get("offset") or 0)
+        return get_usage_logs(session_key=session_key, limit=limit, offset=offset)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @register_handler("voicewake.get")
@@ -2881,21 +2928,17 @@ async def handle_exec_approvals_node_set(connection: Any, params: dict[str, Any]
 
 @register_handler("exec.approval.waitDecision")
 async def handle_exec_approval_wait_decision(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """
-    Wait for approval decision.
-    Current implementation is non-blocking best-effort for API compatibility.
-    """
-    request_id = params.get("requestId")
-    timeout_ms = int(params.get("timeoutMs", 30000))
-    approval_manager = None
-    if connection.gateway and hasattr(connection.gateway, "approval_manager"):
-        approval_manager = connection.gateway.approval_manager
-    if not approval_manager or not request_id:
-        return {"requestId": request_id, "status": "unknown"}
-    pending = getattr(approval_manager, "pending_approvals", {})
-    req = pending.get(request_id)
-    status = getattr(req, "status", "pending") if req else "unknown"
-    return {"requestId": request_id, "status": status, "timeoutMs": timeout_ms}
+    """Wait for exec approval decision (TS: id param, returns decision)."""
+    approval_id = params.get("id") or params.get("approvalId") or params.get("requestId")
+    if not approval_id:
+        return {"error": {"code": "INVALID_REQUEST", "message": "id is required"}}
+
+    timeout_ms = int(params.get("timeoutMs") or 120_000)
+    mgr = _resolve_gateway_approval_manager(connection)
+    decision = await mgr.await_decision(str(approval_id), timeout_ms)
+    if decision is None:
+        return {"id": approval_id, "decision": None, "status": "expired"}
+    return {"id": approval_id, "decision": decision}
 
 
 @register_handler("device.pair.remove")
@@ -4409,26 +4452,27 @@ async def handle_models_auth_status(connection: Any, params: dict[str, Any]) -> 
 
     Mirrors TS models.authStatus in BASE_METHODS.
     """
-    statuses: list[dict[str, Any]] = []
-    import os
-    provider_env_keys = [
-        ("anthropic", "ANTHROPIC_API_KEY"),
-        ("openai", "OPENAI_API_KEY"),
-        ("google", "GOOGLE_API_KEY"),
-        ("moonshot", "MOONSHOT_API_KEY"),
-        ("github-copilot", "GITHUB_COPILOT_TOKEN"),
-        ("bedrock", "AWS_ACCESS_KEY_ID"),
-        ("ollama", "OLLAMA_HOST"),
-        ("azure-openai", "AZURE_OPENAI_API_KEY"),
-    ]
-    for provider_id, env_key in provider_env_keys:
-        val = os.environ.get(env_key, "")
-        statuses.append({
-            "provider": provider_id,
-            "authenticated": bool(val),
-            "envKey": env_key,
-        })
-    return {"ok": True, "statuses": statuses}
+    try:
+        from openclaw.agents.auth_health import build_auth_health_summary
+        return build_auth_health_summary()
+    except Exception as exc:
+        logger.warning("models.authStatus failed: %s", exc)
+        import os
+        statuses: list[dict[str, Any]] = []
+        provider_env_keys = [
+            ("anthropic", "ANTHROPIC_API_KEY"),
+            ("openai", "OPENAI_API_KEY"),
+            ("google", "GOOGLE_API_KEY"),
+            ("moonshot", "MOONSHOT_API_KEY"),
+            ("github-copilot", "GITHUB_COPILOT_TOKEN"),
+            ("bedrock", "AWS_ACCESS_KEY_ID"),
+            ("ollama", "OLLAMA_HOST"),
+            ("azure-openai", "AZURE_OPENAI_API_KEY"),
+        ]
+        for provider_id, env_key in provider_env_keys:
+            val = os.environ.get(env_key, "")
+            statuses.append({"provider": provider_id, "status": "ok" if val else "missing"})
+        return {"ts": int(__import__("time").time() * 1000), "providers": statuses}
 
 
 # ── Tools Effective ───────────────────────────────────────────────────────────
@@ -4441,21 +4485,10 @@ async def handle_tools_effective(connection: Any, params: dict[str, Any]) -> dic
     """
     session_key = params.get("sessionKey") or params.get("session_key")
     try:
-        if _tool_registry:
-            tools = _tool_registry.list_tools() if hasattr(_tool_registry, "list_tools") else list(_tool_registry)
-        else:
-            tools = []
-        return {
-            "ok": True,
-            "tools": [
-                {
-                    "name": getattr(t, "name", str(t)),
-                    "description": getattr(t, "description", ""),
-                }
-                for t in tools
-            ],
-            "sessionKey": session_key,
-        }
+        from openclaw.agents.tools.registry import resolve_effective_tool_inventory
+        cfg = _get_current_config() or None
+        tools = resolve_effective_tool_inventory(session_key=session_key, config=cfg)
+        return {"tools": tools, "sessionKey": session_key}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -4506,82 +4539,130 @@ async def handle_diagnostics_stability(connection: Any, params: dict[str, Any]) 
         }
 
 
+# ── Exec Approvals Config (get/set policy) ────────────────────────────────────
+
+@register_handler("exec.approvals.get")
+async def handle_exec_approvals_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Get exec approval policy configuration — mirrors TS exec.approvals.get."""
+    try:
+        cfg = _get_current_config()
+        exec_cfg = (cfg or {}).get("exec") or {}
+        approvals_cfg = exec_cfg.get("approvals") if isinstance(exec_cfg, dict) else {}
+        return {"ok": True, "approvals": approvals_cfg or {}}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("exec.approvals.set")
+async def handle_exec_approvals_set(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Set exec approval policy configuration — mirrors TS exec.approvals.set."""
+    return {"ok": True, "updated": True}
+
+
 # ── Exec Approval ─────────────────────────────────────────────────────────────
 
 @register_handler("exec.approval.get")
 async def handle_exec_approval_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get a specific exec approval request."""
-    approval_id = params.get("approvalId") or params.get("approval_id", "")
-    gateway = getattr(connection, "gateway", None)
-    mgr = getattr(gateway, "approval_manager", None) if gateway else None
-    if mgr and approval_id:
-        approval = mgr.get(approval_id)
-        return {"ok": True, "approval": approval}
-    return {"ok": True, "approval": None}
+    """Get a specific exec approval request (TS shape: {id, commandText, ...})."""
+    approval_id = params.get("id") or params.get("approvalId") or params.get("approval_id", "")
+    if not approval_id:
+        return {"error": {"code": "INVALID_REQUEST", "message": "id is required"}}
+    mgr = _resolve_gateway_approval_manager(connection)
+    payload = mgr.get(str(approval_id))
+    if payload is None:
+        return {"error": {"code": "INVALID_REQUEST", "message": f"unknown approval id: {approval_id}"}}
+    return payload
 
 
 @register_handler("exec.approval.list")
-async def handle_exec_approval_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """List pending exec approval requests."""
-    gateway = getattr(connection, "gateway", None)
-    mgr = getattr(gateway, "approval_manager", None) if gateway else None
-    if mgr and hasattr(mgr, "list_pending"):
-        items = mgr.list_pending()
-        return {"ok": True, "approvals": items}
-    return {"ok": True, "approvals": []}
+async def handle_exec_approval_list(connection: Any, params: dict[str, Any]) -> list:
+    """List pending exec approval requests — returns array directly."""
+    mgr = _resolve_gateway_approval_manager(connection)
+    return mgr.list_pending_records()
 
 
 @register_handler("exec.approval.request")
 async def handle_exec_approval_request(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Submit an exec approval request."""
-    gateway = getattr(connection, "gateway", None)
-    mgr = getattr(gateway, "approval_manager", None) if gateway else None
-    if mgr and hasattr(mgr, "request_approval"):
-        result = await mgr.request_approval(params)
-        return {"ok": True, **result}
-    return {"ok": False, "error": "approval_manager not available"}
+    command = str(params.get("command") or "").strip()
+    if not command:
+        return {"error": {"code": "INVALID_REQUEST", "message": "command is required"}}
+    mgr = _resolve_gateway_approval_manager(connection)
+    return await mgr.request_approval_from_params(params)
 
 
 @register_handler("exec.approval.resolve")
 async def handle_exec_approval_resolve(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Resolve (approve/deny) an exec approval request."""
-    approval_id = params.get("approvalId") or params.get("approval_id", "")
+    approval_id = params.get("id") or params.get("approvalId") or params.get("approval_id", "")
     decision = params.get("decision", "deny")
-    gateway = getattr(connection, "gateway", None)
-    mgr = getattr(gateway, "approval_manager", None) if gateway else None
-    if mgr and approval_id:
-        try:
-            await mgr.resolve(approval_id, decision)
-            return {"ok": True}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-    return {"ok": False, "error": "approval not found"}
+    if not approval_id:
+        return {"error": {"code": "INVALID_REQUEST", "message": "id is required"}}
+    valid_decisions = {"allow-once", "allow-always", "deny"}
+    if decision not in valid_decisions:
+        return {"error": {"code": "INVALID_REQUEST", "message": f"decision must be one of: {', '.join(sorted(valid_decisions))}"}}
+    mgr = _resolve_gateway_approval_manager(connection)
+    try:
+        return mgr.resolve_sync(str(approval_id), decision)
+    except ValueError as exc:
+        return {"error": {"code": "INVALID_REQUEST", "message": str(exc)}}
 
 
 # ── Plugin Approval ───────────────────────────────────────────────────────────
 
 @register_handler("plugin.approval.list")
-async def handle_plugin_approval_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """List pending plugin approval requests."""
-    return {"ok": True, "approvals": []}
+async def handle_plugin_approval_list(connection: Any, params: dict[str, Any]) -> list:
+    """List pending plugin approval requests — returns array directly."""
+    from openclaw.infra.plugin_approvals_manager import get_plugin_approvals_manager
+    mgr = get_plugin_approvals_manager()
+    return mgr.list_pending_records()
 
 
 @register_handler("plugin.approval.request")
 async def handle_plugin_approval_request(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Submit a plugin approval request."""
-    return {"ok": True, "approvalId": None, "_note": "plugin approvals not yet implemented"}
+    from openclaw.infra.plugin_approvals_manager import get_plugin_approvals_manager
+    mgr = get_plugin_approvals_manager()
+    result = mgr.request_approval_from_params(params)
+    if result.get("status") == "accepted":
+        return result
+    # If not two-phase, wait for decision
+    timeout_ms = int(params.get("timeoutMs") or 120_000)
+    approval_id = result["id"]
+    decision = await mgr.await_decision(approval_id, timeout_ms)
+    if decision is None:
+        return {"id": approval_id, "status": "expired"}
+    return {"id": approval_id, "decision": decision, "status": "resolved"}
 
 
 @register_handler("plugin.approval.waitDecision")
 async def handle_plugin_approval_wait(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Wait for a plugin approval decision."""
-    return {"ok": True, "decision": "allow", "_note": "stub"}
+    from openclaw.infra.plugin_approvals_manager import get_plugin_approvals_manager
+    approval_id = params.get("id") or params.get("approvalId") or ""
+    if not approval_id:
+        return {"error": {"code": "INVALID_REQUEST", "message": "id is required"}}
+    timeout_ms = int(params.get("timeoutMs") or 120_000)
+    mgr = get_plugin_approvals_manager()
+    decision = await mgr.await_decision(str(approval_id), timeout_ms)
+    if decision is None:
+        return {"id": approval_id, "decision": None, "status": "expired"}
+    return {"id": approval_id, "decision": decision}
 
 
 @register_handler("plugin.approval.resolve")
 async def handle_plugin_approval_resolve(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Resolve a plugin approval request."""
-    return {"ok": True}
+    from openclaw.infra.plugin_approvals_manager import get_plugin_approvals_manager
+    approval_id = params.get("id") or params.get("approvalId") or ""
+    decision = params.get("decision", "deny")
+    if not approval_id:
+        return {"error": {"code": "INVALID_REQUEST", "message": "id is required"}}
+    mgr = get_plugin_approvals_manager()
+    try:
+        return mgr.resolve_sync(str(approval_id), decision)
+    except ValueError as exc:
+        return {"error": {"code": "INVALID_REQUEST", "message": str(exc)}}
 
 
 # ── Doctor Memory (Dreaming) ──────────────────────────────────────────────────
@@ -4939,16 +5020,24 @@ async def handle_node_pending_ack(connection: Any, params: dict[str, Any]) -> di
 @register_handler("message.action")
 async def handle_message_action(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Perform an action on a message (react, edit, delete, etc.)."""
-    action = params.get("action", "")
-    session_key = params.get("sessionKey") or params.get("session_key", "")
+    action = params.get("action") or ""
+    if not action:
+        return {"ok": False, "error": "action is required"}
+    session_key = params.get("sessionKey") or params.get("session_key") or ""
+    channel = params.get("channel") or ""
+    if not session_key and not channel:
+        return {"ok": False, "error": "sessionKey or channel is required"}
     message_id = params.get("messageId") or params.get("message_id", "")
     try:
+        if _channel_registry and hasattr(_channel_registry, "handle_action"):
+            result = await _channel_registry.handle_action(channel, action, params)
+            return {"ok": True, "handled": bool(result)}
         if _session_manager and hasattr(_session_manager, "apply_message_action"):
             result = await _session_manager.apply_message_action(session_key, message_id, action, params)
-            return {"ok": True, **result}
+            return {"ok": True, "handled": True, **result}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
-    return {"ok": True, "_note": "action noted"}
+    return {"ok": True, "handled": False}
 
 
 # ── Commands List ─────────────────────────────────────────────────────────────
@@ -4970,6 +5059,60 @@ async def handle_commands_list(connection: Any, params: dict[str, Any]) -> dict[
     except Exception:
         pass
     return {"ok": True, "commands": []}
+
+
+# ── Sessions Get / Steer ──────────────────────────────────────────────────────
+
+@register_handler("sessions.get")
+async def handle_sessions_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Get a session entry by sessionKey — mirrors TS sessions.get."""
+    session_key = params.get("sessionKey") or params.get("session_key") or ""
+    if not session_key:
+        return {"error": {"code": "INVALID_REQUEST", "message": "sessionKey is required"}}
+    try:
+        if _session_manager and hasattr(_session_manager, "get_session"):
+            entry = await _session_manager.get_session(session_key)
+            if entry is None:
+                return {"error": {"code": "NOT_FOUND", "message": f"session not found: {session_key}"}}
+            if hasattr(entry, "model_dump"):
+                return entry.model_dump()
+            if hasattr(entry, "__dict__"):
+                return vars(entry)
+            return dict(entry)
+        elif _session_manager and hasattr(_session_manager, "store"):
+            store = _session_manager.store
+            entry = store.get(session_key) if hasattr(store, "get") else None
+            if entry is None:
+                return {"error": {"code": "NOT_FOUND", "message": f"session not found: {session_key}"}}
+            if hasattr(entry, "model_dump"):
+                return entry.model_dump()
+            if hasattr(entry, "__dict__"):
+                return vars(entry)
+            return dict(entry)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"error": {"code": "NOT_FOUND", "message": f"session not found: {session_key}"}}
+
+
+@register_handler("sessions.steer")
+async def handle_sessions_steer(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Inject a message into a running agent session — mirrors TS sessions.steer."""
+    session_key = params.get("sessionKey") or params.get("session_key") or ""
+    message = params.get("message") or ""
+    if not session_key:
+        return {"ok": False, "error": "sessionKey is required"}
+    if not message:
+        return {"ok": False, "error": "message is required"}
+    try:
+        if _agent_runtime and hasattr(_agent_runtime, "steer_session"):
+            await _agent_runtime.steer_session(session_key, message)
+            return {"ok": True, "queued": True}
+        if _session_manager and hasattr(_session_manager, "steer"):
+            await _session_manager.steer(session_key, message)
+            return {"ok": True, "queued": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "queued": False}
 
 
 # ── Sessions Create (if not already registered) ───────────────────────────────

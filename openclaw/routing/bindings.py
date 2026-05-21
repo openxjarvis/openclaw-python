@@ -173,10 +173,92 @@ def resolve_preferred_account_id(
     return default_account_id
 
 
+def _get_current_cfg():
+    """Load current config; returns None on failure."""
+    try:
+        from openclaw.gateway.config_service import get_config_service as _gcs
+        svc = _gcs()
+        return svc.get_config() if svc else None
+    except Exception:
+        return None
+
+
+def resolve_first_bound_account_id(
+    agent_id: str,
+    channel: str,
+    peer_kind: Optional[str] = None,
+) -> Optional[str]:
+    """Find the first account ID bound to an agent for a given channel and optional peer kind.
+
+    Mirrors TS resolveFirstBoundAccountId().
+
+    Args:
+        agent_id: Agent ID to look for (normalized).
+        channel: Channel name.
+        peer_kind: Optional peer kind filter (e.g. "group", "channel").
+
+    Returns:
+        First matching account ID, or None if not found.
+    """
+    cfg = _get_current_cfg()
+    if cfg is None:
+        return None
+
+    normalized_channel = _normalize_binding_channel_id(channel)
+    normalized_agent = normalize_agent_id(agent_id)
+    if not normalized_channel or not normalized_agent:
+        return None
+
+    for binding in list_bindings(cfg):
+        resolved = _resolve_normalized_binding_match(binding)
+        if not resolved:
+            continue
+        if resolved["channel_id"] != normalized_channel:
+            continue
+        if resolved["agent_id"] != normalized_agent:
+            continue
+        if peer_kind is not None:
+            # Check peer kind in binding match
+            match = binding.get("match", {})
+            if isinstance(match, dict):
+                peer = match.get("peer", {})
+                binding_peer_kind = (peer.get("kind", "") if isinstance(peer, dict) else "").lower()
+                # Allow group ↔ channel aliasing
+                if not peer_kind_matches(binding_peer_kind, peer_kind.lower()):
+                    continue
+        return resolved["account_id"]
+    return None
+
+
+def peer_kind_matches(binding_kind: str, actual_kind: str) -> bool:
+    """Check if a binding peer kind matches the actual peer kind.
+
+    Handles group ↔ channel aliases (Discord uses "channel", Slack uses "group").
+
+    Args:
+        binding_kind: Peer kind from binding config.
+        actual_kind: Actual peer kind from incoming message.
+
+    Returns:
+        True if they match (including aliases).
+    """
+    if not binding_kind:
+        return True  # no constraint = wildcard
+    if binding_kind == actual_kind:
+        return True
+    aliases = {frozenset({"group", "channel"})}
+    for alias_set in aliases:
+        if binding_kind in alias_set and actual_kind in alias_set:
+            return True
+    return False
+
+
 __all__ = [
     "list_bindings",
     "list_bound_account_ids",
     "resolve_default_agent_bound_account_id",
     "build_channel_account_bindings",
     "resolve_preferred_account_id",
+    "resolve_first_bound_account_id",
+    "peer_kind_matches",
 ]

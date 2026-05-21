@@ -534,6 +534,8 @@ class HeartbeatConfig(BaseModel):
     ackMaxChars: int | None = Field(default=None)
     suppressToolErrorWarnings: bool | None = Field(default=None)
     lightContext: bool | None = Field(default=None)
+    isolatedSession: bool | None = Field(default=None)
+    includeSystemPromptSection: bool | None = Field(default=None)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -756,6 +758,11 @@ class AgentDefaults(BaseModel):
     typingIntervalSeconds: int | None = Field(default=None)
     typingMode: Literal["never", "instant", "thinking", "message"] | None = Field(default=None)
     heartbeat: HeartbeatConfig | None = Field(default=None)
+    skills: "SkillsConfig | None" = Field(default=None)
+    systemPromptOverride: str | None = Field(default=None)
+    promptOverlays: list[Any] | None = Field(default=None)
+    startupContext: dict[str, Any] | None = Field(default=None)
+    bootstrapPromptTruncationWarning: bool | None = Field(default=None)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -890,7 +897,8 @@ class SubagentsConfig(BaseModel):
     runTimeoutSeconds: int | None = Field(default=None)
     announceTimeoutMs: int | None = Field(default=None)
     allowAgents: list[str] | None = Field(default=None)
-    
+    requireAgentId: bool | None = Field(default=None)
+
     # Legacy fields for backward compatibility
     enabled: bool = Field(default=True, exclude=True)
     maxDepth: int | None = Field(default=None, exclude=True)
@@ -1251,6 +1259,28 @@ class SessionSkillSnapshot(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class SkillsLoadConfig(BaseModel):
+    """Skills load configuration — mirrors TS SkillsLoadConfig."""
+
+    extraDirs: list[str] | None = Field(default=None)
+    watch: bool | None = Field(default=None)
+    watchDebounceMs: int | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SkillsLimitsConfig(BaseModel):
+    """Skills limits configuration — mirrors TS SkillsLimitsConfig."""
+
+    maxCandidatesPerRoot: int | None = Field(default=None)
+    maxSkillsLoadedPerSource: int | None = Field(default=None)
+    maxSkillsInPrompt: int | None = Field(default=None)
+    maxSkillsPromptChars: int | None = Field(default=None)
+    maxSkillFileBytes: int | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class SkillsConfig(BaseModel):
     """Skills configuration (aligned with TS skills block)"""
 
@@ -1259,6 +1289,8 @@ class SkillsConfig(BaseModel):
     disable: list[str] | None = Field(default=None)
     entries: dict[str, Any] | None = Field(default=None)  # skills.entries.<skillKey>.apiKey, etc.
     install: dict[str, Any] | None = Field(default=None)  # nodeManager, etc.
+    load: SkillsLoadConfig | None = Field(default=None)
+    limits: SkillsLimitsConfig | None = Field(default=None)
 
     model_config = ConfigDict(extra="allow")
 

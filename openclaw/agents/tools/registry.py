@@ -385,3 +385,65 @@ def get_tool_registry(session_manager: Any | None = None) -> ToolRegistry:
     if _global_registry is None:
         _global_registry = ToolRegistry(session_manager=session_manager)
     return _global_registry
+
+
+def resolve_effective_tool_inventory(
+    session_key: str | None = None,
+    config: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Return filtered tool list based on session config and tool policies.
+
+    Mirrors TS resolveEffectiveToolInventory.
+
+    Args:
+        session_key: Optional session key to filter tools by session config.
+        config: Optional config dict for policy filtering.
+
+    Returns:
+        List of {name, description, schema} dicts.
+    """
+    registry = get_tool_registry()
+    tools = registry.list_tools()
+
+    # Apply policy filtering from config if provided
+    denied_tools: set[str] = set()
+    allowed_tools: set[str] | None = None
+    if config:
+        tools_cfg = None
+        if isinstance(config, dict):
+            agents = config.get("agents", {})
+            defaults = agents.get("defaults", {}) if isinstance(agents, dict) else {}
+            tools_cfg = defaults.get("tools") if isinstance(defaults, dict) else None
+        else:
+            agents = getattr(config, "agents", None)
+            defaults = getattr(agents, "defaults", None) if agents else None
+            tools_cfg = getattr(defaults, "tools", None) if defaults else None
+
+        if tools_cfg:
+            deny = getattr(tools_cfg, "deny", None) or (tools_cfg.get("deny") if isinstance(tools_cfg, dict) else None)
+            allow = getattr(tools_cfg, "allow", None) or (tools_cfg.get("allow") if isinstance(tools_cfg, dict) else None)
+            if deny and isinstance(deny, list):
+                denied_tools.update(str(d) for d in deny)
+            if allow and isinstance(allow, list):
+                allowed_tools = set(str(a) for a in allow)
+
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        name = getattr(tool, "name", str(tool))
+        if name in denied_tools:
+            continue
+        if allowed_tools is not None and name not in allowed_tools:
+            continue
+        schema = None
+        if hasattr(tool, "get_schema"):
+            schema = tool.get_schema()
+        elif hasattr(tool, "parameters"):
+            schema = tool.parameters
+        result.append(
+            {
+                "name": name,
+                "description": getattr(tool, "description", ""),
+                "schema": schema,
+            }
+        )
+    return result

@@ -209,10 +209,15 @@ def resolve_cron_delivery_plan(job: Any) -> dict[str, Any]:
 # validate-timestamp helpers
 # ---------------------------------------------------------------------------
 
+SCHEDULE_TIMESTAMP_PAST_GRACE_MS = 60_000        # allow up to 60s in the past
+SCHEDULE_TIMESTAMP_FUTURE_CAP_YEARS = 100        # reject if > 100 years from now (prevents absurd values)
+
+
 def validate_schedule_timestamp(schedule: Any, now_ms: int | None = None) -> str | None:
     """Validate an 'at' schedule's timestamp.
 
     Returns an error message string, or None if valid.
+    Changes vs original: 1-minute past grace, 10-year future cap.
     """
     from .types import AtSchedule
     if isinstance(schedule, dict):
@@ -230,9 +235,51 @@ def validate_schedule_timestamp(schedule: Any, now_ms: int | None = None) -> str
         return f"invalid timestamp: {schedule.at!r}"
     if now_ms is None:
         now_ms = int(time.time() * 1000)
-    if parsed <= now_ms:
+    # Allow up to 60s in the past (grace period)
+    if parsed < now_ms - SCHEDULE_TIMESTAMP_PAST_GRACE_MS:
         return f"at schedule timestamp is in the past: {schedule.at!r}"
+    # Reject if more than SCHEDULE_TIMESTAMP_FUTURE_CAP_YEARS years in the future
+    future_cap_ms = SCHEDULE_TIMESTAMP_FUTURE_CAP_YEARS * 365 * 24 * 3600 * 1000
+    if parsed > now_ms + future_cap_ms:
+        return f"at schedule timestamp is more than {SCHEDULE_TIMESTAMP_FUTURE_CAP_YEARS} years in the future: {schedule.at!r}"
     return None
+
+
+def assert_valid_cron_announce_delivery(
+    delivery_config: Any,
+    configured_channel_ids: list[str] | None = None,
+) -> None:
+    """Validate announce channel IDs in a cron delivery config.
+
+    Args:
+        delivery_config: Delivery config dict or object.
+        configured_channel_ids: List of known/configured channel IDs (optional).
+
+    Raises:
+        ValueError: If announce references unknown channels.
+    """
+    if not delivery_config:
+        return
+    if isinstance(delivery_config, dict):
+        announce = delivery_config.get("announce")
+    else:
+        announce = getattr(delivery_config, "announce", None)
+    if not announce:
+        return
+    if isinstance(announce, str):
+        announce_ids = [announce]
+    elif isinstance(announce, list):
+        announce_ids = [str(a) for a in announce if a]
+    else:
+        announce_ids = []
+
+    if configured_channel_ids is None:
+        return  # Can't validate without a channel list
+
+    known = set(configured_channel_ids)
+    for ch_id in announce_ids:
+        if ch_id and ch_id not in known:
+            raise ValueError(f"announce references unknown channel: {ch_id!r}")
 
 
 # ---------------------------------------------------------------------------

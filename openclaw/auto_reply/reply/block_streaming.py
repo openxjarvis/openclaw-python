@@ -498,6 +498,61 @@ def resolve_block_streaming_coalescing(
     )
 
 
+MAX_CHUNK_CHARS_CAP = 4000
+MAX_COALESCE_IDLE_MS_CAP = 10_000
+
+
+def resolve_effective_block_streaming_config(
+    config: dict | None,
+    session_config: dict | None = None,
+) -> dict:
+    """Merge chunking + coalescing settings with cap values.
+
+    Mirrors TS resolveEffectiveBlockStreamingConfig.
+
+    Args:
+        config: Global OpenClaw config dict.
+        session_config: Per-session config overrides (optional).
+
+    Returns:
+        Dict with: enabled, maxChunkChars, minChunkChars, coalesceIdleMs,
+        breakPreference, joiner.
+    """
+    cfg = config or {}
+    s_cfg = session_config or {}
+
+    agents = cfg.get("agents", {}).get("defaults", {})
+    enabled = agents.get("blockStreamingDefault") == "on"
+
+    chunk_raw = s_cfg.get("blockStreamingChunk") or agents.get("blockStreamingChunk") or {}
+    coalesce_raw = s_cfg.get("blockStreamingCoalesce") or agents.get("blockStreamingCoalesce") or {}
+
+    max_chunk = int(chunk_raw.get("maxChars", chunk_raw.get("max_chars", DEFAULT_BLOCK_STREAM_MAX)))
+    max_chunk = max(1, min(max_chunk, MAX_CHUNK_CHARS_CAP))
+
+    min_chunk = int(chunk_raw.get("minChars", chunk_raw.get("min_chars", DEFAULT_BLOCK_STREAM_MIN)))
+    min_chunk = max(1, min(min_chunk, max_chunk))
+
+    idle_ms = int(coalesce_raw.get("idleMs", coalesce_raw.get("idle_ms", DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS)))
+    idle_ms = max(0, min(idle_ms, MAX_COALESCE_IDLE_MS_CAP))
+
+    break_pref = chunk_raw.get("breakPreference") or chunk_raw.get("break_preference") or "paragraph"
+    if break_pref not in ("paragraph", "newline", "sentence"):
+        break_pref = "paragraph"
+
+    joiner_map = {"sentence": " ", "newline": "\n", "paragraph": "\n\n"}
+    joiner = coalesce_raw.get("joiner") or joiner_map.get(break_pref, "\n\n")
+
+    return {
+        "enabled": bool(s_cfg.get("blockStreamingDefault", enabled) if "blockStreamingDefault" in s_cfg else enabled),
+        "maxChunkChars": max_chunk,
+        "minChunkChars": min_chunk,
+        "coalesceIdleMs": idle_ms,
+        "breakPreference": break_pref,
+        "joiner": joiner,
+    }
+
+
 def resolve_block_streaming_config(
     cfg: dict | None,
     channel: str | None = None,

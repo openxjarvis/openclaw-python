@@ -155,11 +155,30 @@ class SkillCommandSpec:
         skill_name: Corresponding skill name
         description: Command description
         dispatch: Optional dispatch configuration
+        prompt_template: Optional prompt template for the command
+        source_file_path: Optional path to source file defining the command
     """
     name: str
     skill_name: str
     description: str
     dispatch: SkillCommandDispatch | None = None
+    prompt_template: str | None = None
+    source_file_path: str | None = None
+
+
+@dataclass
+class SkillExposure:
+    """
+    Skill exposure configuration (matches TS SkillExposure).
+
+    Attributes:
+        include_in_runtime_registry: Include in runtime tool registry.
+        include_in_available_skills_prompt: Include in available-skills prompt.
+        user_invocable: Whether users can invoke this skill directly.
+    """
+    include_in_runtime_registry: bool | None = None
+    include_in_available_skills_prompt: bool | None = None
+    user_invocable: bool | None = None
 
 
 @dataclass
@@ -174,6 +193,7 @@ class SkillEntry:
         invocation: Invocation policy
         source: Source identifier (bundled, managed, workspace, plugin)
         source_dir: Directory this skill was loaded from
+        exposure: Exposure configuration (where this skill surfaces)
         skill_key: Unique key for this skill (used for config lookups)
     """
     skill: Skill
@@ -182,6 +202,7 @@ class SkillEntry:
     invocation: SkillInvocationPolicy | None = None
     source: str = "unknown"
     source_dir: str = ""
+    exposure: SkillExposure | None = None
 
     def __post_init__(self) -> None:
         if self.frontmatter is None:
