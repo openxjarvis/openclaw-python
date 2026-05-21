@@ -31,6 +31,10 @@ class InternalHookEvent:
     messages: list[str] = field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Agent hook contexts
+# ---------------------------------------------------------------------------
+
 @dataclass
 class AgentBootstrapHookContext:
     """Context for agent:bootstrap events."""
@@ -53,6 +57,35 @@ class AgentBootstrapHookEvent(InternalHookEvent):
         workspace_dir="", bootstrap_files=[]
     ))
 
+
+# ---------------------------------------------------------------------------
+# Gateway hook contexts
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GatewayStartupHookContext:
+    """Context for gateway:startup events.
+
+    Matches TS GatewayStartupHookContext from src/hooks/internal-hooks.ts.
+    """
+
+    cfg: dict[str, Any] | None = None
+    deps: dict[str, Any] | None = None
+    workspace_dir: str | None = None
+
+
+@dataclass
+class GatewayStartupHookEvent(InternalHookEvent):
+    """Gateway startup hook event."""
+
+    type: Literal["gateway"] = "gateway"
+    action: Literal["startup"] = "startup"
+    context: GatewayStartupHookContext = field(default_factory=GatewayStartupHookContext)
+
+
+# ---------------------------------------------------------------------------
+# Message hook contexts
+# ---------------------------------------------------------------------------
 
 @dataclass
 class MessageReceivedHookContext:
@@ -96,6 +129,8 @@ class MessageSentHookContext:
     account_id: str | None = None
     conversation_id: str | None = None
     message_id: str | None = None
+    is_group: bool | None = None
+    group_id: str | None = None
 
 
 @dataclass
@@ -107,6 +142,105 @@ class MessageSentHookEvent(InternalHookEvent):
     context: MessageSentHookContext = field(default_factory=lambda: MessageSentHookContext(
         to="", content="", success=False
     ))
+
+
+@dataclass
+class MessageTranscribedHookContext:
+    """Context for message:transcribed events.
+
+    Matches TS MessageTranscribedHookContext from src/hooks/internal-hooks.ts.
+    """
+
+    transcript: str
+    channel_id: str = ""
+    from_: str | None = None
+    to: str | None = None
+    body: str | None = None
+    body_for_agent: str | None = None
+    timestamp: int | None = None
+    conversation_id: str | None = None
+    message_id: str | None = None
+    sender_id: str | None = None
+    sender_name: str | None = None
+    sender_username: str | None = None
+    provider: str | None = None
+    surface: str | None = None
+    media_path: str | None = None
+    media_type: str | None = None
+
+
+@dataclass
+class MessageTranscribedHookEvent(InternalHookEvent):
+    """Message transcribed hook event (audio → text)."""
+
+    type: Literal["message"] = "message"
+    action: Literal["transcribed"] = "transcribed"
+    context: MessageTranscribedHookContext = field(
+        default_factory=lambda: MessageTranscribedHookContext(transcript="")
+    )
+
+
+@dataclass
+class MessagePreprocessedHookContext:
+    """Context for message:preprocessed events.
+
+    Matches TS MessagePreprocessedHookContext from src/hooks/internal-hooks.ts.
+    """
+
+    channel_id: str = ""
+    from_: str | None = None
+    to: str | None = None
+    body: str | None = None
+    body_for_agent: str | None = None
+    timestamp: int | None = None
+    conversation_id: str | None = None
+    message_id: str | None = None
+    sender_id: str | None = None
+    sender_name: str | None = None
+    sender_username: str | None = None
+    provider: str | None = None
+    surface: str | None = None
+    media_path: str | None = None
+    media_type: str | None = None
+    transcript: str | None = None
+    is_group: bool | None = None
+    group_id: str | None = None
+
+
+@dataclass
+class MessagePreprocessedHookEvent(InternalHookEvent):
+    """Message preprocessed hook event."""
+
+    type: Literal["message"] = "message"
+    action: Literal["preprocessed"] = "preprocessed"
+    context: MessagePreprocessedHookContext = field(default_factory=MessagePreprocessedHookContext)
+
+
+# ---------------------------------------------------------------------------
+# Session hook contexts
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SessionPatchHookContext:
+    """Context for session:patch events.
+
+    Matches TS SessionPatchHookContext from src/hooks/internal-hooks.ts.
+    """
+
+    session_entry: dict[str, Any]
+    patch: dict[str, Any]
+    cfg: dict[str, Any]
+
+
+@dataclass
+class SessionPatchHookEvent(InternalHookEvent):
+    """Session patch hook event."""
+
+    type: Literal["session"] = "session"
+    action: Literal["patch"] = "patch"
+    context: SessionPatchHookContext = field(
+        default_factory=lambda: SessionPatchHookContext(session_entry={}, patch={}, cfg={})
+    )
 
 
 class InternalHookHandler(Protocol):
@@ -187,11 +321,15 @@ async def trigger_internal_hook(event: InternalHookEvent) -> None:
     2. The specific event:action combination (e.g., 'command:new')
     
     Handlers are called in registration order. Errors are caught and logged
-    but don't prevent other handlers from running.
+    but don't prevent other handlers from running.  No-op when hooks are
+    globally disabled via :func:`set_internal_hooks_enabled`.
     
     Args:
         event: The event to trigger
     """
+    if not _hooks_enabled:
+        return
+
     type_handlers = _handlers.get(event.type, [])
     specific_handlers = _handlers.get(f"{event.type}:{event.action}", [])
     
@@ -271,3 +409,50 @@ def is_message_sent_event(event: InternalHookEvent) -> TypeGuard[MessageSentHook
         True if event is a message:sent event
     """
     return event.type == "message" and event.action == "sent"
+
+
+def is_gateway_startup_event(event: InternalHookEvent) -> TypeGuard[GatewayStartupHookEvent]:
+    """Check if event is a gateway:startup event."""
+    return event.type == "gateway" and event.action == "startup"
+
+
+def is_message_transcribed_event(event: InternalHookEvent) -> TypeGuard[MessageTranscribedHookEvent]:
+    """Check if event is a message:transcribed event."""
+    return event.type == "message" and event.action == "transcribed"
+
+
+def is_message_preprocessed_event(event: InternalHookEvent) -> TypeGuard[MessagePreprocessedHookEvent]:
+    """Check if event is a message:preprocessed event."""
+    return event.type == "message" and event.action == "preprocessed"
+
+
+def is_session_patch_event(event: InternalHookEvent) -> TypeGuard[SessionPatchHookEvent]:
+    """Check if event is a session:patch event."""
+    return event.type == "session" and event.action == "patch"
+
+
+# ---------------------------------------------------------------------------
+# Enable / disable control — matches TS setInternalHooksEnabled / hasInternalHookListeners
+# ---------------------------------------------------------------------------
+
+_hooks_enabled: bool = True
+
+
+def set_internal_hooks_enabled(enabled: bool) -> None:
+    """Enable or disable internal hook dispatch globally.
+
+    When disabled, :func:`trigger_internal_hook` is a no-op.
+    Matches TS ``setInternalHooksEnabled()``.
+    """
+    global _hooks_enabled
+    _hooks_enabled = enabled
+
+
+def has_internal_hook_listeners(event_key: str) -> bool:
+    """Return True if there is at least one handler registered for *event_key*.
+
+    *event_key* may be a bare event type (``"command"``) or a
+    ``"type:action"`` pair (``"command:new"``).
+    Matches TS ``hasInternalHookListeners()``.
+    """
+    return bool(_handlers.get(event_key))

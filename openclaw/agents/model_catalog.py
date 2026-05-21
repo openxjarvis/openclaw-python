@@ -11,6 +11,19 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Standardised set of API type strings — mirrors TS types.models.ts MODEL_APIS
+MODEL_APIS: list[str] = [
+    "openai-completions",
+    "openai-responses",
+    "openai-codex-responses",
+    "anthropic-messages",
+    "google-generative-ai",
+    "github-copilot",
+    "bedrock-converse-stream",
+    "ollama",
+    "azure-openai-responses",
+]
+
 _CODEX_PROVIDER = "openai-codex"
 _OPENAI_CODEX_GPT53_MODEL_ID = "gpt-5.3-codex"
 _OPENAI_CODEX_GPT53_SPARK_MODEL_ID = "gpt-5.3-codex-spark"

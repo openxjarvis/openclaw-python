@@ -38,7 +38,7 @@ async def run_isolated_cron_job(
         Execution result
     """
     from ..cron.isolated_agent.delivery import deliver_result
-    from ..cron.isolated_agent.run import run_isolated_agent_turn
+    from ..cron.isolated_agent.run import run_cron_isolated_agent_turn as run_isolated_agent_turn
     
     # Get sessions directory
     sessions_dir = session_manager.sessions_dir if hasattr(session_manager, "sessions_dir") else resolve_state_dir() / "sessions"

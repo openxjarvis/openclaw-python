@@ -82,28 +82,22 @@ _DEFAULT_WORKSPACE_ROOT = str(resolve_state_dir() / "sandboxes")
 def resolve_sandbox_scope_key(scope: str, session_key: str) -> str:
     """Map *scope* + *session_key* to a stable directory-safe key.
 
-    - ``"session"`` → ``session_key`` (truncated/sanitised)
-    - ``"agent"`` → first segment of session key (agent id part)
-    - ``"shared"`` → ``"shared"``
-
-    Mirrors TS ``resolveSandboxScopeKey()``.
+    Delegates to the canonical implementation in session_workspace.py which
+    correctly mirrors TS resolveSandboxScopeKey() — including using
+    resolveAgentIdFromSessionKey for scope="agent".
     """
-    if scope == "shared":
-        return "shared"
-    if scope == "agent":
-        agent_id = session_key.split(":")[0] or "main"
-        return f"agent:{agent_id}"
-    # scope == "session" (default)
-    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in session_key)
-    return safe[:64] or "default"
+    from openclaw.agents.session_workspace import resolve_sandbox_scope_key as _canonical
+    return _canonical(scope, session_key)
 
 
 def resolve_sandbox_workspace_dir(workspace_root: str, scope_key: str) -> str:
     """Build the per-scope workspace directory path.
 
+    Delegates to the canonical slugify-based implementation in session_workspace.py.
     Mirrors TS ``resolveSandboxWorkspaceDir()``.
     """
-    return str(Path(workspace_root) / scope_key)
+    from openclaw.agents.session_workspace import resolve_session_workspace_dir
+    return str(resolve_session_workspace_dir(workspace_root, scope_key))
 
 
 # ---------------------------------------------------------------------------

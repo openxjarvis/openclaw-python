@@ -57,8 +57,12 @@ class SessionResetConfig(BaseModel):
 
 
 class SessionEntry(BaseModel):
-    """Session metadata entry"""
+    """Session metadata entry — mirrors TS SessionEntry (40+ fields).
 
+    All new fields have default values for full backward compatibility.
+    """
+
+    # ── Core identity ──────────────────────────────────────────────────────
     session_id: str
     session_key: str | None = None
     model: str | None = None
@@ -66,9 +70,49 @@ class SessionEntry(BaseModel):
     token_count: dict[str, int] = Field(default_factory=lambda: {"input": 0, "output": 0})
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     last_active_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
-    last_reset_at: str | None = None  # Track last reset time
+    last_reset_at: str | None = None
     message_count: int = 0
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # ── Agent Harness pin (mirrors TS agentHarnessId) ─────────────────────
+    # Once a session starts running, the chosen harness id is recorded here.
+    # Subsequent runs use the same harness (avoids mid-session switching).
+    agent_harness_id: str | None = None
+
+    # ── Sub-agent relationship ─────────────────────────────────────────────
+    spawned_by: str | None = None           # parent session_key that spawned this
+    parent_session_key: str | None = None   # alias for spawned_by (TS compat)
+    spawn_depth: int = 0                    # nesting depth (0 = top-level)
+    subagent_role: str | None = None        # role label (e.g. "coder", "searcher")
+    subagent_control_scope: str | None = None  # ACP scope string
+
+    # ── Runtime state ──────────────────────────────────────────────────────
+    model_provider: str | None = None       # resolved provider id
+    live_model_switch_pending: bool = False # model switch queued for next run
+    compaction_count: int = 0              # number of times session was compacted
+    total_tokens_fresh: bool = False       # token count is authoritative
+    aborted_last_run: bool = False         # last run was aborted by user
+    abort_cutoff_at: int | None = None     # epoch-ms when abort was applied
+
+    # ── Channel / delivery ─────────────────────────────────────────────────
+    last_channel: str | None = None        # last channel id that sent a message
+    queue_mode: str | None = None          # "fifo" | "replace" | None
+    queue_cap: int | None = None           # max queued messages
+    delivery_context: dict | None = None   # channel-specific delivery metadata
+
+    # ── TTS session state ──────────────────────────────────────────────────
+    tts_auto: bool = False                 # auto-read replies via TTS
+    last_tts_read_latest_hash: str | None = None  # hash of last TTS-read message
+
+    # ── ACP (Agent Control Plane) ──────────────────────────────────────────
+    acp: dict | None = None                # ACP state blob
+
+    # ── Skills / prompt engineering ────────────────────────────────────────
+    skills_snapshot: dict | None = None        # resolved skills at session creation
+    system_prompt_report: dict | None = None   # system prompt composition report
+
+    # ── Plugin debug ───────────────────────────────────────────────────────
+    plugin_debug_entries: list | None = None   # per-run plugin debug log entries
 
 
 class TranscriptMessage(BaseModel):

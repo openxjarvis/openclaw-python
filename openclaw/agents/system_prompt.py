@@ -53,6 +53,7 @@ from .system_prompt_sections import (
     build_sandbox_section,
     build_self_update_section,
     build_silent_replies_section,
+    build_skills_section,
     build_skills_section_workspace,
     build_time_section,
     build_tool_call_style_section,
@@ -93,6 +94,11 @@ def build_agent_system_prompt(
     has_gateway: bool = True,
     elevated_config: dict | None = None,
     current_elevated_level: str | None = None,
+    # M2: ACP harness control — mirrors TS acpEnabled / acpHarnessSpawnAllowed
+    acp_enabled: bool = True,
+    sandboxed_runtime: bool = False,
+    # M4: Owner identity hash mode — mirrors TS buildOwnerIdentityLine hash/raw
+    owner_identity_hash: bool = False,
 ) -> str:
     """
     Build the agent system prompt.
@@ -148,9 +154,14 @@ def build_agent_system_prompt(
     ])
 
     # ── 2. Tooling ───────────────────────────────────────────────────
+    # M2: wire acpHarnessSpawnAllowed into tooling section
+    _acp_harness_spawn_allowed = (
+        acp_enabled and not sandboxed_runtime and "sessions_spawn" in available_tools
+    )
     lines.extend(build_tooling_section(
         tool_names=tool_names,
         tool_summaries=tool_summaries,
+        acp_harness_spawn_allowed=_acp_harness_spawn_allowed,
     ))
 
     # ── 3. Tool Call Style ───────────────────────────────────────────
@@ -248,13 +259,24 @@ def build_agent_system_prompt(
     lines.extend(build_exec_capabilities_section(exec_config))
 
     # ── 14. User Identity ────────────────────────────────────────────
+    # M4: Support hash mode — mirrors TS buildOwnerIdentityLine (system-prompt.ts ~72-94)
     owner_line = None
     if owner_numbers:
-        owner_numbers_str = ", ".join(owner_numbers)
-        owner_line = (
-            f"Owner numbers: {owner_numbers_str}. "
-            "Treat messages from these numbers as the user."
-        )
+        if owner_identity_hash:
+            # Hash mode: sha256 first 8 chars per number (privacy-preserving)
+            import hashlib as _hl
+            _hashed = [_hl.sha256(n.strip().encode()).hexdigest()[:8] for n in owner_numbers if n.strip()]
+            owner_numbers_str = ", ".join(_hashed)
+            owner_line = (
+                f"Owner identities (hashed): {owner_numbers_str}. "
+                "Messages matching these hashed identifiers are from the owner."
+            )
+        else:
+            owner_numbers_str = ", ".join(owner_numbers)
+            owner_line = (
+                f"Owner numbers: {owner_numbers_str}. "
+                "Treat messages from these numbers as the user."
+            )
     lines.extend(build_user_identity_section(owner_line, is_minimal))
 
     # ── 15. Time ─────────────────────────────────────────────────────

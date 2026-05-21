@@ -74,33 +74,24 @@ async def _assert_local_media_allowed(
     except Exception:
         resolved = media_path.absolute()
     
-    # Hardening: even if default allowlist includes workspace root,
-    # block per-agent workspace-* subdirectories unless explicitly allowed
+    # Hardening: block per-agent workspace-* subdirectories unless explicitly allowed
     # (prevents temp-dir-based agents from accessing other agents' workspaces)
     if local_roots is None:
-        state_dir = Path(resolve_state_dir())
-        
-        # Find workspace root in allowed roots
-        workspace_root = None
-        for root_str in roots:
-            root_path = Path(root_str)
-            if root_path.name == "workspace":
-                workspace_root = root_path
-                break
-        
-        if workspace_root:
-            try:
-                rel = resolved.relative_to(state_dir)
-                # Check if trying to access workspace-* subdirectory
-                parts = rel.parts
-                if parts and parts[0].startswith("workspace-"):
-                    raise LocalMediaAccessError(
-                        "path-not-allowed",
-                        f"Local media path is not under an allowed directory: {media_path}"
-                    )
-            except ValueError:
-                # Path is not relative to state_dir, continue normal validation
-                pass
+        try:
+            state_dir = Path(resolve_state_dir()).resolve()
+            rel = resolved.relative_to(state_dir)
+            # Check if trying to access workspace-* subdirectory directly under state_dir
+            parts = rel.parts
+            if parts and parts[0].startswith("workspace-"):
+                raise LocalMediaAccessError(
+                    "path-not-allowed",
+                    f"Local media path is not under an allowed directory: {media_path}"
+                )
+        except LocalMediaAccessError:
+            raise
+        except Exception:
+            # Path is not relative to state_dir, continue normal validation
+            pass
     
     # Check if resolved path is under any allowed root
     for root_str in roots:

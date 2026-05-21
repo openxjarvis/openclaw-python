@@ -12,7 +12,12 @@ from openclaw.secrets.types import (
     SecretsAuditSeverity,
     SecretsAuditStatus,
 )
-from openclaw.secrets.resolver import resolve_secrets_for_command, resolve_secret_ref_value
+from openclaw.secrets.resolver import (
+    resolve_secrets_for_command,
+    resolve_secret_ref_value,
+    resolve_secrets_resolve,
+)
+from openclaw.secrets.target_registry import is_known_secret_target_id, list_known_secret_target_ids
 from openclaw.secrets.audit import run_secrets_audit, resolve_secrets_audit_exit_code
 
 __all__ = [
@@ -25,6 +30,9 @@ __all__ = [
     "SecretsAuditStatus",
     "resolve_secrets_for_command",
     "resolve_secret_ref_value",
+    "resolve_secrets_resolve",
+    "is_known_secret_target_id",
+    "list_known_secret_target_ids",
     "run_secrets_audit",
     "resolve_secrets_audit_exit_code",
 ]

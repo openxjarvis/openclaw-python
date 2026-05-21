@@ -865,7 +865,11 @@ async def spawn_subagent_direct(
         requester_origin=requester_origin,
         child_session_key=child_session_key,
         label=label or None,
-        acp_enabled=cfg.acp.enabled if hasattr(cfg, 'acp') and hasattr(cfg.acp, 'enabled') else False,
+        # M7: acp_enabled mirrors TS: cfg.acp?.enabled !== false && !childRuntime.sandboxed
+        acp_enabled=(
+            (cfg.acp.enabled if hasattr(cfg, 'acp') and hasattr(cfg.acp, 'enabled') else True)
+            and not child_runtime.get("sandboxed", False)
+        ),
     )
     
     # Append attachment hint to system prompt (mirrors TS lines 669-673)
@@ -895,21 +899,59 @@ async def spawn_subagent_direct(
     child_task_message = "\n\n".join(parts)
     
     # Thread binding for session mode (mirrors TS ensureThreadBindingForSubagentSpawn)
-    # TS: openclaw/src/agents/subagent-spawn.ts lines 416-425
+    # TS: openclaw/src/agents/subagent-spawn.ts lines 185-250, 459-489
+    # TS first tries plugin hook_runner.runSubagentSpawning; if no hooks, returns error.
+    # Python: try hook runner first, then fall back to session patch.
     if mode == "session" and params.thread and gateway is not None:
+        _thread_bind_ok = False
+        # C10: Try plugin-driven thread binding via hook runner
         try:
-            from openclaw.gateway.internal_call import patch_session_internal
-            
-            thread_id = ctx.agentThreadId or str(uuid.uuid4())
-            await patch_session_internal(
-                gateway=gateway,
-                key=child_session_key,
-                patch={"threadId": str(thread_id), "threadBound": True},
-                timeout_ms=10_000,
-            )
-            logger.debug("Thread binding set for session-mode subagent %s", child_session_key)
-        except Exception as exc:
-            logger.warning("Thread binding failed for %s: %s", child_session_key, exc)
+            _hook_runner = getattr(gateway, "_hook_runner", None)
+            if _hook_runner and _hook_runner.has_hooks("subagent_spawning"):
+                _bind_result = await _hook_runner.run_subagent_spawning(
+                    {
+                        "childSessionKey": child_session_key,
+                        "agentId": target_agent_id,
+                        "label": label or None,
+                        "mode": mode,
+                        "requester": {
+                            "channel": requester_origin.get("channel") if requester_origin else None,
+                            "accountId": requester_origin.get("accountId") if requester_origin else None,
+                            "to": requester_origin.get("to") if requester_origin else None,
+                            "threadId": requester_origin.get("threadId") if requester_origin else ctx.agentThreadId,
+                        },
+                        "threadRequested": True,
+                    },
+                    {
+                        "childSessionKey": child_session_key,
+                        "requesterSessionKey": ctx.agentSessionKey,
+                    },
+                )
+                if isinstance(_bind_result, dict) and _bind_result.get("status") == "ok":
+                    _thread_bind_ok = True
+                    logger.debug("Thread binding via hooks OK for %s", child_session_key)
+                elif isinstance(_bind_result, dict) and _bind_result.get("status") == "error":
+                    logger.warning(
+                        "Thread binding hook failed for %s: %s",
+                        child_session_key, _bind_result.get("error", "unknown error"),
+                    )
+        except Exception as _hook_exc:
+            logger.debug("Thread binding hook (non-fatal): %s", _hook_exc)
+
+        if not _thread_bind_ok:
+            # Fallback: direct session patch (less robust than hook-driven binding)
+            try:
+                from openclaw.gateway.internal_call import patch_session_internal
+                thread_id = ctx.agentThreadId or str(uuid.uuid4())
+                await patch_session_internal(
+                    gateway=gateway,
+                    key=child_session_key,
+                    patch={"threadId": str(thread_id), "threadBound": True},
+                    timeout_ms=10_000,
+                )
+                logger.debug("Thread binding (session patch fallback) for %s", child_session_key)
+            except Exception as exc:
+                logger.warning("Thread binding failed for %s: %s", child_session_key, exc)
 
     # In session mode, override cleanup to "keep" (session stays after completion)
     if mode == "session":
@@ -985,7 +1027,13 @@ async def spawn_subagent_direct(
                 _sb_cfg.get("scope", "session") if isinstance(_sb_cfg, dict)
                 else getattr(_sb_cfg, "scope", "session")
             ) if _sb_cfg else "session"
-            _scope_key = resolve_sandbox_scope_key(_scope, child_session_key)
+            # Subagents must share the REQUESTER session's workspace so they can access
+            # files created by the parent (e.g. PPT → QA subagent reading it).
+            # TS uses a single Docker volume for all sessions in one agent turn; Python
+            # achieves this by resolving the scope key from the parent's session key.
+            # This ensures scope=session subagents get the same sandbox as the parent.
+            _parent_session_key = (ctx.agentSessionKey or "").strip() or child_session_key
+            _scope_key = resolve_sandbox_scope_key(_scope, _parent_session_key)
             if _scope == "shared":
                 child_session_workspace = str(_sandbox_root)
             else:

@@ -577,7 +577,12 @@ class SessionsSpawnTool(AgentTool):
     runTimeoutSeconds, cleanup.
     """
 
-    def __init__(self, session_manager: SessionManager | None = None, gateway: Any = None):
+    def __init__(
+        self,
+        session_manager: SessionManager | None = None,
+        gateway: Any = None,
+        current_session_key: str | None = None,
+    ):
         super().__init__()
         self.name = "sessions_spawn"
         self.description = (
@@ -586,6 +591,7 @@ class SessionsSpawnTool(AgentTool):
         )
         self.session_manager = session_manager
         self.gateway = gateway
+        self.current_session_key = current_session_key
 
     def get_schema(self) -> dict[str, Any]:
         return {
@@ -734,10 +740,11 @@ class SessionsSpawnTool(AgentTool):
             )
             
             # Build spawn context (mirrors TS sessions-spawn-tool.ts lines 170-180)
-            # Get current session key from session_manager if available
-            current_session_key = None
-            if self.session_manager is not None and hasattr(self.session_manager, "current_session_key"):
-                current_session_key = self.session_manager.current_session_key
+            # Prefer explicit current_session_key stored at tool creation, then fall back
+            # to session_manager.current_session_key (set per-dispatch in channel_manager).
+            current_session_key = self.current_session_key
+            if not current_session_key and self.session_manager is not None:
+                current_session_key = getattr(self.session_manager, "current_session_key", None)
             
             spawn_ctx = SpawnSubagentContext(
                 agentSessionKey=current_session_key,

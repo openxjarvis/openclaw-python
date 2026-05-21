@@ -113,7 +113,8 @@ TOOL_ORDER: list[str] = [
 
 def build_tooling_section(
     tool_names: list[str] | None,
-    tool_summaries: dict[str, str] | None = None
+    tool_summaries: dict[str, str] | None = None,
+    acp_harness_spawn_allowed: bool = False,
 ) -> list[str]:
     """Build the Tooling section (matches TS lines 382-406)."""
     if not tool_names:
@@ -166,6 +167,22 @@ def build_tooling_section(
     lines.append(
         "Do not poll `subagents list` / `sessions_list` in a loop; only check status on-demand (for intervention, debugging, or when explicitly asked)."
     )
+
+    # M2: ACP harness guidance — mirrors TS acpHarnessSpawnAllowed block (system-prompt.ts ~449-456)
+    if acp_harness_spawn_allowed:
+        lines.append(
+            'For requests like "do this in codex/claude code/gemini", treat it as ACP harness intent'
+            ' and call `sessions_spawn` with `runtime: "acp"`.'
+        )
+        lines.append(
+            'On Discord, default ACP harness requests to thread-bound persistent sessions'
+            ' (`thread: true`, `mode: "session"`) unless the user asks otherwise.'
+        )
+        lines.append(
+            "Set `agentId` explicitly unless `acp.defaultAgent` is configured,"
+            " and do not route ACP harness requests through `subagents`/`agents_list` or local PTY exec flows."
+        )
+
     lines.append("")
 
     return lines

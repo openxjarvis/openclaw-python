@@ -38,6 +38,60 @@ from .truncate import (
 
 logger = logging.getLogger(__name__)
 
+# Mirrors TS processSchema / bash-tools.schemas.ts exec parameters
+EXEC_TOOL_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string", "description": "Shell command to execute"},
+        "workdir": {"type": "string", "description": "Working directory for the command"},
+        "env": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "Environment variables to set for this command",
+        },
+        "yieldMs": {
+            "type": "integer",
+            "description": "Milliseconds to wait before returning partial output (background mode)",
+        },
+        "background": {
+            "type": "boolean",
+            "description": "Run command in background and return early",
+        },
+        "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds",
+        },
+        "pty": {
+            "type": "boolean",
+            "description": "Allocate a pseudo-TTY for the command",
+        },
+        "elevated": {
+            "type": "boolean",
+            "description": "Request elevated execution when supported",
+        },
+        "host": {
+            "type": "string",
+            "enum": ["sandbox", "gateway", "node"],
+            "description": "Execution host",
+        },
+        "security": {
+            "type": "string",
+            "enum": ["deny", "allowlist", "full"],
+            "description": "Execution security mode override",
+        },
+        "ask": {
+            "type": "string",
+            "enum": ["off", "on-miss", "always"],
+            "description": "Approval ask mode override",
+        },
+        "node": {
+            "type": "string",
+            "description": "Node id when host is node",
+        },
+    },
+    "required": ["command"],
+}
+
 
 def create_bash_tool(
     cwd: str | None = None,
@@ -116,38 +170,24 @@ def create_bash_tool(
 
         @property
         def name(self) -> str:
-            return "bash"
+            return "exec"
 
         @property
         def label(self) -> str:
-            return "Bash"
-        
+            return "Exec"
+
         @property
         def description(self) -> str:
             return (
-                f"Execute a bash command in the current working directory. "
-                f"Returns stdout and stderr. Output is truncated to last "
-                f"{DEFAULT_MAX_LINES} lines or {DEFAULT_MAX_BYTES // 1024}KB "
-                f"(whichever is hit first). If truncated, full output is saved "
-                f"to a temp file. Optionally provide a timeout in seconds."
+                f"Execute a shell command. Returns stdout and stderr. Output is "
+                f"truncated to last {DEFAULT_MAX_LINES} lines or "
+                f"{DEFAULT_MAX_BYTES // 1024}KB. Supports workdir, env, background, "
+                f"pty, elevated, host (sandbox/gateway/node), security, and ask."
             )
-        
+
         @property
         def parameters(self) -> dict[str, Any]:
-            return {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Bash command to execute"
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Timeout in seconds (optional, no default timeout)"
-                    }
-                },
-                "required": ["command"]
-            }
+            return EXEC_TOOL_PARAMETERS
         
         async def execute(
             self,
@@ -160,6 +200,9 @@ def create_bash_tool(
 
             command = params["command"]
             timeout = params.get("timeout") or default_timeout
+            run_cwd = str(params["workdir"]) if params.get("workdir") else _cwd
+            run_security = str(params["security"]) if params.get("security") else _security
+            run_ask = str(params["ask"]) if params.get("ask") else _ask
 
             # Apply command prefix if configured
             resolved_command = f"{command_prefix}\n{command}" if command_prefix else command
@@ -168,16 +211,16 @@ def create_bash_tool(
             # Only engage when exec_security is explicitly configured.
             # None means pi-mono / unconfigured mode — no security gate.
 
-            if _security is not None:
+            if run_security is not None:
                 # Step 1: Hard deny — block all execution
-                if _security == "deny":
+                if run_security == "deny":
                     raise Exception(
                         "exec denied: security mode is 'deny'. "
                         "Set tools.exec.security to 'allowlist' or 'full' to enable execution."
                     )
 
             # Step 2: Obfuscation detection (always, regardless of security mode)
-            if _security in ("allowlist", "full"):
+            if run_security in ("allowlist", "full"):
                 try:
                     from openclaw.infra.exec_obfuscation_detect import detect_command_obfuscation
                     obfus = detect_command_obfuscation(resolved_command)
@@ -191,7 +234,7 @@ def create_bash_tool(
                     pass
 
             # Step 3: For allowlist mode, evaluate + approval flow
-            if _security is not None and _security == "allowlist":
+            if run_security is not None and run_security == "allowlist":
                 from openclaw.infra.exec_approvals_file import (
                     resolve_exec_approvals,
                     requires_exec_approval,
@@ -212,26 +255,26 @@ def create_bash_tool(
                     command=resolved_command,
                     allowlist=approvals_ctx["allowlist"],
                     safe_bins=safe_bins,
-                    cwd=_cwd,
+                    cwd=run_cwd,
                 )
 
                 # If analysis failed and we cannot ask, deny immediately
-                if not analysis.analysis_ok and _ask == "off":
+                if not analysis.analysis_ok and run_ask == "off":
                     raise Exception(
                         "exec denied: command analysis failed (shell line-continuation or "
                         "parse error) and ask=off."
                     )
 
                 # If allowlist not satisfied and ask=off, deny without prompting
-                if not analysis.allowlist_satisfied and _ask == "off":
+                if not analysis.allowlist_satisfied and run_ask == "off":
                     raise Exception(
                         "exec denied: command not in allowlist and ask=off. "
                         "Add the command to exec-approvals.json or set ask=on-miss."
                     )
 
                 needs_approval = requires_exec_approval(
-                    ask=_ask,
-                    security=_security,
+                    ask=run_ask,
+                    security=run_security,
                     analysis_ok=analysis.analysis_ok,
                     allowlist_satisfied=analysis.allowlist_satisfied,
                 )
@@ -240,10 +283,10 @@ def create_bash_tool(
                     # Build request payload for socket approval
                     request_payload = {
                         "command": resolved_command,
-                        "cwd": _cwd,
+                        "cwd": run_cwd,
                         "host": exec_host or "gateway",
-                        "security": _security,
-                        "ask": _ask,
+                        "security": run_security,
+                        "ask": run_ask,
                         "agentId": _agent_id,
                     }
                     socket_path = approvals_ctx.get("socketPath", "")
@@ -273,7 +316,7 @@ def create_bash_tool(
                         # Persist resolved patterns to exec-approvals.json
                         file = approvals_ctx["file"]
                         for pattern in resolve_allow_always_patterns(
-                            analysis.segments, cwd=_cwd
+                            analysis.segments, cwd=run_cwd
                         ):
                             add_allowlist_entry(file, _agent_id, pattern)
                     # "allow-once" → just run without persisting
@@ -353,7 +396,7 @@ def create_bash_tool(
             try:
                 result = await ops.exec(
                     command=resolved_command,
-                    cwd=cwd,
+                    cwd=run_cwd,
                     on_data=handle_data,
                     signal=signal,
                     timeout=timeout,
@@ -448,5 +491,6 @@ def create_bash_tool(
 #   from openclaw.agents.tools.bash import BashTool
 #   tool = BashTool()  or  tool = create_bash_tool(cwd)
 BashTool = create_bash_tool
+create_exec_tool = create_bash_tool
 
-__all__ = ["create_bash_tool", "BashTool"]
+__all__ = ["create_bash_tool", "create_exec_tool", "BashTool", "EXEC_TOOL_PARAMETERS"]

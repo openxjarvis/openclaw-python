@@ -341,7 +341,33 @@ class SimpleMemorySearchManager:
             all_results = self._substring_search(query, min_score, include_sessions)
 
         all_results.sort(key=lambda r: r.score, reverse=True)
-        return all_results[:max_results]
+        top_results = all_results[:max_results]
+
+        # Emit recall event — mirrors TS appendMemoryHostEvent("memory.recall.recorded")
+        try:
+            from .events import (
+                MemoryRecallRecordedEvent,
+                MemoryRecallResultEntry,
+                append_memory_host_event,
+            )
+            evt = MemoryRecallRecordedEvent(
+                query=query,
+                result_count=len(top_results),
+                results=[
+                    MemoryRecallResultEntry(
+                        path=r.path,
+                        start_line=r.start_line,
+                        end_line=r.end_line,
+                        score=r.score,
+                    )
+                    for r in top_results
+                ],
+            )
+            append_memory_host_event(str(self.workspace_dir), evt)
+        except Exception as _evt_exc:
+            logger.debug("Failed to emit recall event: %s", _evt_exc)
+
+        return top_results
 
     def _substring_search(
         self,

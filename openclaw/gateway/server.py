@@ -55,6 +55,7 @@ from openclaw.gateway.device_auth import (
 )
 from openclaw.gateway.error_codes import (
     ErrorCode,
+    GatewayError,
     InvalidRequestError,
     NotLinkedError,
     UnavailableError,
@@ -101,6 +102,10 @@ class GatewayConnection:
         self.conn_id: str = str(uuid.uuid4())
         # Set to the node_id when this connection is a node (role="node")
         self.node_id: str | None = None
+        # Canvas host session state (mirrors TS GatewayWsClient canvas fields)
+        self.canvas_host_url: str | None = None
+        self.canvas_capability: str | None = None
+        self.canvas_capability_expires_at_ms: int | None = None
 
     async def send_response(
         self, request_id: str | int, payload: Any = None, error: ErrorShape | None = None
@@ -219,6 +224,15 @@ class GatewayConnection:
             result = await handler(self, params_dict)
             await self.send_response(request.id, payload=result)
 
+        except GatewayError as e:
+            await self.send_response(
+                request.id,
+                error=ErrorShape(
+                    code=e.error_code.value,
+                    message=str(e),
+                    details=e.details or None,
+                ),
+            )
         except Exception as e:
             logger.error(f"Error handling request {request.method}: {e}", exc_info=True)
             await self.send_response(
@@ -407,10 +421,47 @@ class GatewayConnection:
                     },
                     send_event=self.send_event,
                 )
+                try:
+                    from openclaw.infra.skills_remote import record_remote_node_info
+                    record_remote_node_info(
+                        node_id=node_id,
+                        display_name=display_name if isinstance(display_name, str) else None,
+                        platform=platform if isinstance(platform, str) else None,
+                        commands=[str(c) for c in commands],
+                        remote_ip=self.remote_addr.split(":")[0] if self.remote_addr else None,
+                    )
+                except Exception:
+                    pass
                 logger.info(
                     f"Node registered: id={node_id!r} device={device_id!r} "
                     f"caps={capabilities} conn={self.conn_id!r}"
                 )
+
+            # Resolve canvas host URL for node sessions (mirrors TS hello-ok canvasHostUrl)
+            canvas_port = getattr(self.gateway, "canvas_host_port", None) if self.gateway else None
+            if canvas_port:
+                from openclaw.gateway.canvas_capability import (
+                    CANVAS_CAPABILITY_TTL_MS,
+                    build_canvas_scoped_host_url,
+                    mint_canvas_capability_token,
+                )
+                from openclaw.gateway.canvas_host_url import resolve_canvas_host_url
+                from openclaw.gateway.net import get_local_ip
+
+                host_header = self.headers.get("host")
+                forwarded_proto = self.headers.get("x-forwarded-proto")
+                base_canvas_host_url = resolve_canvas_host_url(
+                    canvas_port=canvas_port,
+                    request_host=host_header,
+                    forwarded_proto=forwarded_proto,
+                    local_address=get_local_ip(),
+                )
+                if base_canvas_host_url:
+                    self.canvas_host_url = base_canvas_host_url
+                    if role == "node":
+                        capability = mint_canvas_capability_token()
+                        self.canvas_capability = capability
+                        self.canvas_capability_expires_at_ms = int(time.time() * 1000) + CANVAS_CAPABILITY_TTL_MS
 
             # Send hello response
             hello = HelloResponse(
@@ -522,6 +573,19 @@ class GatewayServer:
         self._agent_run_seq: dict[str, int] = {}  # Per-run seq tracking for gap detection
         self._tool_event_recipients: dict[str, set[str]] = {}  # Tool event connection tracking
         self._chat_accumulator: dict[str, str] = {}  # Accumulate chat text per runId
+
+        # ── Session subscription registries (mirrors TS server-chat.ts) ──────
+        from .session_event_registry import (
+            SessionEventSubscriberRegistry,
+            SessionMessageSubscriberRegistry,
+            ToolEventRecipientRegistry,
+        )
+        self._session_event_subscribers = SessionEventSubscriberRegistry()
+        self._session_message_subscribers = SessionMessageSubscriberRegistry()
+        self._tool_event_recipient_registry = ToolEventRecipientRegistry()
+
+        # Slow-consumer protection threshold (mirrors TS MAX_BUFFERED_BYTES)
+        self._max_buffered_bytes: int = 1024 * 1024  # 1 MB
         
         # Initialize memory manager (lazy initialization)
         self._memory_manager = None
@@ -557,6 +621,7 @@ class GatewayServer:
         # Wire subscription manager into registry for cleanup on disconnect
         self.node_registry.set_subscription_manager(self.node_subscription_manager)
         self.node_registry.set_event_handler(self.node_event_handler)
+        self.canvas_host_port: int | None = None
 
         # Register global handler instances so gateway handlers can access runtime
         from openclaw.gateway.handlers import set_global_instances
@@ -857,7 +922,20 @@ class GatewayServer:
             # Unregister node on disconnect
             if connection.node_id is not None:
                 self.node_registry.unregister_node(connection.node_id)
+                try:
+                    from openclaw.infra.skills_remote import remove_remote_node_info
+                    remove_remote_node_info(connection.node_id)
+                except Exception:
+                    pass
                 logger.info(f"Node unregistered on disconnect: id={connection.node_id!r}")
+            # Clean up session subscriptions (mirrors TS unsubscribeAllSessionEvents)
+            try:
+                conn_id = getattr(connection, "conn_id", None)
+                if conn_id:
+                    self._session_event_subscribers.remove(conn_id)
+                    self._session_message_subscribers.unsubscribe_all(conn_id)
+            except Exception:
+                pass
             logger.info(f"Connection closed: {remote_addr}")
             # Broadcast presence: peer left
             try:
@@ -871,10 +949,75 @@ class GatewayServer:
         
         return ws
 
+    # ── Broadcast scope guards (mirrors TS EVENT_SCOPE_GUARDS) ───────────────
+
+    # Events that require operator+read scope
+    _OPERATOR_EVENTS: frozenset[str] = frozenset({
+        "session.message", "sessions.changed", "session.tool",
+        "chat", "agent", "tool",
+    })
+
+    # Events allowed for node role (restricted set)
+    _NODE_ALLOWED_EVENTS: frozenset[str] = frozenset({
+        "voicewake.detected", "voicewake.routing", "ping", "pong",
+        "presence", "tick", "heartbeat",
+    })
+
+    def has_event_scope(self, connection: "GatewayConnection", event: str) -> bool:
+        """Return True if the connection is allowed to receive this event.
+
+        Mirrors TS EVENT_SCOPE_GUARDS.
+        - node role: only receives NODE_ALLOWED_EVENTS
+        - operator+read scope: gets all OPERATOR_EVENTS
+        - Others (unauthenticated): only generic events
+        """
+        role = getattr(connection.auth_context, "role", "operator")
+
+        if role == "node":
+            # Node connections only get voicewake + system events
+            base = event.split(".")[0]
+            return event in self._NODE_ALLOWED_EVENTS or base == "node"
+
+        if not connection.authenticated:
+            # Unauthenticated: only ping/pong/presence
+            return event in {"ping", "pong", "presence", "tick"}
+
+        # For operator role, check read scope for session events
+        if event in self._OPERATOR_EVENTS:
+            scopes = getattr(connection.auth_context, "scopes", set())
+            # If scopes is empty (legacy / full-access), allow all
+            if not scopes:
+                return True
+            return "read" in scopes or "operator" in scopes
+
+        return True
+
+    def _is_slow_consumer(self, connection: "GatewayConnection") -> bool:
+        """Detect slow consumers via buffered amount check."""
+        try:
+            ws = connection.websocket
+            # aiohttp does not expose bufferedAmount directly; check underlying transport
+            transport = getattr(ws, "_writer", None)
+            if transport and hasattr(transport, "_transport"):
+                buf = getattr(transport._transport, "get_write_buffer_size", lambda: 0)()
+                return buf > self._max_buffered_bytes
+        except Exception:
+            pass
+        return False
+
     async def broadcast_event(self, event: str, payload: Any = None) -> None:
-        """Broadcast event to all connected clients"""
+        """Broadcast event to all connected clients with scope filtering."""
         disconnected = set()
         for connection in self.connections:
+            if not self.has_event_scope(connection, event):
+                continue
+            if self._is_slow_consumer(connection):
+                logger.debug(
+                    "Dropping event '%s' for slow consumer conn=%s",
+                    event,
+                    connection.conn_id,
+                )
+                continue
             try:
                 await connection.send_event(event, payload)
             except Exception as e:
@@ -883,6 +1026,73 @@ class GatewayServer:
 
         # Clean up disconnected connections
         self.connections -= disconnected
+
+    async def broadcast_to_conn_ids(
+        self,
+        event: str,
+        payload: Any,
+        conn_ids: set[str],
+    ) -> None:
+        """Send an event to a specific set of connection IDs.
+
+        Mirrors TS broadcastToConnIds().
+        Still applies has_event_scope() and slow consumer checks.
+        """
+        if not conn_ids:
+            return
+        conn_map = {c.conn_id: c for c in self.connections if hasattr(c, "conn_id")}
+        disconnected = set()
+        for cid in conn_ids:
+            connection = conn_map.get(cid)
+            if connection is None:
+                continue
+            if not self.has_event_scope(connection, event):
+                continue
+            if self._is_slow_consumer(connection):
+                logger.debug(
+                    "Dropping targeted event '%s' for slow consumer conn=%s",
+                    event,
+                    cid,
+                )
+                continue
+            try:
+                await connection.send_event(event, payload)
+            except Exception:
+                logger.exception("Failed to send targeted event to conn=%s", cid)
+                disconnected.add(connection)
+        self.connections -= disconnected
+
+    async def emit_session_message(self, session_key: str, message: Any) -> None:
+        """Emit a session.message event to targeted subscribers.
+
+        Receivers = union(sessionEventSubscribers.getAll(), sessionMessageSubscribers.get(sessionKey))
+        Mirrors TS emitSessionMessage() in server-session-events.ts.
+        """
+        receivers = self._session_event_subscribers.get_all() | \
+                    self._session_message_subscribers.get(session_key)
+        payload = message if isinstance(message, dict) else (
+            message.to_dict() if hasattr(message, "to_dict") else {"data": str(message)}
+        )
+        await self.broadcast_to_conn_ids("session.message", payload, receivers)
+
+    async def emit_sessions_changed(
+        self,
+        reason: str,
+        session_key: str | None = None,
+        data: dict | None = None,
+    ) -> None:
+        """Emit a sessions.changed event to session event subscribers only.
+
+        Mirrors TS emitSessionsChanged() in server-chat.ts.
+        Note: only sessionEventSubscribers (not message-only subscribers).
+        """
+        receivers = self._session_event_subscribers.get_all()
+        payload = {
+            "reason": reason,
+            **({"sessionKey": session_key} if session_key else {}),
+            **(data or {}),
+        }
+        await self.broadcast_to_conn_ids("sessions.changed", payload, receivers)
     
     def get_memory_manager(self):
         """Get or create memory manager (lazy initialization).

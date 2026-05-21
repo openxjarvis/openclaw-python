@@ -30,6 +30,102 @@ XHIGH_MODEL_IDS = {
 }
 
 
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ThinkingProviderProfile:
+    """Per-provider thinking configuration.
+
+    Mirrors TS ProviderThinkingProfile in plugins/provider-thinking.ts.
+    """
+
+    binary: bool = False             # on/off only (e.g. zai)
+    xhigh_capable: bool = False      # supports xhigh level
+    available_levels: list[str] = field(default_factory=list)  # empty = use defaults
+    default_level: str = "off"       # default thinking level for new sessions
+
+
+# ── Built-in provider profiles ────────────────────────────────────────────────
+_BUILTIN_PROVIDER_PROFILES: dict[str, ThinkingProviderProfile] = {
+    "zai": ThinkingProviderProfile(binary=True, default_level="off"),
+    "moonshot": ThinkingProviderProfile(binary=False, default_level="off"),  # Kimi thinking OFF by default
+    "anthropic": ThinkingProviderProfile(binary=False, xhigh_capable=False, default_level="medium"),
+    "openai": ThinkingProviderProfile(binary=False, xhigh_capable=False, default_level="medium"),
+    "openai-codex": ThinkingProviderProfile(binary=False, xhigh_capable=True, default_level="medium"),
+    "github-copilot": ThinkingProviderProfile(binary=False, xhigh_capable=True, default_level="medium"),
+}
+
+# ── Plugin-registered profiles (populated by api.register_provider_thinking_profile) ──
+_PLUGIN_PROVIDER_PROFILES: dict[str, ThinkingProviderProfile] = {}
+
+_DEFAULT_PROFILE = ThinkingProviderProfile(binary=False, default_level="off")
+
+
+def register_provider_thinking_profile(provider: str, profile: ThinkingProviderProfile) -> None:
+    """Register a thinking profile for a provider from a plugin.
+
+    Mirrors TS registerProviderThinkingProfile().
+    Plugin profiles override built-in defaults.
+    """
+    _PLUGIN_PROVIDER_PROFILES[normalize_provider_id(provider)] = profile
+
+
+def resolve_thinking_profile(
+    provider: str | None,
+    model_id: str | None,
+) -> ThinkingProviderProfile:
+    """Resolve the thinking profile for a provider/model combination.
+
+    Priority: plugin-registered > built-in defaults > global default.
+    Mirrors TS resolveThinkingProfile().
+    """
+    normalized = normalize_provider_id(provider)
+    if normalized in _PLUGIN_PROVIDER_PROFILES:
+        return _PLUGIN_PROVIDER_PROFILES[normalized]
+    if normalized in _BUILTIN_PROVIDER_PROFILES:
+        base = _BUILTIN_PROVIDER_PROFILES[normalized]
+        # kimi-k2.6 can use thinking.keep="all" but still defaults to OFF
+        if normalized == "moonshot" and model_id and "k2.6" in model_id:
+            return ThinkingProviderProfile(binary=False, xhigh_capable=False, default_level="off")
+        return base
+    return _DEFAULT_PROFILE
+
+
+def resolve_supported_thinking_level(
+    requested: str | None,
+    profile: ThinkingProviderProfile,
+) -> str:
+    """Return the closest supported thinking level given a profile.
+
+    Mirrors TS resolveSupportedThinkingLevel().
+    """
+    if not requested:
+        return profile.default_level
+
+    if profile.binary:
+        # Binary providers: map everything to "on" or "off"
+        return "off" if requested == "off" else "on"
+
+    available = profile.available_levels or ["off", "minimal", "low", "medium", "high"]
+    if profile.xhigh_capable and "xhigh" not in available:
+        available = list(available) + ["xhigh"]
+
+    if requested in available:
+        return requested
+
+    # Fallback: nearest lower level
+    order = ["off", "minimal", "low", "medium", "high", "xhigh"]
+    try:
+        req_idx = order.index(requested)
+        for i in range(req_idx, -1, -1):
+            if order[i] in available:
+                return order[i]
+    except ValueError:
+        pass
+    return profile.default_level
+
+
 def normalize_provider_id(provider: str | None) -> str:
     """Normalize provider ID (matches TS normalizeProviderId lines 9-18)"""
     if not provider:
@@ -42,8 +138,14 @@ def normalize_provider_id(provider: str | None) -> str:
 
 
 def is_binary_thinking_provider(provider: str | None) -> bool:
-    """Check if provider uses binary thinking (on/off only)"""
-    return normalize_provider_id(provider) == "zai"
+    """Check if provider uses binary thinking (on/off only).
+
+    Checks plugin-registered profiles first, then built-in defaults.
+    Mirrors TS provider-thinking.ts isBinaryThinkingProvider().
+    """
+    normalized = normalize_provider_id(provider)
+    profile = resolve_thinking_profile(normalized, None)
+    return profile.binary
 
 
 def normalize_think_level(raw: str | None, default: ThinkLevel = "medium") -> ThinkLevel:
@@ -93,19 +195,23 @@ def normalize_think_level(raw: str | None, default: ThinkLevel = "medium") -> Th
 
 
 def supports_xhigh_thinking(provider: str | None, model: str | None) -> bool:
+    """Check if provider/model supports xhigh thinking.
+
+    Checks plugin-registered profiles first, then model-id based lookup.
+    Mirrors TS supportsXHighThinking from thinking.ts lines 77-87.
     """
-    Check if provider/model supports xhigh thinking.
-    
-    Mirrors TS supportsXHighThinking from thinking.ts lines 77-87
-    """
+    profile = resolve_thinking_profile(normalize_provider_id(provider), model)
+    if profile.xhigh_capable:
+        return True
+
     model_key = (model or "").strip().lower()
     if not model_key:
         return False
-    
+
     provider_key = (provider or "").strip().lower()
     if provider_key:
         return f"{provider_key}/{model_key}" in XHIGH_MODEL_SET
-    
+
     return model_key in XHIGH_MODEL_IDS
 
 

@@ -17,7 +17,7 @@ from .resolve_route import (
 )
 from .session_key import (
     DEFAULT_MAIN_KEY,
-    THREAD_SESSION_MARKERS,
+    THREAD_SESSION_MARKER,
     ParsedAgentSessionKey,
     SessionKeyShape,
     build_agent_main_session_key,
@@ -47,7 +47,7 @@ __all__ = [
     "DEFAULT_ACCOUNT_ID",
     "DEFAULT_AGENT_ID",
     "DEFAULT_MAIN_KEY",
-    "THREAD_SESSION_MARKERS",
+    "THREAD_SESSION_MARKER",
     "ParsedAgentSessionKey",
     "SessionKeyShape",
     "build_agent_main_session_key",

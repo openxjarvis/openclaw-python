@@ -13,7 +13,13 @@ from .server_browser import start_browser_control_server_if_enabled
 from .server_canvas import start_canvas_host_server
 from ..hooks.gmail_watcher import start_gmail_watcher
 from ..hooks.loader import load_internal_hooks
-from ..hooks.internal_hooks import clear_internal_hooks, create_internal_hook_event, trigger_internal_hook
+from ..hooks.internal_hooks import (
+    clear_internal_hooks,
+    create_internal_hook_event,
+    trigger_internal_hook,
+    GatewayStartupHookContext,
+    GatewayStartupHookEvent,
+)
 from ..plugins.services import start_plugin_services
 from ..infra.device_identity import load_or_create_device_identity
 from ..infra.outbound.delivery_queue import ensure_queue_dir
@@ -230,19 +236,19 @@ async def start_gateway_sidecars(params: dict) -> dict:
         # Small delay to let services fully initialize
         async def trigger_startup_hook():
             await asyncio.sleep(0.25)
-            hook_event = create_internal_hook_event(
-                "gateway",
-                "startup",
-                "gateway:startup",
-                {
-                    "cfg": cfg,
-                    "deps": deps,
-                    "workspaceDir": default_workspace_dir,
-                    "workspace_dir": default_workspace_dir,
-                }
+            ctx = GatewayStartupHookContext(
+                cfg=cfg,
+                deps=deps,
+                workspace_dir=default_workspace_dir,
+            )
+            hook_event = GatewayStartupHookEvent(
+                type="gateway",
+                action="startup",
+                session_key="gateway:startup",
+                context=ctx,
             )
             await trigger_internal_hook(hook_event)
-        
+
         # Create task to trigger hook in background
         asyncio.create_task(trigger_startup_hook())
     

@@ -33,10 +33,83 @@ class DeliveryContext(BaseModel):
     replyToMessageId: Optional[str] = None
 
 
+class SessionSkillEntry(BaseModel):
+    """Skill entry in session snapshot — mirrors TS skills[] item."""
+    name: str
+    primaryEnv: Optional[str] = None
+    requiredEnv: Optional[list[str]] = None
+
+
 class SessionSkillSnapshot(BaseModel):
-    """Snapshot of skills enabled for this session"""
-    enabled: dict[str, bool] = Field(default_factory=dict)
-    apiKeys: dict[str, str] = Field(default_factory=dict)
+    """Snapshot of skills enabled for this session — mirrors TS SessionSkillSnapshot."""
+    prompt: str = ""
+    skills: list[SessionSkillEntry] = Field(default_factory=list)
+    skillFilter: Optional[list[str]] = None
+    resolvedSkills: Optional[list[dict[str, Any]]] = None
+    version: Optional[int] = None
+    # Legacy Python shape (kept for backward compatibility when loading old stores)
+    enabled: Optional[dict[str, bool]] = None
+    apiKeys: Optional[dict[str, str]] = None
+
+
+class SessionAcpIdentity(BaseModel):
+    state: Literal["pending", "resolved"]
+    acpxRecordId: Optional[str] = None
+    acpxSessionId: Optional[str] = None
+    agentSessionId: Optional[str] = None
+    source: Literal["ensure", "status", "event"]
+    lastUpdatedAt: int
+
+
+class SessionAcpMeta(BaseModel):
+    """ACP session metadata — mirrors TS SessionAcpMeta."""
+    backend: str
+    agent: str
+    runtimeSessionName: str
+    identity: Optional[SessionAcpIdentity] = None
+    mode: Literal["persistent", "oneshot"]
+    runtimeOptions: Optional[dict[str, Any]] = None
+    cwd: Optional[str] = None
+    state: Literal["idle", "running", "error"]
+    lastActivityAt: int
+    lastError: Optional[str] = None
+
+
+class SessionCompactionTranscriptReference(BaseModel):
+    sessionId: str
+    sessionFile: Optional[str] = None
+    leafId: Optional[str] = None
+    entryId: Optional[str] = None
+
+
+class SessionCompactionCheckpoint(BaseModel):
+    """Compaction checkpoint DAG node — mirrors TS SessionCompactionCheckpoint."""
+    checkpointId: str
+    sessionKey: str
+    sessionId: str
+    createdAt: int
+    reason: Literal["manual", "auto-threshold", "overflow-retry", "timeout-retry"]
+    tokensBefore: Optional[int] = None
+    tokensAfter: Optional[int] = None
+    summary: Optional[str] = None
+    firstKeptEntryId: Optional[str] = None
+    preCompaction: SessionCompactionTranscriptReference
+    postCompaction: SessionCompactionTranscriptReference
+
+
+class CliSessionBinding(BaseModel):
+    sessionId: str
+    authProfileId: Optional[str] = None
+    authEpoch: Optional[str] = None
+    authEpochVersion: Optional[int] = None
+    extraSystemPromptHash: Optional[str] = None
+    mcpConfigHash: Optional[str] = None
+    mcpResumeHash: Optional[str] = None
+
+
+class SessionPluginDebugEntry(BaseModel):
+    pluginId: str
+    lines: list[str] = Field(default_factory=list)
 
 
 class SessionSystemPromptReportWorkspaceFile(BaseModel):
@@ -100,6 +173,57 @@ class SessionEntry(BaseModel):
     
     # Parent relationship
     spawnedBy: Optional[str] = Field(None, description="Parent session key that spawned this session")
+    spawnedWorkspaceDir: Optional[str] = None
+    parentSessionKey: Optional[str] = None
+    forkedFromParent: Optional[bool] = None
+
+    # Subagent lifecycle (persisted after completion)
+    startedAt: Optional[int] = None
+    endedAt: Optional[int] = None
+    runtimeMs: Optional[int] = None
+    status: Optional[Literal["running", "done", "failed", "killed", "timeout"]] = None
+    subagentRole: Optional[Literal["orchestrator", "leaf"]] = None
+    subagentControlScope: Optional[Literal["children", "none"]] = None
+
+    # Abort cutoff (/stop boundary)
+    abortCutoffMessageSid: Optional[str] = None
+    abortCutoffTimestamp: Optional[int] = None
+
+    # Session timing
+    sessionStartedAt: Optional[int] = None
+    lastInteractionAt: Optional[int] = None
+
+    # Cost / cache tracking
+    estimatedCostUsd: Optional[float] = None
+    cacheRead: Optional[int] = None
+    cacheWrite: Optional[int] = None
+
+    # Model flags
+    fastMode: Optional[bool] = None
+    traceLevel: Optional[str] = None
+    liveModelSwitchPending: Optional[bool] = None
+    agentRuntimeOverride: Optional[str] = None
+    modelOverrideSource: Optional[Literal["auto", "user"]] = None
+    agentHarnessId: Optional[str] = None
+
+    # TTS read-latest state
+    lastTtsReadLatestHash: Optional[str] = None
+    lastTtsReadLatestAt: Optional[int] = None
+
+    # Heartbeat isolation
+    heartbeatIsolatedBaseSessionKey: Optional[str] = None
+    heartbeatTaskState: Optional[dict[str, int]] = None
+
+    # Compaction checkpoints (full DAG)
+    compactionCheckpoints: Optional[list[SessionCompactionCheckpoint]] = None
+    memoryFlushContextHash: Optional[str] = None
+
+    # CLI bindings
+    cliSessionBindings: Optional[dict[str, CliSessionBinding]] = None
+
+    # Plugin debug + ACP
+    pluginDebugEntries: Optional[list[SessionPluginDebugEntry]] = None
+    acp: Optional[SessionAcpMeta] = None
     
     # Token statistics
     inputTokens: Optional[int] = Field(None, description="Total input tokens used")

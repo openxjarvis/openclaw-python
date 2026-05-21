@@ -88,8 +88,39 @@ def format_abort_reply_text(stopped_subagents: int = 0) -> str:
     return f"Agent was aborted. Stopped {stopped_subagents} {label}."
 
 
+def _stop_subagents_for_requester(session_key: str, *, _depth: int = 0) -> int:
+    """Recursively abort all subagents spawned by session_key.
+
+    Mirrors TS stopSubagentsForRequester() from auto-reply/reply/abort.ts.
+    Returns count of sub-sessions stopped.
+    """
+    if _depth > 10:
+        return 0  # guard against infinite recursion
+    stopped = 0
+    try:
+        from openclaw.agents.subagent_registry import get_global_registry
+        registry = get_global_registry()
+        child_keys = registry.get_children(session_key) if hasattr(registry, "get_children") else []
+        for child_key in list(child_keys):
+            # Abort each child
+            try:
+                from openclaw.gateway.chat_abort import abort_chat_runs_for_session_key
+                abort_chat_runs_for_session_key(None, child_key, "parent_aborted")
+            except Exception:
+                pass
+            # Recurse into grandchildren
+            stopped += 1 + _stop_subagents_for_requester(child_key, _depth=_depth + 1)
+    except Exception:
+        pass
+    return stopped
+
+
 def try_fast_abort(ctx: Any) -> dict[str, Any]:
-    """Fast abort detection. Returns {handled, aborted}."""
+    """Fast abort detection with recursive subagent cascade.
+
+    Mirrors TS tryFastAbort() from auto-reply/reply/abort.ts.
+    Returns {handled, aborted, stopped_subagents}.
+    """
     body = (
         getattr(ctx, "CommandBody", None)
         or getattr(ctx, "RawBody", None)
@@ -99,21 +130,41 @@ def try_fast_abort(ctx: Any) -> dict[str, Any]:
     if not is_abort_request_text(body.strip()):
         return {"handled": False, "aborted": False}
     session_key = getattr(ctx, "SessionKey", None)
+    stopped = 0
     if session_key:
         # Set abort cutoff to skip stale messages
         from openclaw.auto_reply.reply.abort_cutoff import set_abort_cutoff
         cutoff_timestamp = time.time()
         message_id = getattr(ctx, "MessageId", None) or str(int(cutoff_timestamp * 1000))
         set_abort_cutoff(session_key, cutoff_timestamp, message_id)
-        
+
         # Try to abort via the gateway's embedded pi runner
         try:
             from openclaw.gateway.chat_abort import abort_chat_runs_for_session_key
             abort_chat_runs_for_session_key(None, session_key, "user_stop")
         except Exception:
             pass
+
+        # Recursive: stop all subagents (mirrors TS stopSubagentsForRequester)
+        stopped = _stop_subagents_for_requester(session_key)
+
+        # Mark session entry as aborted
+        try:
+            from openclaw.agents.session_store import get_session_store
+            store = get_session_store()
+            if store and hasattr(store, "patch_session"):
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(store.patch_session(session_key, {
+                        "aborted_last_run": True,
+                        "abort_cutoff_at": int(cutoff_timestamp * 1000),
+                    }))
+        except Exception:
+            pass
+
         set_abort_memory(session_key, True)
-    return {"handled": True, "aborted": True, "stopped_subagents": 0}
+    return {"handled": True, "aborted": True, "stopped_subagents": stopped}
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +454,18 @@ async def _run_with_agent_session(
         system_prompt=system_prompt,
     )
 
+    # C1: Wire think_level into AgentSession — mirrors TS passing thinkLevel into embedded Pi run.
+    # Try the canonical setter; fall back to setting it on the underlying pi_session.
+    if think_level:
+        try:
+            if hasattr(agent_session, "set_thinking_level"):
+                agent_session.set_thinking_level(think_level)
+            elif hasattr(agent_session, "_pi_session") and agent_session._pi_session is not None:
+                if hasattr(agent_session._pi_session, "set_thinking_level"):
+                    agent_session._pi_session.set_thinking_level(think_level)
+        except Exception as _tl_err:
+            logger.debug("Could not apply think_level=%s: %s", think_level, _tl_err)
+
     accumulated_text = ""
     events: list[Any] = []
 
@@ -499,6 +562,11 @@ async def _run_with_gateway_runtime(
                 accumulated_text += delta
                 if on_block_reply:
                     await on_block_reply(ReplyPayload(text=delta))
+        # M1: Add tool_result branch (was missing on gateway path — matched pi_mono path)
+        elif ev_type in ("tool_result", "agent.tool_result"):
+            result_text = _get_event_text(event)
+            if result_text and on_tool_result:
+                await on_tool_result(ReplyPayload(text=result_text))
 
     if accumulated_text:
         return ReplyPayload(text=accumulated_text)
@@ -1600,18 +1668,51 @@ async def get_reply_from_config(
             effective_body_with_context, _untrusted_parts
         )
 
+    # C2: Apply remaining directives (reasoning, verbose, elevated, exec) —
+    # mirrors TS resolveReplyDirectives application.
+
+    # reasoning_level → think_level fallback mapping (if think not explicitly set)
+    _effective_think = directives.think_level
+    if not _effective_think and directives.reasoning_level:
+        _rl_map = {"on": "medium", "stream": "high", "off": "off"}
+        _effective_think = _rl_map.get(directives.reasoning_level)
+
+    # elevated_level: append a note to the inbound meta prompt so the agent is aware
+    _extra_sp = extra_system_prompt
+    if directives.elevated_level and directives.elevated_level != "off":
+        _elevated_note = (
+            f"\n\n## Elevated Mode\nThis session is running in elevated mode: {directives.elevated_level}. "
+            "You may access admin capabilities if available."
+        )
+        _extra_sp = f"{_extra_sp}{_elevated_note}" if _extra_sp else _elevated_note.strip()
+
+    # exec_options: surface exec directives as context in the meta prompt
+    if directives.exec_options:
+        _exec_raw = directives.exec_options.get("raw", "")
+        if _exec_raw:
+            _exec_note = f"\n\n## Exec Directive\nExec options: {_exec_raw}"
+            _extra_sp = f"{_extra_sp}{_exec_note}" if _extra_sp else _exec_note.strip()
+
+    # verbose_level: record in session metadata (non-fatal)
+    if directives.verbose_level and _session_entry_for_model is not None:
+        try:
+            from openclaw.config.sessions.store_utils import patch_session_internal as _psi_v
+            _psi_v(session_key, {"verboseLevel": directives.verbose_level})
+        except Exception:
+            pass
+
     final = await run_agent_turn(
         message=effective_body_with_context,
         session_key=session_key,
         cfg=cfg,
         runtime=runtime,
-        think_level=directives.think_level,
+        think_level=_effective_think,
         model_override=directives.model_override,
         images=images if images else None,
         on_block_reply=on_block_reply,
         on_tool_result=on_tool_result,
         ctx=ctx,
-        inbound_meta_prompt=extra_system_prompt,
+        inbound_meta_prompt=_extra_sp,
     )
 
     if directives.reply_to_id and final:

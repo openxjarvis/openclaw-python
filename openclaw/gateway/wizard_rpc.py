@@ -15,6 +15,49 @@ from ..wizard.session import WizardSession, WizardCancelledError
 
 logger = logging.getLogger(__name__)
 
+_GATEWAY_MODES = frozenset({"local", "remote"})
+_FLOW_VALUES = frozenset({"quickstart", "advanced", "manual"})
+
+
+def resolve_wizard_start_params(params: dict) -> dict[str, Any]:
+    """Resolve wizard.start RPC params — mirrors TS WizardStartParamsSchema.
+
+    TS ``mode`` is gateway placement (``local`` | ``remote``) only.
+    ``flow`` (quickstart | advanced) is a Python extension for setup depth;
+    ``manual`` normalizes to ``advanced``.
+    """
+    raw_mode = params.get("mode")
+    raw_flow = params.get("flow")
+    workspace = params.get("workspace")
+
+    gateway_mode: str | None = None
+    flow = "quickstart"
+
+    if isinstance(raw_mode, str) and raw_mode.strip():
+        m = raw_mode.strip().lower()
+        if m in _GATEWAY_MODES:
+            gateway_mode = m
+        elif m in _FLOW_VALUES:
+            # Legacy: clients sent setup flow in ``mode`` before ``flow`` existed.
+            flow = "advanced" if m == "manual" else m
+        else:
+            return {"error": f"invalid mode: {raw_mode}"}
+
+    if isinstance(raw_flow, str) and raw_flow.strip():
+        f = raw_flow.strip().lower()
+        if f not in _FLOW_VALUES:
+            return {"error": f"invalid flow: {raw_flow}"}
+        flow = "advanced" if f == "manual" else f
+
+    if gateway_mode == "remote" and flow == "quickstart":
+        flow = "advanced"
+
+    return {
+        "gateway_mode": gateway_mode,
+        "flow": flow,
+        "workspace": workspace,
+    }
+
 
 class WizardRPCHandler:
     """Handles wizard-related RPC methods.
@@ -42,16 +85,22 @@ class WizardRPCHandler:
         if running:
             return {"error": "wizard already running", "sessionId": running}
 
-        mode = params.get("mode", "quickstart")
-        workspace = params.get("workspace")
+        resolved = resolve_wizard_start_params(params)
+        if "error" in resolved:
+            return resolved
 
-        if mode not in ("quickstart", "advanced", "manual", "local", "remote"):
-            return {"error": f"invalid mode: {mode}"}
+        flow = resolved["flow"]
+        gateway_mode = resolved["gateway_mode"]
+        workspace = resolved["workspace"]
 
         async def _runner(prompter):
             from ..wizard.onboarding import run_onboarding_wizard
 
-            await run_onboarding_wizard(flow=mode, workspace_dir=workspace)
+            await run_onboarding_wizard(
+                flow=flow,
+                mode=gateway_mode,
+                workspace_dir=workspace,
+            )
 
         try:
             session_id = str(uuid.uuid4())

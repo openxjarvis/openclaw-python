@@ -705,15 +705,20 @@ class SessionManager:
         
         return True
     
-    def _get_session_store(self) -> SessionStore:
+    def _get_session_store(self, skip_cache: bool = False) -> SessionStore:
         """
         Get session store with caching.
-        
+
+        Args:
+            skip_cache: M8: When True, bypass TTL/mtime cache and always reload from disk,
+                matching TS initSessionState which always loads with skipCache=true to
+                prevent stale identity data in multi-gateway environments.
+
         Returns:
             SessionStore instance
         """
         # Check cache validity
-        if self._is_cache_valid():
+        if not skip_cache and self._is_cache_valid():
             return self._session_store
         
         # Reload from disk
@@ -881,8 +886,9 @@ class SessionManager:
         elif session_key is None and session_id is None:
             session_key = build_agent_main_session_key(self.agent_id)
         
-        # Look up or create session ID using SessionStore (with caching)
-        store = self._get_session_store()
+        # M8: Load store fresh per turn (mirrors TS initSessionState skipCache=true)
+        # Always reload from disk to avoid stale identity data in multi-gateway setups.
+        store = self._get_session_store(skip_cache=True)
         logger.info(f"get_or_create_session: session_key={session_key}, existing_keys={list(store.keys())}")
         
         entry = store.get(session_key) if session_key else None

@@ -139,7 +139,7 @@ def create_openclaw_coding_tools(
         ("read", enable_read, create_read_tool, {}),
         ("write", enable_write, create_write_tool, {}),
         ("edit", enable_edit, create_edit_tool, {}),
-        ("bash", enable_bash, create_bash_tool, {"denied_commands": denied_commands} if denied_commands else {}),
+        ("exec", enable_bash, create_bash_tool, {"denied_commands": denied_commands} if denied_commands else {}),
         ("grep", enable_grep, create_grep_tool, {}),
         ("find", enable_find, create_find_tool, {}),
         ("ls", enable_ls, create_ls_tool, {}),

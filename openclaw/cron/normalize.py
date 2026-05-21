@@ -215,6 +215,12 @@ def validate_schedule_timestamp(schedule: Any, now_ms: int | None = None) -> str
     Returns an error message string, or None if valid.
     """
     from .types import AtSchedule
+    if isinstance(schedule, dict):
+        kind = schedule.get("kind") or schedule.get("type")
+        if kind != "at":
+            return None
+        at_val = schedule.get("at") or schedule.get("timestamp") or ""
+        schedule = AtSchedule(at=str(at_val), type="at")
     if not isinstance(schedule, AtSchedule):
         return None
     if not schedule.at or not schedule.at.strip():

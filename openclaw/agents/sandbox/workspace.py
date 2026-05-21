@@ -57,6 +57,14 @@ async def ensure_sandbox_workspace(
                 src = seed / filename
                 if not src.exists():
                     continue
+                # M11: Lightweight boundary check — mirrors TS openBoundaryFile.
+                # Resolve symlinks and ensure the source is truly under the seed dir.
+                try:
+                    resolved_src = src.resolve()
+                    resolved_src.relative_to(seed)  # raises ValueError if outside seed
+                except (ValueError, OSError):
+                    logger.warning("Seed file %s resolves outside seed dir — skipping (symlink escape?)", filename)
+                    continue
                 try:
                     shutil.copy2(str(src), str(dest))
                     logger.debug("Seeded sandbox workspace file: %s", filename)
@@ -65,12 +73,14 @@ async def ensure_sandbox_workspace(
         else:
             logger.warning("Sandbox seed_from path does not exist or is not a directory: %s", seed)
 
-    if not skip_bootstrap:
-        try:
-            from openclaw.agents.ensure_workspace import ensure_agent_workspace  # type: ignore[import]
-            ensure_agent_workspace(
-                dir=str(workspace),
-                ensure_bootstrap_files=True,
-            )
-        except (ImportError, Exception) as exc:
-            logger.warning("ensure_agent_workspace skipped for sandbox workspace: %s", exc)
+    # M12: Always call ensure_agent_workspace — mirrors TS which always invokes
+    # ensureAgentWorkspace and only sets ensureBootstrapFiles=false when skip_bootstrap.
+    # Python previously skipped the call entirely; now we always run mkdir/state setup.
+    try:
+        from openclaw.agents.ensure_workspace import ensure_agent_workspace  # type: ignore[import]
+        ensure_agent_workspace(
+            workspace_dir=str(workspace),
+            ensure_bootstrap_files=not skip_bootstrap,
+        )
+    except (ImportError, Exception) as exc:
+        logger.warning("ensure_agent_workspace skipped for sandbox workspace: %s", exc)

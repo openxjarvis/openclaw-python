@@ -78,7 +78,13 @@ class ImageTool(AgentTool):
         return {
             "type": "object",
             "properties": {
-                "image": {"type": "string", "description": "Image file path, URL, or data URL"},
+                "image": {"type": "string", "description": "Image file path, URL, or data URL (single image)"},
+                "images": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Multiple image paths, URLs, or data URLs",
+                    "maxItems": 20,
+                },
                 "prompt": {
                     "type": "string",
                     "description": "Question or instruction about the image",
@@ -87,6 +93,15 @@ class ImageTool(AgentTool):
                     "type": "string",
                     "description": "Model to use (claude-3-5-sonnet, gpt-4-vision)",
                     "default": "claude-3-5-sonnet",
+                },
+                "maxImages": {
+                    "type": "number",
+                    "description": "Maximum number of images to process",
+                    "default": 20,
+                },
+                "maxBytesMb": {
+                    "type": "number",
+                    "description": "Maximum file size per image in megabytes",
                 },
             },
             "required": ["image", "prompt"],

@@ -260,7 +260,7 @@ class GatewayBootstrap:
         except Exception as exc:
             logger.debug("update-check: skipped: %s", exc)
 
-        # Step 4: Start diagnostic heartbeat
+        # Step 4: Start diagnostic heartbeat + stability recorder
         logger.info("Step 4: Starting diagnostic heartbeat")
         try:
             # Use module-level import so tests can patch it
@@ -268,6 +268,8 @@ class GatewayBootstrap:
             _sdh = _bmod.start_diagnostic_heartbeat
             if _sdh:
                 _sdh()
+            from openclaw.diagnostics.stability import start_diagnostic_stability_recorder
+            start_diagnostic_stability_recorder()
         except Exception as e:
             logger.warning(f"Diagnostic heartbeat failed: {e}")
         results["steps_completed"] += 1
@@ -379,6 +381,15 @@ class GatewayBootstrap:
             from ..plugins.types import create_empty_plugin_registry
             self.plugin_registry = create_empty_plugin_registry()
         
+        # Initialize built-in agent harness registry (PI harness) — must happen
+        # after plugins are loaded so plugin harnesses can also register.
+        try:
+            from ..agents.harness import initialize_harness_registry
+            initialize_harness_registry()
+            logger.debug("Agent harness registry initialized")
+        except Exception as _harness_exc:
+            logger.warning("Harness registry initialization failed: %s", _harness_exc)
+
         # ✅ CRITICAL: Wire gateway reference OUTSIDE the plugin try-except
         # This ensures subagent announce/completion flows work even if plugin loading fails
         try:
@@ -1029,6 +1040,11 @@ class GatewayBootstrap:
             # Override the ChannelManager that GatewayServer created with our own
             # (since we already configured it in Step 13)
             self.server.channel_manager = self.channel_manager
+
+            sidecar_services = results.get("sidecar_services") or {}
+            canvas_host = sidecar_services.get("canvas_host") if isinstance(sidecar_services, dict) else None
+            if isinstance(canvas_host, dict) and canvas_host.get("port"):
+                self.server.canvas_host_port = int(canvas_host["port"])
             
             # Inject gateway reference into SessionsSpawnTool (required for subagent spawning)
             # SessionsSpawnTool needs the gateway object to make internal RPC calls, but it's
@@ -1551,6 +1567,8 @@ class GatewayBootstrap:
         try:
             from ..infra.diagnostic_events import stop_diagnostic_heartbeat
             stop_diagnostic_heartbeat()
+            from openclaw.diagnostics.stability import stop_diagnostic_stability_recorder
+            stop_diagnostic_stability_recorder()
         except Exception:
             pass
         

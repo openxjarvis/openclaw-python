@@ -330,17 +330,28 @@ def _resolve_implicit_providers(
                 ],
             }
 
-    # Moonshot (Kimi)
+    # Moonshot (Kimi) — TS CHANGELOG #68907, #68816, #68746
+    # URL: MOONSHOT_API_KEY → .cn endpoint; KIMI_API_KEY → .ai endpoint
+    # Default model updated to kimi-k2.6 (kimi-latest is deprecated)
     if not explicit_providers.get("moonshot"):
         moonshot_key = os.environ.get("MOONSHOT_API_KEY", "").strip()
-        if moonshot_key:
+        kimi_key = os.environ.get("KIMI_API_KEY", "").strip()
+        effective_key = moonshot_key or kimi_key
+        if effective_key:
+            # .ai endpoint for KIMI_API_KEY, .cn for MOONSHOT_API_KEY (legacy)
+            base_url = (
+                "https://api.moonshot.ai/v1" if (kimi_key and not moonshot_key)
+                else "https://api.moonshot.cn/v1"
+            )
             implicit["moonshot"] = {
-                "apiKey": moonshot_key,
-                "baseUrl": "https://api.moonshot.cn/v1",
+                "apiKey": effective_key,
+                "baseUrl": base_url,
+                "defaultModel": "kimi-k2.6",
                 "models": [
                     {"id": "moonshot-v1-8k", "name": "Moonshot 8K", "input": ["text"]},
                     {"id": "moonshot-v1-32k", "name": "Moonshot 32K", "input": ["text"]},
-                    {"id": "kimi-latest", "name": "Kimi Latest", "input": ["text"]},
+                    {"id": "kimi-k2.6", "name": "Kimi K2.6", "input": ["text"], "reasoning": True},
+                    {"id": "kimi-latest", "name": "Kimi Latest (deprecated)", "input": ["text"]},
                 ],
             }
 
@@ -361,6 +372,18 @@ def _resolve_implicit_providers(
             implicit["openrouter"] = {
                 "apiKey": openrouter_key,
                 "baseUrl": "https://openrouter.ai/api/v1",
+                "models": [],
+            }
+
+    # Azure OpenAI — api type "azure-openai-responses" (mirrors TS MODEL_APIS)
+    if not explicit_providers.get("azure-openai"):
+        azure_key = os.environ.get("AZURE_OPENAI_API_KEY", "").strip()
+        azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+        if azure_key and azure_endpoint:
+            implicit["azure-openai"] = {
+                "apiKey": azure_key,
+                "baseUrl": azure_endpoint,
+                "api": "azure-openai-responses",
                 "models": [],
             }
 

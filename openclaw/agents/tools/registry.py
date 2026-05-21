@@ -71,6 +71,8 @@ class ToolRegistry:
         coding_tools = create_coding_tools(cwd)
         for tool in coding_tools:
             self._tools[tool.name] = tool
+        if "exec" in self._tools:
+            self._tools["bash"] = self._tools["exec"]
 
         # Also register TS-compatible aliases (read_file, write_file, edit_file)
         from .file_ops import ReadFileTool, WriteFileTool, EditFileTool  # noqa: PLC0415
@@ -119,7 +121,8 @@ class ToolRegistry:
                 ),
                 SessionsSpawnTool(
                     self._session_manager,
-                    gateway=self._gateway
+                    gateway=self._gateway,
+                    current_session_key=current_session_key,
                 ),
                 SubagentsTool(
                     agent_session_key=current_session_key,
@@ -182,6 +185,39 @@ class ToolRegistry:
             _pdf_ws = _Path(self._workspace_dir) if self._workspace_dir else None
             pdf_tool = PdfAnalysisTool(workspace_dir=_pdf_ws)
             self._tools[pdf_tool.name] = pdf_tool
+        except Exception:
+            pass
+
+        # sessions_yield — subagent coordination
+        try:
+            from .sessions_yield import SessionsYieldTool
+            self._tools[SessionsYieldTool.name] = SessionsYieldTool()
+        except Exception:
+            pass
+
+        # update_plan — task tracking
+        try:
+            from .update_plan import UpdatePlanTool
+            self._tools[UpdatePlanTool.name] = UpdatePlanTool()
+        except Exception:
+            pass
+
+        # Media generation tools — registered only when a provider is configured
+        try:
+            from .image_generate import ImageGenerateTool
+            self._tools[ImageGenerateTool.name] = ImageGenerateTool()
+        except Exception:
+            pass
+
+        try:
+            from .music_generate import MusicGenerateTool
+            self._tools[MusicGenerateTool.name] = MusicGenerateTool()
+        except Exception:
+            pass
+
+        try:
+            from .video_generate import VideoGenerateTool
+            self._tools[VideoGenerateTool.name] = VideoGenerateTool()
         except Exception:
             pass
 
@@ -260,10 +296,30 @@ class ToolRegistry:
 
     def get_all_schemas(self) -> dict[str, dict]:
         """Return a dict of {tool_name: schema} for all registered tools."""
-        return {
-            name: (tool.get_schema() if hasattr(tool, 'get_schema') else getattr(tool, 'parameters', {}))
-            for name, tool in self._tools.items()
-        }
+        result = {}
+        for name, tool in self._tools.items():
+            schema = None
+            # Prefer explicit get_schema() method
+            if hasattr(tool, "get_schema") and callable(getattr(tool.__class__, "get_schema", None)):
+                try:
+                    schema = tool.get_schema()
+                except Exception:
+                    pass
+            # Fall back to @property or plain attribute named `schema`
+            if not schema:
+                raw = getattr(tool.__class__, "schema", None)
+                if isinstance(raw, property):
+                    try:
+                        schema = raw.fget(tool)
+                    except Exception:
+                        pass
+                elif raw is not None and isinstance(raw, dict):
+                    schema = raw
+            # Final fallback to `parameters` attribute
+            if not schema:
+                schema = getattr(tool, "parameters", {})
+            result[name] = schema or {}
+        return result
 
     def get_tools_by_profile(self, profile: str = "full") -> list[AgentTool]:
         """

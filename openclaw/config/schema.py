@@ -8,9 +8,12 @@ from typing import Any, Literal, Optional
 
 
 class ModelConfig(BaseModel):
-    """Model configuration"""
-    primary: str = Field(default="anthropic/claude-opus-4-5-20250514")
-    fallbacks: list[str] = Field(default_factory=list)
+    """Model configuration — mirrors TS AgentModelSchema object form"""
+    primary: str | None = Field(default=None)
+    fallbacks: list[str] | None = Field(default=None)
+    timeoutMs: int | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class AgentModelEntryConfig(BaseModel):
@@ -473,18 +476,36 @@ class ContextPruningConfig(BaseModel):
     minPrunableToolChars: int = Field(default=50000, ge=0)
 
 
+class CompactionQualityGuardConfig(BaseModel):
+    """Compaction quality guard — mirrors TS AgentCompactionQualityGuardConfig"""
+    enabled: bool | None = Field(default=None)
+    maxRetries: int | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class CompactionConfig(BaseModel):
     """Compaction configuration - mirrors TypeScript AgentCompactionConfig"""
-    enabled: bool = Field(default=True)
-    mode: str = Field(default="safeguard")  # "default" | "safeguard"
-    reserveTokens: int = Field(default=16384, ge=0)
-    keepRecentTokens: int = Field(default=20000, ge=0)
-    maxHistoryShare: float = Field(default=0.5, ge=0.1, le=0.9)
+    mode: Literal["default", "safeguard"] | None = Field(default=None)
+    provider: str | None = Field(default=None)
+    reserveTokens: int | None = Field(default=None, ge=0)
+    keepRecentTokens: int | None = Field(default=None, ge=0)
     reserveTokensFloor: int | None = Field(default=None, ge=0)
-    # Fields from TS compaction schema (added in P2 alignment)
+    maxHistoryShare: float | None = Field(default=None, ge=0.1, le=0.9)
+    customInstructions: str | None = Field(default=None)
+    recentTurnsPreserve: int | None = Field(default=None, ge=0, le=12)
     identifierPolicy: Literal["strict", "off", "custom"] | None = Field(default=None)
     identifierInstructions: str | None = Field(default=None)
-    memoryFlush: "MemoryFlushConfig | None" = Field(default=None)  # TS location is compaction.memoryFlush
+    qualityGuard: CompactionQualityGuardConfig | None = Field(default=None)
+    postIndexSync: Literal["off", "async", "await"] | None = Field(default=None)
+    postCompactionSections: list[str] | None = Field(default=None)
+    model: str | None = Field(default=None)
+    timeoutSeconds: int | None = Field(default=None, ge=1)
+    memoryFlush: "MemoryFlushConfig | None" = Field(default=None)
+    truncateAfterCompaction: bool | None = Field(default=None)
+    notifyUser: bool | None = Field(default=None)
+    # Legacy Python field (not in TS schema; kept for backward compatibility)
+    enabled: bool | None = Field(default=None)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -613,9 +634,70 @@ class CliBackendConfig(BaseModel):
     """Runtime reliability tuning for this backend's process lifecycle"""
 
 
+class SilentReplyPolicyConfig(BaseModel):
+    """Silent-reply policy by conversation type — mirrors TS SilentReplyPolicyConfigSchema"""
+    direct: Literal["allow", "disallow"] | None = Field(default=None)
+    group: Literal["allow", "disallow"] | None = Field(default=None)
+    internal: Literal["allow", "disallow"] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SilentReplyRewriteConfig(BaseModel):
+    """Silent-reply rewrite policy by conversation type — mirrors TS SilentReplyRewriteConfigSchema"""
+    direct: bool | None = Field(default=None)
+    group: bool | None = Field(default=None)
+    internal: bool | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AgentContextLimitsConfig(BaseModel):
+    """Focused context-budget overrides — mirrors TS AgentContextLimitsSchema"""
+    memoryGetMaxChars: int | None = Field(default=None, ge=1, le=250_000)
+    memoryGetDefaultLines: int | None = Field(default=None, ge=1, le=5_000)
+    toolResultMaxChars: int | None = Field(default=None, ge=1, le=250_000)
+    postCompactionMaxChars: int | None = Field(default=None, ge=1, le=50_000)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AgentExperimentalConfig(BaseModel):
+    """Experimental agent-default flags — mirrors TS agents.defaults.experimental"""
+    localModelLean: bool | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AgentLlmConfig(BaseModel):
+    """LLM timeout configuration — mirrors TS AgentLlmConfig"""
+    idleTimeoutSeconds: int | None = Field(default=None, ge=0)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AgentRuntimePolicyConfig(BaseModel):
+    """Default agent runtime policy — mirrors TS AgentRuntimePolicySchema"""
+    id: str | None = Field(default=None)
+    fallback: Literal["pi", "none"] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AgentEmbeddedHarnessConfig(BaseModel):
+    """@deprecated Use agentRuntime — mirrors TS AgentEmbeddedHarnessSchema"""
+    runtime: str | None = Field(default=None)
+    fallback: Literal["pi", "none"] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class AgentDefaults(BaseModel):
     """Default agent settings - mirrors TS AgentDefaultsSchema"""
 
+    params: dict[str, Any] | None = Field(default=None)
+    agentRuntime: AgentRuntimePolicyConfig | None = Field(default=None)
+    embeddedHarness: AgentEmbeddedHarnessConfig | None = Field(default=None)
     workspace: str | None = Field(default=None)
     agentDir: str | None = Field(default=None)
     model: str | ModelConfig = Field(default="google/gemini-3-pro-preview")
@@ -639,13 +721,23 @@ class AgentDefaults(BaseModel):
     blockStreamingCoalesce: "BlockStreamingCoalesceConfig | dict[str, Any] | None" = Field(default=None)
     # Fields added in P2 alignment - mirrors TS AgentDefaultsSchema
     imageModel: str | ModelConfig | None = Field(default=None)
+    imageGenerationModel: str | ModelConfig | None = Field(default=None)
+    videoGenerationModel: str | ModelConfig | None = Field(default=None)
+    musicGenerationModel: str | ModelConfig | None = Field(default=None)
+    mediaGenerationAutoProviderFallback: bool | None = Field(default=None)
     pdfModel: str | ModelConfig | None = Field(default=None)
     pdfMaxBytesMb: float | None = Field(default=None)
     pdfMaxPages: int | None = Field(default=None)
     repoRoot: str | None = Field(default=None)
     skipBootstrap: bool | None = Field(default=None)
+    contextInjection: Literal["always", "continuation-skip", "never"] | None = Field(default=None)
     bootstrapMaxChars: int | None = Field(default=None)
     bootstrapTotalMaxChars: int | None = Field(default=None)
+    experimental: AgentExperimentalConfig | None = Field(default=None)
+    contextLimits: AgentContextLimitsConfig | None = Field(default=None)
+    llm: AgentLlmConfig | None = Field(default=None)
+    silentReply: SilentReplyPolicyConfig | None = Field(default=None)
+    silentReplyRewrite: SilentReplyRewriteConfig | None = Field(default=None)
     userTimezone: str | None = Field(default=None)
     timeFormat: Literal["auto", "12", "24"] | None = Field(default=None)
     envelopeTimezone: str | None = Field(default=None)
@@ -654,7 +746,7 @@ class AgentDefaults(BaseModel):
     contextTokens: int | None = Field(default=None)
     cliBackends: Optional[dict[str, CliBackendConfig]] = Field(default=None)
     embeddedPi: dict[str, Any] | None = Field(default=None)
-    thinkingDefault: Literal["off", "minimal", "low", "medium", "high", "xhigh", "adaptive"] | None = Field(default=None)
+    thinkingDefault: Literal["off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"] | None = Field(default=None)
     verboseDefault: Literal["off", "on", "full"] | None = Field(default=None)
     elevatedDefault: Literal["off", "on", "ask", "full"] | None = Field(default=None)
     humanDelay: "HumanDelayConfig | dict[str, Any] | None" = Field(default=None)
@@ -729,22 +821,24 @@ class SandboxConfig(BaseModel):
 
     Mirrors TS agents.defaults.sandbox / agents.list[].sandbox schema.
     See: openclaw/docs/gateway/sandboxing.md
-    
-    Default: mode="all" to ensure workspace isolation and match TS behavior.
-    Requires Docker. If Docker is unavailable, Gateway will warn and auto-disable.
-    Users can explicitly set mode="off" in openclaw.json to disable sandbox.
+
+    Defaults mirror TS resolveSandboxConfigForAgent:
+      mode="off"    (TS default — no sandboxing unless explicitly enabled)
+      scope="agent" (TS default from resolveSandboxScope when neither scope nor
+                     perSession is set)
+    Users must explicitly set mode="all" or mode="non-main" to enable sandboxing.
     """
 
     # When to sandbox: "off" | "non-main" | "all"
     mode: str = Field(
-        default="all",
-        description="Sandbox mode: 'all' (recommended, requires Docker), 'non-main', or 'off'"
+        default="off",
+        description="Sandbox mode: 'off' (default), 'all' (requires Docker), or 'non-main'"
     )
 
     # Container scope: "session" | "agent" | "shared"
     scope: str = Field(
-        default="session",
-        description="Container scope: 'session' (isolated per-session, recommended), 'agent', or 'shared'"
+        default="agent",
+        description="Container scope: 'agent' (default), 'session' (isolated per-session), or 'shared'"
     )
 
     # Workspace access inside sandbox: "none" | "ro" | "rw"
@@ -760,6 +854,18 @@ class SandboxConfig(BaseModel):
     workspaceRoot: Optional[str] = Field(
         default=None,
         description="Sandbox workspace root. Defaults to ~/.openclaw/sandboxes/"
+    )
+
+    # M13: perSession — legacy alias for scope="session" (mirrors TS AgentSandboxConfig.perSession)
+    perSession: Optional[bool] = Field(
+        default=None,
+        description="Legacy: set scope='session' when true. Use scope='session' instead."
+    )
+
+    # M13: prune — mirrors TS AgentSandboxConfig.prune (container lifecycle management)
+    prune: Optional[bool] = Field(
+        default=None,
+        description="Whether to prune stale sandbox containers on restart."
     )
 
     # Docker-level settings (bind mounts etc.)
@@ -1120,6 +1226,29 @@ class ChannelsConfig(BaseModel):
 
     # Allow extension channels (matrix, zalo, msteams, etc.) — matches TS .passthrough()
     model_config = ConfigDict(extra="allow")
+
+
+class SessionSkillEntry(BaseModel):
+    """Skill entry in session snapshot — mirrors TS SessionSkillSnapshot.skills[] item."""
+    name: str
+    primaryEnv: str | None = Field(default=None)
+    requiredEnv: list[str] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SessionSkillSnapshot(BaseModel):
+    """Snapshot of skills enabled for a session — mirrors TS SessionSkillSnapshot."""
+    prompt: str = ""
+    skills: list[SessionSkillEntry] = Field(default_factory=list)
+    skillFilter: list[str] | None = Field(default=None)
+    resolvedSkills: list[dict[str, Any]] | None = Field(default=None)
+    version: int | None = Field(default=None)
+    # Legacy Python shape (backward compatibility when loading old stores)
+    enabled: dict[str, bool] | None = Field(default=None)
+    apiKeys: dict[str, str] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class SkillsConfig(BaseModel):
@@ -1911,6 +2040,53 @@ class DockerUlimitConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+# ─── MCP / Crestodian / Surfaces (top-level) ─────────────────────────────────
+
+class McpServerConfig(BaseModel):
+    """MCP server definition — mirrors TS McpServerSchema"""
+    command: str | None = Field(default=None)
+    args: list[str] | None = Field(default=None)
+    env: dict[str, str | int | bool] | None = Field(default=None)
+    cwd: str | None = Field(default=None)
+    workingDirectory: str | None = Field(default=None)
+    url: str | None = Field(default=None)
+    headers: dict[str, str | int | bool] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class McpConfig(BaseModel):
+    """Global MCP configuration — mirrors TS McpConfigSchema"""
+    servers: dict[str, McpServerConfig] | None = Field(default=None)
+    sessionIdleTtlMs: int | None = Field(default=None, ge=0)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CrestodianRescueConfig(BaseModel):
+    """Crestodian rescue settings — mirrors TS crestodian.rescue"""
+    enabled: Literal["auto"] | bool | None = Field(default=None)
+    ownerDmOnly: bool | None = Field(default=None)
+    pendingTtlMinutes: int | None = Field(default=None, ge=1)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CrestodianConfig(BaseModel):
+    """Crestodian configuration — mirrors TS CrestodianSchema"""
+    rescue: CrestodianRescueConfig | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SurfaceConfig(BaseModel):
+    """Per-surface silent-reply overrides — mirrors TS surfaces[surfaceId]"""
+    silentReply: SilentReplyPolicyConfig | None = Field(default=None)
+    silentReplyRewrite: SilentReplyRewriteConfig | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 # ─── Top-level typed config models (replacing dict[str, Any]) ─────────────────
 
 class SecretsDefaultsConfig(BaseModel):
@@ -2094,6 +2270,9 @@ class OpenClawConfig(BaseModel):
     media: MediaTopLevelConfig | None = Field(default=None)
     cli: CliConfig | None = Field(default=None)
     secrets: SecretsConfig | None = Field(default=None)
+    mcp: McpConfig | None = Field(default=None)
+    crestodian: CrestodianConfig | None = Field(default=None)
+    surfaces: dict[str, SurfaceConfig] | None = Field(default=None)
     # $schema field for JSON schema editor tooling
     schema_ref: str | None = Field(default=None, alias="$schema")
 
@@ -2107,6 +2286,7 @@ class OpenClawConfig(BaseModel):
 AgentConfig.model_rebuild()
 AuthConfig.model_rebuild()
 GatewayNodesConfig.model_rebuild()
+CompactionConfig.model_rebuild()
 AgentDefaults.model_rebuild()
 AgentsConfig.model_rebuild()
 SandboxDockerConfig.model_rebuild()

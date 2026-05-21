@@ -177,7 +177,11 @@ def list_skill_commands_for_agents(
             commands = _scan_workspace_for_skills(workspace_dir)
 
         for command in commands:
-            name = (command.get("name") or "").lower()
+            # Support both dict-like (legacy) and dataclass SkillCommandSpec objects
+            if isinstance(command, dict):
+                name = (command.get("name") or "").lower()
+            else:
+                name = (getattr(command, "name", None) or "").lower()
             if name and name not in used:
                 used.add(name)
                 entries.append(command)

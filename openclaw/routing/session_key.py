@@ -12,7 +12,7 @@ Session keys uniquely identify conversation contexts:
 from __future__ import annotations
 
 import re
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # Constants (matches TS lines 10-12)
 DEFAULT_AGENT_ID = "main"
@@ -384,7 +384,7 @@ def is_acp_session_key(session_key: str | None) -> bool:
 # Functions ported from src/sessions/session-key-utils.ts
 # ---------------------------------------------------------------------------
 
-THREAD_SESSION_MARKERS = (":thread:", ":topic:")
+THREAD_SESSION_MARKER = ":thread:"
 
 
 def is_cron_run_session_key(session_key: str | None) -> bool:
@@ -435,26 +435,24 @@ def resolve_thread_parent_session_key(session_key: str | None) -> str | None:
     """
     Resolve the parent session key from a thread session key.
 
-    Finds the *last* occurrence of ':thread:' or ':topic:' and returns
-    everything before it.
+    Only strips a trailing ``:thread:<id>`` suffix (not ``:topic:``), matching
+    TypeScript ``parseThreadSessionSuffix`` / ``resolveThreadParentSessionKey``.
 
-    Returns None if no thread marker is found.
-
-    Matches TS resolveThreadParentSessionKey().
+    Returns None if no thread suffix is found.
     """
     raw = (session_key or "").strip()
     if not raw:
         return None
-    normalized = raw.lower()
-    idx = -1
-    for marker in THREAD_SESSION_MARKERS:
-        candidate = normalized.rfind(marker)
-        if candidate > idx:
-            idx = candidate
-    if idx <= 0:
+    lower_raw = raw.lower()
+    marker_index = lower_raw.rfind(THREAD_SESSION_MARKER)
+    if marker_index == -1:
         return None
-    parent = raw[:idx].strip()
-    return parent if parent else None
+    base_session_key = raw[:marker_index].strip()
+    thread_id_raw = raw[marker_index + len(THREAD_SESSION_MARKER) :]
+    thread_id = (thread_id_raw or "").strip()
+    if not thread_id or not base_session_key:
+        return None
+    return base_session_key
 
 
 SessionKeyShape = str  # "missing" | "agent" | "legacy_or_alias" | "malformed_agent"

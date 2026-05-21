@@ -16,8 +16,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
-from typing import Callable, Awaitable
+from typing import Any, Awaitable, Callable, Literal, TypedDict
+
+from openclaw.auto_reply.chunk import (
+    _get_provider_section,
+    _normalize_account_id,
+    _resolve_account_entry,
+    resolve_chunk_mode,
+    resolve_text_chunk_limit,
+)
 
 from openclaw.markdown.fences import parse_fence_spans, is_safe_fence_break
 
@@ -59,6 +68,21 @@ class BlockStreamingCoalesceConfig:
     idle_ms: int = DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS
     joiner: str = "\n"
     flush_on_enqueue: bool = False
+
+
+class BlockStreamingCoalescing(TypedDict, total=False):
+    min_chars: int
+    max_chars: int
+    idle_ms: int
+    joiner: str
+    flush_on_enqueue: bool
+
+
+class BlockStreamingChunking(TypedDict, total=False):
+    min_chars: int
+    max_chars: int
+    break_preference: Literal["paragraph", "newline", "sentence"]
+    flush_on_paragraph: bool
 
 
 @dataclass
@@ -270,6 +294,209 @@ class BlockStreamingPipeline:
 # ---------------------------------------------------------------------------
 # Config resolution helpers
 # ---------------------------------------------------------------------------
+
+def clamp_positive_integer(
+    value: Any,
+    fallback: int,
+    *,
+    min_value: int,
+    max_value: int,
+) -> int:
+    """Clamp a numeric value to integer bounds. Mirrors TS clampPositiveInteger."""
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return fallback
+    rounded = round(value)
+    if rounded < min_value:
+        return min_value
+    if rounded > max_value:
+        return max_value
+    return int(rounded)
+
+
+def _as_object_record(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+def _resolve_channel_streaming_block_coalesce(entry: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Resolve blockStreamingCoalesce from streaming.block.coalesce or legacy keys."""
+    if not entry:
+        return None
+    streaming = _as_object_record(entry.get("streaming"))
+    if streaming:
+        block = _as_object_record(streaming.get("block"))
+        if block:
+            coalesce = _as_object_record(block.get("coalesce"))
+            if coalesce:
+                return coalesce
+    legacy = entry.get("blockStreamingCoalesce") or entry.get("block_streaming_coalesce")
+    return legacy if isinstance(legacy, dict) else None
+
+
+def _resolve_provider_chunk_context(
+    cfg: dict[str, Any] | None,
+    provider: str | None = None,
+    account_id: str | None = None,
+) -> tuple[str | None, str | None, int]:
+    """Return (provider_key, provider_id, text_limit). Mirrors TS resolveProviderChunkContext."""
+    from openclaw.utils.message_channel import normalize_message_channel
+
+    provider_key: str | None = None
+    if provider:
+        provider_key = normalize_message_channel(provider)
+    provider_id = provider_key
+
+    provider_chunk_limit: int | None = None
+    if provider_id:
+        try:
+            from openclaw.channels.plugins import get_channel_plugin
+
+            plugin = get_channel_plugin(provider_id)
+            outbound = getattr(plugin, "outbound", None) if plugin else None
+            limit = getattr(outbound, "text_chunk_limit", None) if outbound else None
+            if isinstance(limit, int) and limit > 0:
+                provider_chunk_limit = limit
+        except Exception:
+            provider_chunk_limit = None
+
+    text_limit = resolve_text_chunk_limit(
+        cfg,
+        provider_key,
+        account_id,
+        fallback_limit=provider_chunk_limit,
+    )
+    return provider_key, provider_id, text_limit
+
+
+def _resolve_provider_block_streaming_coalesce(
+    cfg: dict[str, Any] | None,
+    provider_key: str | None,
+    account_id: str | None,
+) -> dict[str, Any] | None:
+    """Resolve provider/account blockStreamingCoalesce. Mirrors TS resolveProviderBlockStreamingCoalesce."""
+    if not cfg or not provider_key:
+        return None
+    section = _get_provider_section(cfg, provider_key)
+    if not section:
+        return None
+    normalized_account_id = _normalize_account_id(account_id)
+    accounts = section.get("accounts")
+    account_cfg: dict[str, Any] | None = None
+    if isinstance(accounts, dict) and normalized_account_id:
+        account_cfg = _resolve_account_entry(accounts, normalized_account_id)
+        if not isinstance(account_cfg, dict):
+            account_cfg = None
+    account_legacy: dict[str, Any] | None = None
+    if isinstance(account_cfg, dict):
+        legacy = account_cfg.get("blockStreamingCoalesce") or account_cfg.get("block_streaming_coalesce")
+        account_legacy = legacy if isinstance(legacy, dict) else None
+    section_legacy_raw = section.get("blockStreamingCoalesce") or section.get("block_streaming_coalesce")
+    section_legacy = section_legacy_raw if isinstance(section_legacy_raw, dict) else None
+    return (
+        _resolve_channel_streaming_block_coalesce(account_cfg)
+        or _resolve_channel_streaming_block_coalesce(section)
+        or account_legacy
+        or section_legacy
+    )
+
+
+def resolve_block_streaming_chunking(
+    cfg: dict[str, Any] | None,
+    provider: str | None = None,
+    account_id: str | None = None,
+) -> BlockStreamingChunking:
+    """Resolve block streaming chunking defaults. Mirrors TS resolveBlockStreamingChunking."""
+    provider_key, _, text_limit = _resolve_provider_chunk_context(cfg, provider, account_id)
+    agents = (cfg or {}).get("agents", {}).get("defaults", {})
+    chunk_cfg = agents.get("blockStreamingChunk") or agents.get("block_streaming_chunk") or {}
+
+    chunk_mode = resolve_chunk_mode(cfg, provider_key, account_id)
+
+    max_requested = max(1, math.floor(chunk_cfg.get("maxChars", chunk_cfg.get("max_chars", DEFAULT_BLOCK_STREAM_MAX))))
+    max_chars = max(1, min(max_requested, text_limit))
+    min_fallback = DEFAULT_BLOCK_STREAM_MIN
+    min_requested = max(1, math.floor(chunk_cfg.get("minChars", chunk_cfg.get("min_chars", min_fallback))))
+    min_chars = min(min_requested, max_chars)
+    break_pref = chunk_cfg.get("breakPreference") or chunk_cfg.get("break_preference")
+    break_preference: Literal["paragraph", "newline", "sentence"] = (
+        break_pref if break_pref in ("newline", "sentence") else "paragraph"
+    )
+    return BlockStreamingChunking(
+        min_chars=min_chars,
+        max_chars=max_chars,
+        break_preference=break_preference,
+        flush_on_paragraph=chunk_mode == "newline",
+    )
+
+
+def resolve_block_streaming_coalescing(
+    cfg: dict[str, Any] | None,
+    provider: str | None = None,
+    account_id: str | None = None,
+    chunking: BlockStreamingChunking | None = None,
+) -> BlockStreamingCoalescing | None:
+    """Resolve block streaming coalescing defaults. Mirrors TS resolveBlockStreamingCoalescing."""
+    provider_key, provider_id, text_limit = _resolve_provider_chunk_context(cfg, provider, account_id)
+
+    provider_defaults: dict[str, Any] | None = None
+    if provider_id:
+        try:
+            from openclaw.channels.plugins import get_channel_plugin
+
+            plugin = get_channel_plugin(provider_id)
+            streaming = getattr(plugin, "streaming", None) if plugin else None
+            defaults = (
+                getattr(streaming, "block_streaming_coalesce_defaults", None)
+                or getattr(streaming, "blockStreamingCoalesceDefaults", None)
+                if streaming
+                else None
+            )
+            if isinstance(defaults, dict):
+                provider_defaults = defaults
+        except Exception:
+            provider_defaults = None
+
+    provider_cfg = _resolve_provider_block_streaming_coalesce(cfg, provider_key, account_id)
+    agents = (cfg or {}).get("agents", {}).get("defaults", {})
+    coalesce_cfg = provider_cfg or agents.get("blockStreamingCoalesce") or agents.get("block_streaming_coalesce")
+
+    min_requested = max(
+        1,
+        math.floor(
+            (coalesce_cfg or {}).get("minChars")
+            or (coalesce_cfg or {}).get("min_chars")
+            or (provider_defaults or {}).get("minChars")
+            or (provider_defaults or {}).get("min_chars")
+            or (chunking or {}).get("min_chars")
+            or DEFAULT_BLOCK_STREAM_MIN
+        ),
+    )
+    max_requested = max(
+        1,
+        math.floor((coalesce_cfg or {}).get("maxChars") or (coalesce_cfg or {}).get("max_chars") or text_limit),
+    )
+    max_chars = max(1, min(max_requested, text_limit))
+    min_chars = min(min_requested, max_chars)
+    idle_ms = max(
+        0,
+        math.floor(
+            (coalesce_cfg or {}).get("idleMs")
+            or (coalesce_cfg or {}).get("idle_ms")
+            or (provider_defaults or {}).get("idleMs")
+            or (provider_defaults or {}).get("idle_ms")
+            or DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS
+        ),
+    )
+    preference = (chunking or {}).get("break_preference", "paragraph")
+    joiner = " " if preference == "sentence" else "\n" if preference == "newline" else "\n\n"
+    return BlockStreamingCoalescing(
+        min_chars=min_chars,
+        max_chars=max_chars,
+        idle_ms=idle_ms,
+        joiner=joiner,
+    )
+
 
 def resolve_block_streaming_config(
     cfg: dict | None,

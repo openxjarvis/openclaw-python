@@ -40,16 +40,26 @@ CHANNEL_RESTART_POLICY = {
     "initial_delay_ms": 5_000,    # 5 s initial backoff
     "max_delay_ms": 300_000,       # 5 min max backoff
     "backoff_factor": 2.0,
+    "jitter": 0.1,                 # M19: ±10% jitter — mirrors TS CHANNEL_RESTART_POLICY
 }
 
 
 def _compute_backoff_ms(attempt: int) -> float:
-    """Compute backoff delay in ms for a given restart attempt (1-indexed)."""
+    """Compute backoff delay in ms for a given restart attempt (1-indexed).
+
+    M19: Applies ±jitter to prevent thundering herd when multiple channels
+    restart simultaneously — mirrors TS CHANNEL_RESTART_POLICY jitter: 0.1.
+    """
+    import random
     initial = CHANNEL_RESTART_POLICY["initial_delay_ms"]
     factor = CHANNEL_RESTART_POLICY["backoff_factor"]
     max_delay = CHANNEL_RESTART_POLICY["max_delay_ms"]
+    jitter = CHANNEL_RESTART_POLICY.get("jitter", 0.0)
     delay = initial * (factor ** (attempt - 1))
-    return min(delay, max_delay)
+    delay = min(delay, max_delay)
+    if jitter > 0:
+        delay *= (1.0 + random.uniform(-jitter, jitter))
+    return delay
 
 
 # Channel event type constants
@@ -1483,6 +1493,9 @@ class ChannelManager:
                 _session_mgr = self.get_session_manager(agent_id)
                 if _session_mgr:
                     session = _session_mgr.get_or_create_session_by_key(session_key)
+                    # Expose current session key so tools (e.g. SessionsSpawnTool) can
+                    # pass it as the parent session key when spawning subagents.
+                    _session_mgr.current_session_key = session_key
                     logger.info(f"[{channel_id}] Session created/retrieved: key={session_key}, uuid={session.session_id}")
 
                     # Resolve workspace — mirrors TS behaviour:
@@ -2384,19 +2397,26 @@ class ChannelManager:
                     except Exception:
                         pass
 
-                # When sandbox uses a per-session workspace (sandbox on + ws_access != rw),
-                # inject the path so the agent knows where to save files.
-                # When sandbox is OFF or workspaceAccess=rw, the agent uses the workspace
-                # root directly and can read/edit SOUL.md, USER.md, etc. — no note needed.
+                # Align ## Workspace section with TS displayWorkspaceDir logic:
+                # TS shows containerWorkspaceDir (e.g. /workspace inside Docker) as the
+                # working directory; Python has no container so session_workspace IS
+                # the effective workspace — replace the static agent-root path with it.
+                # Mirrors: displayWorkspaceDir = sandboxContainerWorkspace || workspaceDir
                 if session_workspace and _sandbox_enabled and _ws_access != "rw":
-                    _ws_note = (
-                        "\n\n## Session Workspace\n"
-                        f"Your **session workspace** for this conversation is: `{session_workspace}`\n"
-                        "Save all generated files, downloads, and outputs **inside this directory** "
-                        "(e.g. `{session_workspace}/report.pdf`, `{session_workspace}/output.mp4`).\n"
-                        "Do NOT scatter files into the parent workspace root."
-                    ).replace("{session_workspace}", session_workspace)
-                    _turn_system_prompt = (_turn_system_prompt or "") + _ws_note
+                    import re as _re_ws
+                    _turn_system_prompt = _re_ws.sub(
+                        r"Your working directory is: [^\n]+",
+                        f"Your working directory is: {session_workspace}",
+                        _turn_system_prompt or "",
+                        count=1,
+                    )
+                    _turn_system_prompt = (_turn_system_prompt or "").replace(
+                        "Treat this directory as the single global workspace for file operations "
+                        "unless explicitly instructed otherwise.",
+                        f"Prefer relative paths — they resolve against `{session_workspace}` "
+                        "(your session workspace). All file tools and bash commands use this directory. "
+                        "Do NOT save files outside this directory.",
+                    )
 
                 # Inject per-turn channel note so the agent always knows which channel
                 # it is responding in and can use MEDIA: tokens / message tool correctly.
@@ -2501,7 +2521,20 @@ class ChannelManager:
                     )
                     _sk_entries = load_workspace_skill_entries(_skill_ws, _cfg_dict)
                     _sk_eligible = filter_skill_entries(_sk_entries, _cfg_dict, None)
+                    # always-entries used for keyword detection (Python/Gemini-specific)
                     _always_entries = [e for e in _sk_eligible if e.metadata and e.metadata.always]
+
+                    # C6: Build FULL skill command specs for slash dispatch — mirrors TS
+                    # listSkillCommandsForWorkspace → resolveSkillCommandInvocation.
+                    # TS uses ALL user-invocable skills, not just always=true.
+                    try:
+                        from openclaw.auto_reply.skill_commands import (
+                            list_skill_commands_for_workspace as _list_sk_cmds,
+                            resolve_skill_command_invocation as _resolve_sk_cmd,
+                        )
+                        _all_skill_cmds = _list_sk_cmds(_skill_ws, _cfg_dict)
+                    except Exception:
+                        _all_skill_cmds = []
 
                     def _read_skill_md_cm(loc: object) -> str | None:
                         if not loc:
@@ -2527,33 +2560,38 @@ class ChannelManager:
                     _injected = False
 
                     # Path 1: Slash command dispatch — mirrors TS resolveSkillCommandInvocation.
+                    # Now uses ALL user-invocable skills (not just always=true).
                     # Handles /pptx [args]  and  /skill pptx [args].
-                    if _msg_stripped.startswith("/"):
-                        _slash_m = _re_sk.match(r"^/([^\s]+)(?:\s+([\s\S]+))?$", _msg_stripped)
-                        if _slash_m:
-                            _cmd_name = _slash_m.group(1).lower()
-                            _cmd_args = (_slash_m.group(2) or "").strip()
-                            # Resolve /skill pptx [args] format (mirrors TS /skill handler)
-                            if _cmd_name == "skill" and _cmd_args:
-                                _skill_re = _re_sk.match(r"^([^\s]+)(?:\s+([\s\S]+))?$", _cmd_args)
-                                if _skill_re:
-                                    _cmd_name = _skill_re.group(1).lower()
-                                    _cmd_args = (_skill_re.group(2) or "").strip()
-                            for _ae in _always_entries:
-                                if _ae.skill.name.lower() == _cmd_name:
-                                    _sc = _read_skill_md_cm(getattr(_ae.skill, "location", None))
-                                    # Use extracted args as user input (aligns with TS skillInvocation.args)
-                                    _user_inp = _cmd_args if _cmd_args else _msg_stripped
-                                    effective_message_text = _build_skill_rewrite_cm(_ae.skill.name, _user_inp, _sc)
-                                    _injected = True
-                                    logger.info(
-                                        "[%s] Skill slash-cmd /%s → rewrite%s",
-                                        channel_id, _ae.skill.name,
-                                        " (SKILL.md injected)" if _sc else "",
-                                    )
+                    if _msg_stripped.startswith("/") and _all_skill_cmds:
+                        try:
+                            _sk_invocation = _resolve_sk_cmd(_msg_stripped, _all_skill_cmds)
+                        except Exception:
+                            _sk_invocation = None
+                        if _sk_invocation:
+                            _sk_cmd = _sk_invocation.get("command") or {}
+                            _sk_args = _sk_invocation.get("args") or ""
+                            _sk_name = (
+                                _sk_cmd.get("skillName") if isinstance(_sk_cmd, dict)
+                                else getattr(_sk_cmd, "skillName", getattr(_sk_cmd, "skill_name", ""))
+                            ) or ""
+                            # Find location from skill entries for SKILL.md injection
+                            _sk_loc = None
+                            for _ae in _sk_eligible:
+                                if _ae.skill.name.lower() == _sk_name.lower():
+                                    _sk_loc = getattr(_ae.skill, "location", None)
                                     break
+                            _sc = _read_skill_md_cm(_sk_loc)
+                            _user_inp = _sk_args if _sk_args else _msg_stripped
+                            effective_message_text = _build_skill_rewrite_cm(_sk_name, _user_inp, _sc)
+                            _injected = True
+                            logger.info(
+                                "[%s] Skill slash-cmd → skill '%s'%s",
+                                channel_id, _sk_name,
+                                " (SKILL.md injected)" if _sc else "",
+                            )
 
-                    # Path 2: Keyword detection for natural language (Gemini workaround).
+                    # Path 2: Keyword detection for natural language (Gemini workaround —
+                    # Python-only, TS relies on model following system prompt instructions).
                     if not _injected:
                         _SKILL_KEYWORDS: dict[str, list[str]] = {
                             "pptx": ["ppt", ".pptx", "presentation", "slide", "deck",

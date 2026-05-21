@@ -778,6 +778,105 @@ class CronService:
             return [self._job_to_dict(j) for j in jobs]
         return await self._locked(_do)
 
+    async def list_page(
+        self,
+        *,
+        include_disabled: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+        query: str | None = None,
+        enabled: str | None = None,
+        sort_by: str = "nextRunAtMs",
+        sort_dir: str = "asc",
+    ) -> Dict[str, Any]:
+        """Paginated/filtered job list — mirrors TS cron.listPage."""
+
+        def _normalize_query(value: str | None) -> str:
+            if not isinstance(value, str):
+                return ""
+            return value.strip().lower()
+
+        def _resolve_enabled_filter() -> str:
+            if enabled in ("all", "enabled", "disabled"):
+                return enabled
+            return "all" if include_disabled else "enabled"
+
+        def _sort_jobs(jobs: list[CronJob]) -> list[CronJob]:
+            dir_mult = -1 if sort_dir == "desc" else 1
+
+            def compare(a: CronJob, b: CronJob) -> int:
+                cmp = 0
+                if sort_by == "name":
+                    a_name = a.name if isinstance(a.name, str) else ""
+                    b_name = b.name if isinstance(b.name, str) else ""
+                    cmp = (a_name.casefold() > b_name.casefold()) - (
+                        a_name.casefold() < b_name.casefold()
+                    )
+                elif sort_by == "updatedAtMs":
+                    cmp = a.updated_at_ms - b.updated_at_ms
+                else:
+                    a_next = a.state.next_run_ms
+                    b_next = b.state.next_run_ms
+                    if isinstance(a_next, int) and isinstance(b_next, int):
+                        cmp = a_next - b_next
+                    elif isinstance(a_next, int):
+                        cmp = -1
+                    elif isinstance(b_next, int):
+                        cmp = 1
+                if cmp != 0:
+                    return cmp * dir_mult
+                a_id = a.id if isinstance(a.id, str) else ""
+                b_id = b.id if isinstance(b.id, str) else ""
+                return (a_id > b_id) - (a_id < b_id)
+
+            from functools import cmp_to_key
+
+            return sorted(jobs, key=cmp_to_key(compare))
+
+        async def _do() -> Dict[str, Any]:
+            await self._ensure_loaded()
+            enabled_filter = _resolve_enabled_filter()
+            normalized_query = _normalize_query(query)
+            source = list(self.jobs.values())
+
+            filtered: list[CronJob] = []
+            for job in source:
+                if enabled_filter == "enabled" and not job.enabled:
+                    continue
+                if enabled_filter == "disabled" and job.enabled:
+                    continue
+                if normalized_query:
+                    haystack = _normalize_query(
+                        " ".join(
+                            [
+                                job.name or "",
+                                job.description or "",
+                                job.agent_id or "",
+                            ]
+                        )
+                    )
+                    if normalized_query not in haystack:
+                        continue
+                filtered.append(job)
+
+            sorted_jobs = _sort_jobs(filtered)
+            total = len(sorted_jobs)
+            safe_offset = max(0, min(total, int(offset)))
+            default_limit = total if total > 0 else 50
+            page_limit = max(1, min(200, int(limit if limit is not None else default_limit)))
+            page_jobs = sorted_jobs[safe_offset : safe_offset + page_limit]
+            next_offset = safe_offset + len(page_jobs)
+            return {
+                "jobs": [self._job_to_dict(j) for j in page_jobs],
+                "total": total,
+                "offset": safe_offset,
+                "limit": page_limit,
+                "hasMore": next_offset < total,
+                "nextOffset": next_offset if next_offset < total else None,
+            }
+
+        return await self._locked(_do)
+
     async def add_job(self, job: CronJob) -> CronJob:
         async def _do() -> CronJob:
             self._warn_if_disabled("add")

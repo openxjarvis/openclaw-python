@@ -449,6 +449,157 @@ class PluginApi:
         logger.debug(f"[{self.id}] registered typed hook: {hook_name} (priority={priority})")
 
     # =========================================================================
+    # Agent Harness Registration (mirrors TS registerAgentHarness)
+    # =========================================================================
+
+    def register_agent_harness(self, harness: Any) -> None:
+        """Register an agent harness from this plugin.
+
+        Mirrors TS OpenClawPluginApi.registerAgentHarness().
+        The harness must have an 'id' attribute.
+        """
+        harness_id = getattr(harness, "id", None)
+        if not harness_id:
+            self._push_diagnostic("error", "register_agent_harness: harness missing 'id'")
+            return
+        # Set plugin_id if not set
+        if not getattr(harness, "plugin_id", None):
+            try:
+                harness.plugin_id = self.id
+            except AttributeError:
+                pass
+        try:
+            from openclaw.agents.harness.registry import register_global_agent_harness
+            register_global_agent_harness(harness)
+            logger.debug(f"[{self.id}] registered agent harness: {harness_id}")
+        except ValueError as e:
+            self._push_diagnostic("error", f"register_agent_harness: {e}")
+
+    # =========================================================================
+    # Thinking Provider Profile Registration (mirrors TS provider-thinking)
+    # =========================================================================
+
+    def register_provider_thinking_profile(self, provider: str, profile: Any) -> None:
+        """Register a provider thinking profile from this plugin.
+
+        Mirrors TS registerProviderThinkingProfile().
+        profile: ThinkingProviderProfile { binary, xhigh_capable, available_levels, default_level }
+        """
+        try:
+            from openclaw.auto_reply.reply.thinking import register_provider_thinking_profile as _reg
+            _reg(provider, profile)
+            logger.debug(f"[{self.id}] registered thinking profile for provider: {provider}")
+        except Exception as exc:
+            self._push_diagnostic("error", f"register_provider_thinking_profile: {exc}")
+
+    # =========================================================================
+    # Media / Content Generation Provider Registration
+    # =========================================================================
+
+    def register_speech_provider(self, provider: Any) -> None:
+        """Register a TTS/speech provider."""
+        self._register_media_provider("speech", provider)
+
+    def register_realtime_transcription_provider(self, provider: Any) -> None:
+        """Register a real-time transcription provider."""
+        self._register_media_provider("realtime_transcription", provider)
+
+    def register_realtime_voice_provider(self, provider: Any) -> None:
+        """Register a real-time voice provider."""
+        self._register_media_provider("realtime_voice", provider)
+
+    def register_image_generation_provider(self, provider: Any) -> None:
+        """Register an image generation provider."""
+        self._register_media_provider("image_generation", provider)
+
+    def register_music_generation_provider(self, provider: Any) -> None:
+        """Register a music generation provider."""
+        self._register_media_provider("music_generation", provider)
+
+    def register_video_generation_provider(self, provider: Any) -> None:
+        """Register a video generation provider."""
+        self._register_media_provider("video_generation", provider)
+
+    def register_web_search_provider(self, provider: Any) -> None:
+        """Register a web search provider."""
+        self._register_media_provider("web_search", provider)
+
+    def register_web_fetch_provider(self, provider: Any) -> None:
+        """Register a web fetch provider."""
+        self._register_media_provider("web_fetch", provider)
+
+    def _register_media_provider(self, kind: str, provider: Any) -> None:
+        """Internal: store a typed provider registration in the registry."""
+        if not hasattr(self._registry, "media_providers"):
+            self._registry.media_providers = {}  # type: ignore[attr-defined]
+        providers = self._registry.media_providers  # type: ignore[attr-defined]
+        if kind not in providers:
+            providers[kind] = []
+        providers[kind].append({"plugin_id": self.id, "provider": provider})
+        logger.debug(f"[{self.id}] registered {kind} provider")
+
+    # =========================================================================
+    # Context / Compaction / Harness Extension Registration
+    # =========================================================================
+
+    def register_context_engine(self, engine: Any) -> None:
+        """Register a context engine (for RAG/search augmentation)."""
+        if not hasattr(self._registry, "context_engines"):
+            self._registry.context_engines = []  # type: ignore[attr-defined]
+        self._registry.context_engines.append({"plugin_id": self.id, "engine": engine})  # type: ignore[attr-defined]
+        logger.debug(f"[{self.id}] registered context engine")
+
+    def register_compaction_provider(self, provider: Any) -> None:
+        """Register a custom compaction provider."""
+        if not hasattr(self._registry, "compaction_providers"):
+            self._registry.compaction_providers = []  # type: ignore[attr-defined]
+        self._registry.compaction_providers.append({"plugin_id": self.id, "provider": provider})  # type: ignore[attr-defined]
+        logger.debug(f"[{self.id}] registered compaction provider")
+
+    def register_detached_task_runtime(self, runtime: Any) -> None:
+        """Register a detached task runtime (mirrors TS registerDetachedTaskRuntime)."""
+        if not hasattr(self._registry, "detached_task_runtimes"):
+            self._registry.detached_task_runtimes = []  # type: ignore[attr-defined]
+        self._registry.detached_task_runtimes.append({"plugin_id": self.id, "runtime": runtime})  # type: ignore[attr-defined]
+        logger.debug(f"[{self.id}] registered detached task runtime")
+
+    # =========================================================================
+    # Memory Registration (mirrors TS memory capability slots)
+    # =========================================================================
+
+    def register_memory_capability(self, capability: Any) -> None:
+        """Register a memory capability (backend slot)."""
+        if not hasattr(self._registry, "memory_capabilities"):
+            self._registry.memory_capabilities = []  # type: ignore[attr-defined]
+        self._registry.memory_capabilities.append({"plugin_id": self.id, "capability": capability})  # type: ignore[attr-defined]
+        logger.debug(f"[{self.id}] registered memory capability")
+
+    def register_memory_embedding_provider(self, provider: Any) -> None:
+        """Register a memory embedding provider."""
+        if not hasattr(self._registry, "memory_embedding_providers"):
+            self._registry.memory_embedding_providers = []  # type: ignore[attr-defined]
+        self._registry.memory_embedding_providers.append({"plugin_id": self.id, "provider": provider})  # type: ignore[attr-defined]
+        logger.debug(f"[{self.id}] registered memory embedding provider")
+
+    # =========================================================================
+    # Config & Text Transforms (mirrors TS registerConfigMigration / registerTextTransforms)
+    # =========================================================================
+
+    def register_config_migration(self, migration: Any) -> None:
+        """Register a config migration (version upgrade handler)."""
+        if not hasattr(self._registry, "config_migrations"):
+            self._registry.config_migrations = []  # type: ignore[attr-defined]
+        self._registry.config_migrations.append({"plugin_id": self.id, "migration": migration})  # type: ignore[attr-defined]
+        logger.debug(f"[{self.id}] registered config migration")
+
+    def register_text_transforms(self, transforms: Any) -> None:
+        """Register text transform functions (mirrors TS registerTextTransforms)."""
+        if not hasattr(self._registry, "text_transforms"):
+            self._registry.text_transforms = []  # type: ignore[attr-defined]
+        self._registry.text_transforms.append({"plugin_id": self.id, "transforms": transforms})  # type: ignore[attr-defined]
+        logger.debug(f"[{self.id}] registered text transforms")
+
+    # =========================================================================
     # Utility
     # =========================================================================
 

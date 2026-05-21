@@ -163,9 +163,15 @@ def convert_run_log_entry_to_api(entry: dict[str, Any]) -> dict[str, Any]:
     }
     if status is not None:
         result["status"] = status
-    for field in ("error", "summary"):
+    for field in ("error", "summary", "deliveryError", "jobName"):
         if entry.get(field):
             result[field] = entry[field]
+    if isinstance(entry.get("delivered"), bool):
+        result["delivered"] = entry["delivered"]
+    if entry.get("deliveryStatus") is not None:
+        result["deliveryStatus"] = entry["deliveryStatus"]
+    if isinstance(entry.get("delivery"), dict):
+        result["delivery"] = entry["delivery"]
     for py_key, ts_key in (
         ("runAtMs", "runAtMs"),
         ("durationMs", "durationMs"),

@@ -354,6 +354,18 @@ class PdfAnalysisTool(AgentToolBase):
     - File size limits
     """
     
+    @property
+    def name(self) -> str:
+        return "pdf"
+
+    @property
+    def label(self) -> str:
+        return "PDF"
+
+    @property
+    def description(self) -> str:
+        return "Analyze PDF documents with AI models. Supports native PDF analysis, text extraction, page range selection, and multiple PDFs."
+
     def __init__(
         self,
         workspace_dir: Path | None = None,
@@ -373,15 +385,6 @@ class PdfAnalysisTool(AgentToolBase):
             max_pages: Maximum pages per PDF
         """
         super().__init__()
-        self.name = "pdf"
-        self.label = "PDF"
-        self.description = (
-            "Analyze one or more PDF documents with a model. Supports native PDF analysis "
-            "for Anthropic and Google models, with text/image extraction fallback for other "
-            "providers. Use pdf for a single path/URL, or pdfs for multiple (up to 10). "
-            "Provide a prompt describing what to analyze."
-        )
-        
         self.workspace_dir = workspace_dir
         self.config = config or {}
         self.max_bytes = int(max_bytes_mb * 1024 * 1024)
@@ -448,7 +451,8 @@ class PdfAnalysisTool(AgentToolBase):
         
         if not pdf_inputs:
             return AgentToolResult(
-                content=[TextContent(text="pdf required: provide a path or URL to a PDF document")]
+                content=[TextContent(text="pdf required: provide a path or URL to a PDF document")],
+                details={"error": "pdf_required"}
             )
         
         # Enforce max PDFs cap (matches TS lines 383-394)

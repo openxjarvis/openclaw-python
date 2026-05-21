@@ -64,7 +64,20 @@ async def call_gateway_internal(
     except Exception as e:
         logger.debug(f"Failed to resolve gateway port, using default: {e}")
     
-    url = f"ws://localhost:{port}"
+    # M18: Support non-default bind address (host) from gateway config
+    # Mirrors TS gateway/call.ts which reads gateway host config.
+    _host = "localhost"
+    try:
+        if hasattr(config, "gateway") and config.gateway:
+            gw_cfg = config.gateway
+            _cfg_host = (
+                gw_cfg.get("host") if isinstance(gw_cfg, dict) else getattr(gw_cfg, "host", None)
+            )
+            if _cfg_host and _cfg_host not in ("0.0.0.0", "::", ""):
+                _host = _cfg_host
+    except Exception:
+        pass
+    url = f"ws://{_host}:{port}"
     
     # Get auth token (if configured)
     auth_token = None

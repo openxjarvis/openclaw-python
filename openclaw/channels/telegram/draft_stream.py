@@ -464,18 +464,43 @@ class TelegramDraftStream:
 
     async def _send_draft(self, html_text: str) -> bool:
         """sendMessageDraft transport -- Bot API 9.5, PTB v22+.
-        Mirrors TS sendDraftTransportPreview().
+        Mirrors TS sendDraftTransportPreview() + shouldFallbackFromDraftTransport.
+
+        C11: If sendMessageDraft fails (API unsupported / not available), fall back
+        to the message transport (sendMessage + editMessageText), matching TS behaviour
+        in draft-stream.ts where shouldFallbackFromDraftTransport switches transports.
         """
         thread_id: int | None = self._thread_params.get("message_thread_id")
-        await self._api.send_message_draft(
-            chat_id=self._chat_id,
-            draft_id=self._draft_id,
-            text=html_text,
-            parse_mode="HTML",
-            message_thread_id=thread_id,
-        )
-        self._consecutive_errors = 0
-        return True
+        try:
+            await self._api.send_message_draft(
+                chat_id=self._chat_id,
+                draft_id=self._draft_id,
+                text=html_text,
+                parse_mode="HTML",
+                message_thread_id=thread_id,
+            )
+            self._consecutive_errors = 0
+            return True
+        except Exception as _draft_err:
+            err_str = str(_draft_err).lower()
+            # Mirrors TS shouldFallbackFromDraftTransport: switch transports when
+            # the API is not supported or method is unknown on this bot/server.
+            _should_fallback = (
+                "method not found" in err_str
+                or "not supported" in err_str
+                or "unknown method" in err_str
+                or "bad request" in err_str
+                or "not available" in err_str
+                or hasattr(_draft_err, "description") and "not found" in str(getattr(_draft_err, "description", "")).lower()
+            )
+            if _should_fallback:
+                logger.info(
+                    "DraftStream [%s]: sendMessageDraft unavailable (%s) — switching to message transport",
+                    self._chat_id, type(_draft_err).__name__,
+                )
+                self._use_draft_transport = False
+                return await self._send_or_edit_message(html_text)
+            raise
 
     async def _send_or_edit_message(self, html_text: str) -> bool:
         """Message transport -- sendMessage (first) + editMessageText (subsequent).

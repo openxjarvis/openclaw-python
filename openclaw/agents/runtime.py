@@ -333,10 +333,18 @@ class MultiProviderRuntime:
             return OpenAIProvider(provider_name_override="mistral", **kwargs)
 
         if provider_name == "moonshot":
-            # Standard Moonshot API (international endpoint by default)
-            # For China endpoint, set baseUrl: "https://api.moonshot.cn/v1" in openclaw.json
-            kwargs["base_url"] = kwargs.get("base_url") or "https://api.moonshot.ai/v1"
-            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("MOONSHOT_API_KEY") or os.getenv("KIMI_CODE_API_KEY")
+            # URL selection: MOONSHOT_API_KEY → .cn, KIMI_API_KEY → .ai (matches TS CHANGELOG #68816)
+            moonshot_key = os.getenv("MOONSHOT_API_KEY", "")
+            kimi_key = os.getenv("KIMI_API_KEY", "")
+            effective_key = moonshot_key or kimi_key or os.getenv("KIMI_CODE_API_KEY", "")
+            default_url = (
+                "https://api.moonshot.ai/v1" if (kimi_key and not moonshot_key)
+                else "https://api.moonshot.cn/v1"
+            )
+            kwargs["base_url"] = kwargs.get("base_url") or default_url
+            kwargs["api_key"] = kwargs.get("api_key") or effective_key
+            # supportsDeveloperRole=False — Moonshot uses "user" role for system-level messages
+            kwargs.setdefault("supports_developer_role", False)
             return OpenAIProvider(provider_name_override="moonshot", **kwargs)
 
         if provider_name in ("kimi-coding", "kimi"):

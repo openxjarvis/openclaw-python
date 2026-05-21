@@ -142,6 +142,19 @@ class PiAgentRuntime:
     handlers need no changes.
     """
 
+    # Module-level singleton for the builtin-pi harness to delegate to
+    _global_instance: "PiAgentRuntime | None" = None
+
+    @classmethod
+    def get_instance(cls) -> "PiAgentRuntime | None":
+        """Return the global singleton instance (set at gateway init time)."""
+        return cls._global_instance
+
+    @classmethod
+    def set_instance(cls, instance: "PiAgentRuntime") -> None:
+        """Register the singleton (called from bootstrap)."""
+        cls._global_instance = instance
+
     # Retry loop constants — aligned with TS run.ts
     BASE_RUN_RETRY_ITERATIONS = 24
     RUN_RETRY_ITERATIONS_PER_PROFILE = 8
@@ -1165,6 +1178,15 @@ class PiAgentRuntime:
         stream_callback: Any | None = None,
         streaming_behavior: str | None = None,
         session_workspace: str | None = None,
+        # Draft streaming callbacks (mirrors TS RunEmbeddedPiAgentParams)
+        on_partial_reply: Any | None = None,    # Callable[[str, str], None] — text, runId
+        on_block_reply: Any | None = None,      # Callable[[dict, str], None] — block, runId
+        on_reasoning_stream: Any | None = None,  # Callable[[str], None] — reasoning text
+        # Harness-level integration
+        provider: str | None = None,
+        provider_model_id: str | None = None,
+        abort_signal: Any | None = None,
+        extra_params: dict | None = None,
     ) -> AsyncIterator[Any]:
         """Stream agent events for one conversation turn.
 

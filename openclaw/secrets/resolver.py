@@ -75,6 +75,69 @@ def resolve_secret_ref_value(
     return SecretResolution(ref=ref, error="no resolution strategy matched")
 
 
+def resolve_secrets_resolve(
+    command_name: str,
+    target_ids: list[str],
+    config: Any | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Resolve secrets for gateway ``secrets.resolve`` RPC.
+
+    Mirrors TS ``createSecretsHandlers`` ``secrets.resolve`` return shape.
+    """
+    from .target_registry import is_known_secret_target_id, target_id_matches_path
+
+    diagnostics: list[str] = []
+    inactive_ref_paths: list[str] = []
+
+    if config is None:
+        try:
+            from openclaw.config import load_config
+            config = load_config()
+        except Exception as exc:
+            diagnostics.append(f"config load failed: {exc}")
+            return {
+                "assignments": [],
+                "diagnostics": diagnostics,
+                "inactiveRefPaths": inactive_ref_paths,
+            }
+
+    cleaned = [t.strip() for t in target_ids if isinstance(t, str) and t.strip()]
+    for tid in cleaned:
+        if not is_known_secret_target_id(tid):
+            diagnostics.append(f"unknown target id: {tid}")
+
+    id_set = set(cleaned)
+    all_assignments = resolve_secrets_for_command(config, target_ids=None, env=env)
+
+    assignments: list[dict[str, Any]] = []
+    for a in all_assignments:
+        if not id_set:
+            assignments.append({
+                "path": a.path,
+                "pathSegments": a.path_segments,
+                "value": a.value,
+            })
+            continue
+        for tid in id_set:
+            if target_id_matches_path(tid, a.path):
+                assignments.append({
+                    "path": a.path,
+                    "pathSegments": a.path_segments,
+                    "value": a.value,
+                })
+                break
+
+    if command_name:
+        diagnostics.append(f"command: {command_name}")
+
+    return {
+        "assignments": assignments,
+        "diagnostics": diagnostics,
+        "inactiveRefPaths": inactive_ref_paths,
+    }
+
+
 def resolve_secrets_for_command(
     config: Any,
     target_ids: set[str] | None = None,

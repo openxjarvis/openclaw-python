@@ -45,6 +45,7 @@ _start_time = datetime.now()
 _flags: dict[str, bool] = {}
 _listeners: list[Callable[[str, Any], Any]] = []
 _heartbeat_task: asyncio.Task | None = None
+_event_seq: int = 0
 
 
 def log_webhook_received(channel: str, metadata: dict[str, Any] | None = None) -> None:
@@ -212,10 +213,18 @@ def on_diagnostic_event(listener: Callable[[str, Any], Any]) -> Callable:
 
 
 def _emit(event_type: str, data: dict[str, Any]) -> None:
-    """Emit a diagnostic event"""
+    """Emit a diagnostic event with monotonic seq/ts (mirrors TS enrichDiagnosticEvent)."""
+    global _event_seq
+    _event_seq += 1
+    payload: dict[str, Any] = {
+        "type": event_type,
+        "seq": _event_seq,
+        "ts": int(datetime.now().timestamp() * 1000),
+        **data,
+    }
     for listener in _listeners:
         try:
-            result = listener(event_type, data)
+            result = listener(event_type, payload)
             if asyncio.iscoroutine(result):
                 asyncio.ensure_future(result)
         except Exception as e:

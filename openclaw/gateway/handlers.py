@@ -131,6 +131,10 @@ def _sorted_unique_strings(*values: Any) -> list[str]:
 
 
 def _resolve_node_caller_id(connection: Any) -> str | None:
+    node_id = getattr(connection, "node_id", None)
+    if isinstance(node_id, str) and node_id.strip():
+        return node_id.strip()
+
     auth_ctx = getattr(connection, "auth_context", None)
     device_id = getattr(auth_ctx, "device_id", None)
     if isinstance(device_id, str) and device_id.strip():
@@ -857,7 +861,13 @@ def _parse_identity_md(content: str) -> dict[str, str]:
 
 @register_handler("agent.wait")
 async def handle_agent_wait(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Wait for agent run completion (TS-like status)."""
+    """Wait for agent run completion.
+
+    Mirrors TS agent.wait which uses the waiter-notification system from
+    agent-wait-dedupe.ts.  If the run is already done it returns immediately;
+    otherwise it registers an asyncio.Event waiter and blocks until the run
+    notifies us or the timeout expires.
+    """
     run_id = params.get("runId")
     timeout_ms = int(params.get("timeoutMs", params.get("timeout", 30000)))
     if not run_id:
@@ -867,42 +877,83 @@ async def handle_agent_wait(connection: Any, params: dict[str, Any]) -> dict[str
     if gateway is None:
         return {"runId": run_id, "status": "timeout"}
 
-    # If run already completed, return terminal status snapshot.
-    if hasattr(gateway, "agent_run_status"):
-        done = gateway.agent_run_status.get(run_id)
-        if done:
-            return {
-                "runId": run_id,
-                "status": done.get("status", "ok"),
-                "startedAt": done.get("startedAt"),
-                "endedAt": done.get("endedAt"),
-                "error": done.get("error"),
-            }
+    # -----------------------------------------------------------------------
+    # Fast path: run already completed — return terminal snapshot immediately.
+    # -----------------------------------------------------------------------
+    def _terminal_snapshot() -> dict[str, Any] | None:
+        if hasattr(gateway, "agent_run_status"):
+            done = gateway.agent_run_status.get(run_id)
+            if done:
+                return {
+                    "runId": run_id,
+                    "status": done.get("status", "ok"),
+                    "startedAt": done.get("startedAt"),
+                    "endedAt": done.get("endedAt"),
+                    "error": done.get("error"),
+                }
+        return None
 
-    if not hasattr(gateway, "active_runs"):
-        return {"runId": run_id, "status": "timeout"}
+    snap = _terminal_snapshot()
+    if snap:
+        return snap
 
-    task = gateway.active_runs.get(run_id)
-    if task is None:
-        return {"runId": run_id, "status": "ok"}
+    # -----------------------------------------------------------------------
+    # Wait path: register a waiter event and block until notified or timeout.
+    # Mirrors TS waitForAgentRunTerminal() in agent-wait-dedupe.ts.
+    # -----------------------------------------------------------------------
+    if timeout_ms <= 0:
+        snap = _terminal_snapshot()
+        return snap or {"runId": run_id, "status": "timeout"}
 
+    evt = _add_agent_waiter(run_id)
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=max(0.0, timeout_ms / 1000.0))
-    except asyncio.TimeoutError:
-        return {"runId": run_id, "status": "timeout"}
-    except asyncio.CancelledError:
-        return {"runId": run_id, "status": "aborted"}
-    except Exception as e:
-        return {"runId": run_id, "status": "error", "error": str(e)}
+        timeout_sec = max(0.0, timeout_ms / 1000.0)
 
-    if task.cancelled():
-        return {"runId": run_id, "status": "aborted"}
-    if task.exception():
-        return {"runId": run_id, "status": "error", "error": str(task.exception())}
-    started_at = None
-    if hasattr(gateway, "agent_run_starts"):
-        started_at = gateway.agent_run_starts.get(run_id)
-    return {"runId": run_id, "status": "ok", "startedAt": started_at}
+        # If there's a concrete active task, race the event against the task completing.
+        active_task: asyncio.Task | None = None
+        if hasattr(gateway, "active_runs"):
+            t = gateway.active_runs.get(run_id)
+            if t is not None and hasattr(t, "done"):
+                active_task = t
+
+        try:
+            if active_task is not None and not active_task.done():
+                # Race: event notification OR the task itself finishing
+                evt_waiter = asyncio.ensure_future(evt.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {evt_waiter, active_task},
+                        timeout=timeout_sec,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        evt_waiter.cancel()
+                        snap = _terminal_snapshot()
+                        return snap or {"runId": run_id, "status": "timeout"}
+                    evt_waiter.cancel()
+                except Exception:
+                    evt_waiter.cancel()
+                    raise
+            else:
+                await asyncio.wait_for(evt.wait(), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            snap = _terminal_snapshot()
+            return snap or {"runId": run_id, "status": "timeout"}
+
+        snap = _terminal_snapshot()
+        if snap:
+            return snap
+
+        # Fallback: check active task directly
+        if active_task is not None:
+            if active_task.cancelled():
+                return {"runId": run_id, "status": "aborted"}
+            exc = active_task.exception() if active_task.done() else None
+            if exc:
+                return {"runId": run_id, "status": "error", "error": str(exc)}
+        return {"runId": run_id, "status": "ok"}
+    finally:
+        _remove_agent_waiter(run_id, evt)
 
 
 @register_handler("agents.list")
@@ -1043,10 +1094,17 @@ async def handle_channels_status(connection: Any, params: dict[str, Any]) -> dic
             "channelDefaultAccountId": {},
         }
 
-    # Use get_snapshot() which directly accesses _runtime_envs instead of relying on list_channels()
-    # This ensures we capture all running channels even if registration state is inconsistent
-    snapshot = _channel_registry.get_snapshot()
-    logger.info(f"channels.status: get_snapshot() returned {len(snapshot)} channels: {list(snapshot.keys())}")
+    # Build snapshot dict: prefer get_snapshot(), fall back to get_all_channels()
+    snapshot: dict[str, Any] = {}
+    if hasattr(_channel_registry, "get_snapshot") and callable(_channel_registry.get_snapshot):
+        snapshot = _channel_registry.get_snapshot() or {}
+    elif hasattr(_channel_registry, "get_all_channels") and callable(_channel_registry.get_all_channels):
+        for ch in (_channel_registry.get_all_channels() or []):
+            if isinstance(ch, dict):
+                cid = ch.get("id") or ch.get("channel_id", "")
+                if cid:
+                    snapshot[cid] = ch
+    logger.info(f"channels.status: snapshot returned {len(snapshot)} channels: {list(snapshot.keys())}")
     
     probe = bool(params.get("probe", False))
     timeout_ms = max(1000, int(params.get("timeoutMs", 5000)))
@@ -1230,14 +1288,57 @@ async def handle_config_schema(connection: Any, params: dict[str, Any]) -> dict[
 
 @register_handler("cron.list")
 async def handle_cron_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """List cron jobs — returns { jobs: CronJob[] } matching TypeScript cron.list response."""
+    """List cron jobs with pagination/filter — mirrors TS cron.list."""
+    from openclaw.config.loader import load_config
+    from openclaw.cron.delivery_preview import resolve_cron_delivery_previews
     from openclaw.cron.service import get_cron_service
+
     cron_service = get_cron_service()
     if not cron_service:
-        return {"jobs": []}
-    include_disabled = bool(params.get("includeDisabled", False))
-    jobs = await cron_service.list_jobs(include_disabled=include_disabled)
-    return {"jobs": jobs}
+        return {
+            "jobs": [],
+            "total": 0,
+            "offset": 0,
+            "limit": 50,
+            "hasMore": False,
+            "nextOffset": None,
+            "deliveryPreviews": {},
+        }
+
+    page = await cron_service.list_page(
+        include_disabled=bool(params.get("includeDisabled", False)),
+        limit=params.get("limit"),
+        offset=int(params.get("offset") or 0),
+        query=params.get("query"),
+        enabled=params.get("enabled"),
+        sort_by=params.get("sortBy") or "nextRunAtMs",
+        sort_dir=params.get("sortDir") or "asc",
+    )
+
+    preview_jobs = []
+    for job_dict in page.get("jobs", []):
+        job_id = job_dict.get("id")
+        if isinstance(job_id, str):
+            job = cron_service.get_job(job_id)
+            if job:
+                preview_jobs.append(job)
+
+    cfg = load_config()
+    delivery_previews = await resolve_cron_delivery_previews(
+        cfg=cfg,
+        default_agent_id=cron_service.default_agent_id,
+        jobs=preview_jobs,
+    )
+
+    return {
+        "jobs": page.get("jobs", []),
+        "total": page.get("total", 0),
+        "offset": page.get("offset", 0),
+        "limit": page.get("limit", 50),
+        "hasMore": page.get("hasMore", False),
+        "nextOffset": page.get("nextOffset"),
+        "deliveryPreviews": delivery_previews,
+    }
 
 
 @register_handler("cron.status")
@@ -1285,6 +1386,14 @@ async def handle_cron_add(connection: Any, params: dict[str, Any]) -> dict[str, 
     # Run normalization (applies defaults, infers sessionTarget, delivery, stagger, etc.)
     job_data = normalize_cron_job_create(raw_job) or {}
 
+    from openclaw.cron.normalize import validate_schedule_timestamp
+
+    schedule = job_data.get("schedule")
+    if schedule:
+        ts_error = validate_schedule_timestamp(schedule)
+        if ts_error:
+            raise ValueError(ts_error)
+
     # Generate id if not provided
     if "id" not in job_data:
         job_data["id"] = str(uuid.uuid4())
@@ -1330,6 +1439,13 @@ async def handle_cron_update(connection: Any, params: dict[str, Any]) -> dict[st
 
     # Normalize patch (no defaults)
     python_patch = normalize_cron_job_patch(raw_patch) or {}
+
+    from openclaw.cron.normalize import validate_schedule_timestamp
+
+    if python_patch.get("schedule"):
+        ts_error = validate_schedule_timestamp(python_patch["schedule"])
+        if ts_error:
+            raise ValueError(ts_error)
 
     # Add updated timestamp
     python_patch["updated_at_ms"] = int(datetime.now(UTC).timestamp() * 1000)
@@ -1389,41 +1505,78 @@ async def handle_cron_run(connection: Any, params: dict[str, Any]) -> dict[str, 
 
 @register_handler("cron.runs")
 async def handle_cron_runs(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """List cron run history (matches TypeScript format)"""
-    from openclaw.cron.service import get_cron_service
+    """List cron run history with pagination — mirrors TS cron.runs."""
+    from openclaw.cron.run_log import (
+        read_cron_run_log_entries_page,
+        read_cron_run_log_entries_page_all,
+        resolve_cron_run_log_path,
+    )
     from openclaw.cron.serialization import convert_run_log_entry_to_api
-    
-    # Accept both "id" (frontend) and "jobId" (legacy)
-    job_id = params.get("id") or params.get("jobId")
-    limit = params.get("limit", 50)
+    from openclaw.cron.service import get_cron_service
 
-    if not job_id:
-        return {"entries": []}
-    
-    # Get cron service from gateway
     cron_service = get_cron_service()
-    if not cron_service:
-        logger.warning("Cron service not available")
-        return {"entries": []}
-    
+    empty_page = {
+        "entries": [],
+        "total": 0,
+        "offset": 0,
+        "limit": int(params.get("limit") or 50),
+        "hasMore": False,
+        "nextOffset": None,
+    }
+    if not cron_service or not cron_service.store_path:
+        return empty_page
+
+    job_id = params.get("id") or params.get("jobId")
+    explicit_scope = params.get("scope")
+    scope = explicit_scope if explicit_scope in ("job", "all") else ("job" if job_id else "all")
+
+    if scope == "job" and not job_id:
+        raise ValueError("invalid cron.runs params: missing id")
+
+    page_opts = {
+        "limit": params.get("limit"),
+        "offset": int(params.get("offset") or 0),
+        "statuses": params.get("statuses"),
+        "status": params.get("status"),
+        "delivery_statuses": params.get("deliveryStatuses"),
+        "delivery_status": params.get("deliveryStatus"),
+        "query": params.get("query"),
+        "sort_dir": params.get("sortDir"),
+    }
+
     try:
-        from openclaw.cron.store import CronRunLog
-        
-        # Read run log for the job (arg order: log_dir, job_id)
-        # CronService uses _store_path internally, not store.store_path
-        state_dir = resolve_state_dir()
-        cron_dir = state_dir / "cron"
-        run_log_dir = cron_dir / "runs"
-        run_log = CronRunLog(run_log_dir, job_id)
-        entries = run_log.read(limit=limit)
-        
-        # Convert to TypeScript API format
-        api_entries = [convert_run_log_entry_to_api(entry) for entry in entries]
-        
-        return {"entries": api_entries}
+        if scope == "all":
+            jobs = await cron_service.list_jobs(include_disabled=True)
+            job_name_by_id = {
+                j["id"]: j["name"]
+                for j in jobs
+                if isinstance(j.get("id"), str) and isinstance(j.get("name"), str)
+            }
+            page = read_cron_run_log_entries_page_all(
+                store_path=cron_service.store_path,
+                job_name_by_id=job_name_by_id,
+                **page_opts,
+            )
+        else:
+            log_path = resolve_cron_run_log_path(
+                store_path=cron_service.store_path,
+                job_id=str(job_id),
+            )
+            page = read_cron_run_log_entries_page(
+                log_path,
+                job_id=str(job_id),
+                **page_opts,
+            )
+    except ValueError as exc:
+        raise ValueError("invalid cron.runs params: invalid id") from exc
     except Exception as e:
-        logger.error(f"Failed to read cron runs: {e}", exc_info=True)
-        return {"entries": []}
+        logger.error("Failed to read cron runs: %s", e, exc_info=True)
+        return empty_page
+
+    page["entries"] = [
+        convert_run_log_entry_to_api(entry) for entry in page.get("entries", [])
+    ]
+    return page
 
 
 @register_handler("device.pair.list")
@@ -1751,132 +1904,19 @@ def resolve_log_file(file_path: Path) -> Path:
 
 @register_handler("logs.tail")
 async def handle_logs_tail(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Tail gateway logs - mirrors TS logs.tail handler
-    
-    Returns log lines with cursor-based pagination matching TS format:
-    {
-        "cursor": number,
-        "size": number,
-        "lines": string[],
-        "truncated": boolean,
-        "reset": boolean,
-        "file": string
-    }
-    """
-    from pathlib import Path
-    import os
-    
-    # Default values (mirrors TS constants)
-    DEFAULT_LIMIT = 500
-    DEFAULT_MAX_BYTES = 250_000
-    MAX_LIMIT = 5000
-    MAX_BYTES = 1_000_000
-    
-    # Parse params
+    """Tail gateway logs — mirrors TS logs.tail via readConfiguredLogTail."""
+    from openclaw.logging.log_tail import read_configured_log_tail
+
     cursor_param = params.get("cursor")
-    limit = min(params.get("limit", DEFAULT_LIMIT), MAX_LIMIT)
-    max_bytes = min(params.get("maxBytes", DEFAULT_MAX_BYTES), MAX_BYTES)
-    
-    # Resolve log file with rolling log support
-    # Use daily rolling log files in ~/.openclaw/tmp/openclaw-YYYY-MM-DD.log (matches TS)
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    state_dir = resolve_state_dir()
-    log_dir = state_dir / "tmp"
-    log_file = log_dir / f"openclaw-{date_str}.log"
-    log_file = resolve_log_file(log_file)
-    
-    # Check if file exists
-    if not log_file.exists():
-        return {
-            "cursor": 0,
-            "size": 0,
-            "lines": [],
-            "truncated": False,
-            "reset": False,
-            "file": str(log_file)
-        }
-    
-    # Get file size
-    size = log_file.stat().st_size
-    
-    # Determine read position
-    cursor = None
-    if isinstance(cursor_param, (int, float)):
-        cursor = max(0, int(cursor_param))
-    
-    reset = False
-    truncated = False
-    start = 0
-    
-    if cursor is not None:
-        if cursor > size:
-            # File was truncated/rotated
-            reset = True
-            start = max(0, size - max_bytes)
-            truncated = start > 0
-        else:
-            start = cursor
-            if size - start > max_bytes:
-                # Too much data since last read
-                reset = True
-                truncated = True
-                start = max(0, size - max_bytes)
-    else:
-        # Initial read - get tail
-        start = max(0, size - max_bytes)
-        truncated = start > 0
-    
-    # Read file slice
-    if size == 0 or size <= start:
-        return {
-            "cursor": size,
-            "size": size,
-            "lines": [],
-            "truncated": truncated,
-            "reset": reset,
-            "file": str(log_file)
-        }
-    
-    lines = []
+    cursor = int(cursor_param) if isinstance(cursor_param, (int, float)) else None
     try:
-        with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
-            # Check if we need to skip partial line at start
-            prefix = ""
-            if start > 0:
-                f.seek(start - 1)
-                prefix = f.read(1)
-            
-            # Read from start position
-            f.seek(start)
-            length = size - start
-            text = f.read(length)
-            
-            # Split into lines
-            lines = text.split('\n')
-            
-            # Remove partial first line if we started mid-file
-            if start > 0 and prefix != '\n':
-                lines = lines[1:]
-            
-            # Remove trailing empty line
-            if lines and lines[-1] == '':
-                lines = lines[:-1]
-            
-            # Limit number of lines
-            if len(lines) > limit:
-                lines = lines[-limit:]
-    
-    except Exception as e:
-        raise RuntimeError(f"log read failed: {e}")
-    
-    return {
-        "cursor": size,
-        "size": size,
-        "lines": lines,
-        "truncated": truncated,
-        "reset": reset,
-        "file": str(log_file)
-    }
+        return await read_configured_log_tail(
+            cursor=cursor,
+            limit=params.get("limit"),
+            max_bytes=params.get("maxBytes"),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"log read failed: {exc}") from exc
 
 
 @register_handler("models.list")
@@ -2216,121 +2256,208 @@ async def handle_skills_status(connection: Any, params: dict[str, Any]) -> dict[
         list_agent_ids,
     )
     from openclaw.routing.session_key import normalize_agent_id
-    
-    # Resolve agent ID (mirrors TS logic lines 71-82)
+    from openclaw.infra.skills_remote import (
+        can_exec_request_node,
+        get_remote_skill_eligibility,
+        sync_remote_nodes_from_registry,
+    )
+
     cfg = load_config()
     agent_id_raw = params.get("agentId", "").strip() if params.get("agentId") else ""
     agent_id = normalize_agent_id(agent_id_raw) if agent_id_raw else resolve_default_agent_id(cfg)
-    
-    # Validate agent exists if specified
+
     if agent_id_raw:
         known_agents = list_agent_ids(cfg)
         if agent_id not in known_agents:
             raise ValueError(f'unknown agent id "{agent_id_raw}"')
-    
-    # Resolve workspace directory for the agent (mirrors TS line 84)
+
     workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
-    
-    # Build config dict for skills status
-    config_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
-    
-    # Resolve bundled skills directory (mirrors TS line 87)
+    config_dict = cfg.model_dump() if hasattr(cfg, "model_dump") else (cfg if isinstance(cfg, dict) else {})
+
+    registry = _node_registry
+    if registry is None and getattr(connection, "gateway", None) is not None:
+        registry = getattr(connection.gateway, "node_registry", None)
+    sync_remote_nodes_from_registry(registry)
+
+    remote = get_remote_skill_eligibility(
+        advertise_exec_node=can_exec_request_node(config_dict, agent_id),
+    )
+    eligibility = {"remote": remote} if remote else None
+
     bundled_skills_dir = resolve_bundled_skills_dir()
-    
-    # Build and return skill status report (mirrors TS lines 85-89)
     return build_workspace_skill_status(
         workspace_dir,
         config=config_dict,
-        bundled_skills_dir=bundled_skills_dir
+        bundled_skills_dir=bundled_skills_dir,
+        eligibility=eligibility,
     )
 
 
 @register_handler("skills.install")
 async def handle_skills_install(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Install a skill's dependencies - mirrors TS skills.install handler"""
+    """Install skill deps or ClawHub skill — mirrors TS skills.install handler."""
     from openclaw.config.loader import load_config
     from openclaw.agents.agent_scope import resolve_agent_workspace_dir, resolve_default_agent_id
     from openclaw.agents.skills.workspace import load_workspace_skill_entries
     from openclaw.agents.skills.installer import install_skill_dependencies
-    
+    from openclaw.agents.skills_clawhub import install_skill_from_clawhub
+    from openclaw.security.install_security_scan import scan_skill_install_source
+    from pathlib import Path
+
+    cfg = load_config()
+    workspace_dir_raw = resolve_agent_workspace_dir(cfg, resolve_default_agent_id(cfg))
+
+    if params.get("source") == "clawhub":
+        slug = params.get("slug", "")
+        result = await install_skill_from_clawhub(
+            workspace_dir=str(workspace_dir_raw),
+            slug=str(slug),
+            version=params.get("version"),
+            force=bool(params.get("force")),
+        )
+        if result.get("ok"):
+            return {
+                "ok": True,
+                "message": f"Installed {result['slug']}@{result['version']}",
+                "stdout": "",
+                "stderr": "",
+                "code": 0,
+                "slug": result["slug"],
+                "version": result["version"],
+                "targetDir": result["targetDir"],
+            }
+        return {"ok": False, "error": result.get("error", "install failed")}
+
     skill_name = params.get("name", "")
     install_id = params.get("installId", "")
-    timeout_ms = params.get("timeoutMs")
-    
+    dangerously_force = bool(params.get("dangerouslyForceUnsafeInstall"))
+
     try:
-        # Resolve workspace for default agent (mirrors TS line 132)
-        cfg = load_config()
-        workspace_dir_raw = resolve_agent_workspace_dir(cfg, resolve_default_agent_id(cfg))
-        
-        config_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
-        
+        config_dict = cfg.model_dump() if hasattr(cfg, "model_dump") else {}
         entries = load_workspace_skill_entries(str(workspace_dir_raw), config_dict)
-        target = next(
-            (e for e in entries if e.skill.name == skill_name),
-            None,
-        )
+        target = next((e for e in entries if e.skill.name == skill_name), None)
         if target is None:
             return {
                 "ok": False,
-                "message": f"Skill '{skill_name}' not found",
-                "name": skill_name,
-                "installed": False
+                "message": f"Skill not found: {skill_name}",
+                "stdout": "",
+                "stderr": "",
+                "code": None,
             }
-        
+
+        source = getattr(target.skill, "source", "unknown")
+        base_dir = Path(getattr(target.skill, "base_dir", None) or getattr(target.skill, "location", "") or ".").parent
+        if not base_dir.is_dir():
+            base_dir = Path(str(workspace_dir_raw)) / "skills" / skill_name
+
+        scan = await scan_skill_install_source(
+            skill_name=skill_name,
+            source_dir=str(base_dir.resolve()),
+            origin=str(source),
+            install_id=str(install_id),
+            dangerously_force_unsafe_install=dangerously_force,
+        )
+        if scan and scan.get("blocked"):
+            return {
+                "ok": False,
+                "message": scan["blocked"].get("reason", "security scan blocked install"),
+                "stdout": "",
+                "stderr": "",
+                "code": None,
+            }
+
         install_specs = getattr(getattr(target.skill, "metadata", None), "install", None) or []
+        if install_id:
+            filtered = []
+            for i, spec in enumerate(install_specs):
+                spec_id = getattr(spec, "id", None) or f"{getattr(spec, 'kind', 'install')}-{i}"
+                if spec_id == install_id:
+                    filtered.append(spec)
+            install_specs = filtered
+            if not install_specs:
+                return {
+                    "ok": False,
+                    "message": f"Installer not found: {install_id}",
+                    "stdout": "",
+                    "stderr": "",
+                    "code": None,
+                }
+
         success, errors = await install_skill_dependencies(target.skill, install_specs)
-        
+        message = "Installation complete" if success else f"Installation failed: {', '.join(errors)}"
         return {
             "ok": success,
-            "message": "Installation complete" if success else f"Installation failed: {', '.join(errors)}",
-            "name": skill_name,
-            "installed": success,
-            "errors": errors
+            "message": message,
+            "stdout": "",
+            "stderr": "\n".join(errors) if errors else "",
+            "code": 0 if success else None,
         }
     except Exception as exc:
         logger.error("skills.install error: %s", exc, exc_info=True)
         return {
             "ok": False,
             "message": str(exc),
-            "name": skill_name,
-            "installed": False,
-            "error": str(exc)
+            "stdout": "",
+            "stderr": "",
+            "code": None,
         }
 
 
 @register_handler("skills.update")
 async def handle_skills_update(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Update skill configuration - mirrors TS skills.update handler"""
+    """Update skill config or ClawHub installs — mirrors TS skills.update handler."""
     from openclaw.config.loader import load_config, write_config_file
+    from openclaw.agents.agent_scope import resolve_agent_workspace_dir, resolve_default_agent_id
+    from openclaw.agents.skills_clawhub import update_skills_from_clawhub
     import copy
-    
+
+    if params.get("source") == "clawhub":
+        slug = params.get("slug")
+        update_all = bool(params.get("all"))
+        if not slug and not update_all:
+            raise ValueError('clawhub skills.update requires "slug" or "all"')
+        if slug and update_all:
+            raise ValueError('clawhub skills.update accepts either "slug" or "all", not both')
+
+        cfg = load_config()
+        workspace_dir = resolve_agent_workspace_dir(cfg, resolve_default_agent_id(cfg))
+        results = await update_skills_from_clawhub(
+            workspace_dir=str(workspace_dir),
+            slug=str(slug) if slug else None,
+        )
+        errors = [r for r in results if not r.get("ok")]
+        return {
+            "ok": len(errors) == 0,
+            "skillKey": slug if slug else "*",
+            "config": {
+                "source": "clawhub",
+                "results": results,
+            },
+            **({"error": "; ".join(str(r.get("error", "")) for r in errors)} if errors else {}),
+        }
+
     skill_key = params.get("skillKey", "")
     enabled = params.get("enabled")
     api_key = params.get("apiKey")
     env = params.get("env")
-    
+
     try:
         cfg = load_config()
-        
-        # Get current skills config (mirrors TS lines 165-167)
-        cfg_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
+        cfg_dict = cfg.model_dump() if hasattr(cfg, "model_dump") else {}
         skills = copy.deepcopy(cfg_dict.get("skills") or {})
         entries = copy.deepcopy(skills.get("entries") or {})
         current = copy.deepcopy(entries.get(skill_key) or {})
-        
-        # Update enabled flag (mirrors TS lines 168-170)
+
         if isinstance(enabled, bool):
             current["enabled"] = enabled
-        
-        # Update apiKey (mirrors TS lines 171-177)
+
         if isinstance(api_key, str):
             trimmed = api_key.strip()
             if trimmed:
                 current["apiKey"] = trimmed
             elif "apiKey" in current:
                 del current["apiKey"]
-        
-        # Update env vars (mirrors TS lines 179-193)
+
         if env and isinstance(env, dict):
             next_env = copy.deepcopy(current.get("env", {}))
             for key, value in env.items():
@@ -2343,19 +2470,16 @@ async def handle_skills_update(connection: Any, params: dict[str, Any]) -> dict[
                 else:
                     next_env[trimmed_key] = trimmed_val
             current["env"] = next_env
-        
-        # Write updated config (mirrors TS lines 195-201)
+
         entries[skill_key] = current
         skills["entries"] = entries
         cfg_dict["skills"] = skills
-        
         write_config_file(cfg_dict)
-        
-        # Bump skills snapshot version (for refresh detection)
+
         from openclaw.agents.skills.refresh import bump_skills_snapshot_version
         bump_skills_snapshot_version()
-        
-        return {"ok": True, "updated": True, "skillKey": skill_key, "config": current}
+
+        return {"ok": True, "skillKey": skill_key, "config": current}
     except Exception as exc:
         logger.error("skills.update error: %s", exc, exc_info=True)
         return {"ok": False, "skillKey": skill_key, "error": str(exc)}
@@ -2381,36 +2505,62 @@ async def handle_talk(connection: Any, params: dict[str, Any]) -> dict[str, Any]
 
 @register_handler("tts.status")
 async def handle_tts_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get TTS status"""
-    return {"enabled": False, "provider": None}
+    from openclaw.gateway.voice_gateway import handle_tts_status as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("tts.enable")
 async def handle_tts_enable(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Enable TTS"""
-    return {"enabled": True}
+    from openclaw.gateway.voice_gateway import handle_tts_enable as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("tts.disable")
 async def handle_tts_disable(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Disable TTS"""
-    return {"enabled": False}
+    from openclaw.gateway.voice_gateway import handle_tts_disable as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("tts.convert")
 async def handle_tts_convert(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Convert text to speech"""
-    text = params.get("text", "")
-    return {"text": text, "status": "queued"}
+    from openclaw.gateway.voice_gateway import handle_tts_convert as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("tts.providers")
-async def handle_tts_providers(connection: Any, params: dict[str, Any]) -> list[dict[str, Any]]:
-    """List TTS providers"""
-    return [
-        {"name": "openai", "available": True},
-        {"name": "elevenlabs", "available": False},
-    ]
+async def handle_tts_providers(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    from openclaw.gateway.voice_gateway import _get_cfg_dict
+    from openclaw.tts.provider_registry import (
+        get_resolved_speech_provider_config,
+        list_speech_providers,
+    )
+    from openclaw.tts.tts import get_tts_provider, resolve_tts_config, resolve_tts_prefs_path
+
+    cfg = _get_cfg_dict(connection)
+    config = resolve_tts_config(cfg)
+    prefs_path = resolve_tts_prefs_path(config)
+    raw = config.get("rawConfig") or {}
+    return {
+        "providers": [
+            {
+                "id": p.id,
+                "name": p.label,
+                "configured": p.is_configured(
+                    cfg=cfg,
+                    provider_config=get_resolved_speech_provider_config(raw, p.id, cfg),
+                    timeout_ms=config.get("timeoutMs") or 30_000,
+                ),
+                "models": list(p.models),
+                "voices": list(p.voices),
+            }
+            for p in list_speech_providers(cfg)
+        ],
+        "active": get_tts_provider(config, prefs_path),
+    }
 
 
 @register_handler("update.run")
@@ -2433,16 +2583,16 @@ async def handle_usage_cost(connection: Any, params: dict[str, Any]) -> dict[str
 
 @register_handler("voicewake.get")
 async def handle_voicewake_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get voice wake status"""
-    return {"enabled": False, "keyword": None}
+    from openclaw.gateway.voice_gateway import handle_voicewake_get as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("voicewake.set")
 async def handle_voicewake_set(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Set voice wake configuration"""
-    enabled = params.get("enabled", False)
-    keyword = params.get("keyword")
-    return {"enabled": enabled, "keyword": keyword}
+    from openclaw.gateway.voice_gateway import handle_voicewake_set as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("web.login.start")
@@ -2474,11 +2624,15 @@ async def handle_wizard_start(connection: Any, params: dict[str, Any]) -> dict[s
     if _wizard_handler:
         return await _wizard_handler.wizard_start(params)
 
-    mode = params.get("mode", "quickstart")
-    workspace = params.get("workspace")
+    from .wizard_rpc import resolve_wizard_start_params
 
-    if not isinstance(mode, str) or mode not in ("quickstart", "advanced", "manual", "local", "remote"):
-        return {"error": "invalid mode"}
+    resolved = resolve_wizard_start_params(params)
+    if "error" in resolved:
+        return resolved
+
+    flow = resolved["flow"]
+    gateway_mode = resolved["gateway_mode"]
+    workspace = resolved["workspace"]
 
     running_id = _find_running_wizard()
     if running_id:
@@ -2489,7 +2643,11 @@ async def handle_wizard_start(connection: Any, params: dict[str, Any]) -> dict[s
 
     async def _runner(prompter):
         from ..wizard.onboarding import run_onboarding_wizard
-        await run_onboarding_wizard(flow=mode, workspace_dir=workspace)
+        await run_onboarding_wizard(
+            flow=flow,
+            mode=gateway_mode,
+            workspace_dir=workspace,
+        )
 
     try:
         session_id = str(uuid.uuid4())
@@ -2607,16 +2765,16 @@ async def handle_talk_mode_set(connection: Any, params: dict[str, Any]) -> dict[
 
 @register_handler("talk.mode")
 async def handle_talk_mode(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Combined talk.mode endpoint (TS-compatible shim)."""
-    if any(k in params for k in ("enabled", "provider", "model", "language")):
-        return await handle_talk_mode_set(connection, params)
-    return await handle_talk_mode_get(connection, params)
+    from openclaw.gateway.voice_gateway import handle_talk_mode as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("talk.config")
 async def handle_talk_config(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Alias for talk mode configuration."""
-    return await handle_talk_mode(connection, params)
+    from openclaw.gateway.voice_gateway import handle_talk_config as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("system-event")
@@ -2663,9 +2821,9 @@ async def handle_skills_bins(connection: Any, params: dict[str, Any]) -> dict[st
 
 @register_handler("tts.setProvider")
 async def handle_tts_set_provider(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Set TTS provider (TS-compatible endpoint)."""
-    provider = params.get("provider")
-    return {"ok": True, "provider": provider}
+    from openclaw.gateway.voice_gateway import handle_tts_set_provider as _impl
+
+    return await _impl(connection, params)
 
 
 @register_handler("exec.approvals.node.get")
@@ -2983,13 +3141,34 @@ async def handle_last_heartbeat(connection: Any, params: dict[str, Any]) -> dict
 
 @register_handler("wake")
 async def handle_wake(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Trigger wake event."""
-    return {"ok": True, "woke": True}
+    """Trigger cron wake / heartbeat — mirrors TS wake handler."""
+    from openclaw.cron.service import get_cron_service
+
+    mode = params.get("mode")
+    if mode not in ("now", "next-heartbeat"):
+        raise ValueError("invalid wake params: mode must be 'now' or 'next-heartbeat'")
+
+    text = params.get("text")
+    if not isinstance(text, str):
+        raise ValueError("invalid wake params: text is required")
+
+    cron_service = get_cron_service()
+    if not cron_service:
+        return {"ok": False}
+
+    return cron_service.wake(text=text, mode=mode)
 
 
 @register_handler("agents.create")
 async def handle_agents_create(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Create agent (full implementation mirroring TS agents.create)"""
+    try:
+        return await _handle_agents_create_impl(connection, params)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+async def _handle_agents_create_impl(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     from pathlib import Path
     from openclaw.routing.session_key import normalize_agent_id
     from openclaw.commands.agents_config import apply_agent_config, find_agent_entry_index
@@ -3000,12 +3179,12 @@ async def handle_agents_create(connection: Any, params: dict[str, Any]) -> dict[
     from openclaw.agents.ensure_workspace_and_sessions import ensure_workspace_and_sessions
     from openclaw.config.loader import write_config_file
     
-    # Validate required params
-    raw_name = str(params.get("name", "")).strip()
+    # Validate required params — name defaults to id if not provided
+    raw_name = str(params.get("name") or params.get("id", "")).strip()
     if not raw_name:
         raise ValueError("name is required")
     
-    agent_id = normalize_agent_id(raw_name)
+    agent_id = str(params.get("id", "")).strip() or normalize_agent_id(raw_name)
     
     # Check if agent already exists
     cfg = _get_current_config()
@@ -3032,7 +3211,7 @@ async def handle_agents_create(connection: Any, params: dict[str, Any]) -> dict[
         cfg,
         agent_id=agent_id,
         name=raw_name,
-        workspace=workspace_dir,
+        workspace=str(workspace_dir) if workspace_dir else None,
     )
     
     # Resolve agentDir
@@ -3829,35 +4008,29 @@ async def handle_doctor_memory_status(connection: Any, params: dict[str, Any]) -
 
     Returns embedding availability, provider info, and connection health.
     """
-    from pathlib import Path as _Path
-
-    agent_id = "default"
     try:
-        from openclaw.config.loader import load_config as _lc_doc
-        cfg = _lc_doc()
-        if cfg:
-            cfg_dict = cfg if isinstance(cfg, dict) else (cfg.model_dump() if hasattr(cfg, "model_dump") else {})
-            agents_cfg = cfg_dict.get("agents", {}) or {}
-            agent_id = agents_cfg.get("defaultId") or agents_cfg.get("default_id") or "default"
-    except Exception:
-        cfg = None
-
-    try:
-        state_dir = _Path.home() / ".openclaw" / "state"
-        workspace_dir = state_dir / "agents" / agent_id
+        cfg, agent_id, workspace_dir = _resolve_doctor_memory_context(
+            params if isinstance(params, dict) else {}
+        )
 
         from openclaw.memory.manager import get_memory_search_manager
-        manager = await get_memory_search_manager(workspace_dir, config=cfg, agent_id=agent_id)
+        manager = await get_memory_search_manager(
+            workspace_dir, config=cfg, agent_id=agent_id
+        )
 
         status = manager.status()
         embedding = await manager.probe_embedding_availability()
 
+        from openclaw.memory.dreaming import build_dreaming_status_payload, load_dreaming_store_stats
+
+        store_stats = await load_dreaming_store_stats(workspace_dir)
         payload = {
             "agentId": agent_id,
             "provider": status.provider,
             "embedding": {
                 "ok": embedding.ok,
             },
+            "dreaming": build_dreaming_status_payload(cfg, store_stats),
         }
         if embedding.error:
             payload["embedding"]["error"] = embedding.error
@@ -3867,6 +4040,13 @@ async def handle_doctor_memory_status(connection: Any, params: dict[str, Any]) -
         return {"ok": True, **payload}
 
     except Exception as e:
+        agent_id = "default"
+        try:
+            _, agent_id, _ = _resolve_doctor_memory_context(
+                params if isinstance(params, dict) else {}
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "agentId": agent_id,
@@ -3879,8 +4059,34 @@ async def handle_doctor_memory_status(connection: Any, params: dict[str, Any]) -
 
 @register_handler("node.canvas.capability.refresh")
 async def handle_node_canvas_capability_refresh(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Refresh canvas capability detection on a node."""
-    return {"ok": True, "refreshed": True}
+    """Rotate scoped canvas capability token for the connected node session."""
+    from openclaw.gateway.canvas_capability import (
+        CANVAS_CAPABILITY_TTL_MS,
+        build_canvas_scoped_host_url,
+        mint_canvas_capability_token,
+    )
+    from openclaw.gateway.error_codes import UnavailableError
+
+    base_canvas_host_url = getattr(connection, "canvas_host_url", None) or ""
+    if not isinstance(base_canvas_host_url, str) or not base_canvas_host_url.strip():
+        raise UnavailableError("canvas host unavailable for this node session")
+
+    canvas_capability = mint_canvas_capability_token()
+    import time
+
+    canvas_capability_expires_at_ms = int(time.time() * 1000) + CANVAS_CAPABILITY_TTL_MS
+    scoped_canvas_host_url = build_canvas_scoped_host_url(base_canvas_host_url.strip(), canvas_capability)
+    if not scoped_canvas_host_url:
+        raise UnavailableError("failed to mint scoped canvas host URL")
+
+    connection.canvas_capability = canvas_capability
+    connection.canvas_capability_expires_at_ms = canvas_capability_expires_at_ms
+
+    return {
+        "canvasCapability": canvas_capability,
+        "canvasCapabilityExpiresAtMs": canvas_capability_expires_at_ms,
+        "canvasHostUrl": scoped_canvas_host_url,
+    }
 
 
 @register_handler("secrets.reload")
@@ -3914,25 +4120,31 @@ async def handle_secrets_resolve(connection: Any, params: dict[str, Any]) -> dic
     command_name = command_name.strip()
     cleaned_ids = [t.strip() for t in target_ids if isinstance(t, str) and t.strip()]
 
+    from openclaw.secrets.target_registry import is_known_secret_target_id
+    from openclaw.secrets.resolver import resolve_secrets_resolve
+
+    for tid in cleaned_ids:
+        if not is_known_secret_target_id(tid):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": f'invalid secrets.resolve params: unknown target id "{tid}"',
+                },
+            }
+
     try:
-        from openclaw.secrets.resolver import resolve_secrets_for_command
-        result = await resolve_secrets_for_command(
+        cfg = _get_current_config()
+        result = resolve_secrets_resolve(
             command_name=command_name,
             target_ids=cleaned_ids,
+            config=cfg,
         )
         return {
             "ok": True,
             "assignments": result.get("assignments", []),
             "diagnostics": result.get("diagnostics", []),
             "inactiveRefPaths": result.get("inactiveRefPaths", []),
-        }
-    except ImportError:
-        # Secrets resolver not yet implemented — return empty assignments
-        return {
-            "ok": True,
-            "assignments": [],
-            "diagnostics": [],
-            "inactiveRefPaths": [],
         }
     except Exception as exc:
         return {
@@ -4073,6 +4285,910 @@ async def handle_tools_catalog(connection: Any, params: dict[str, Any]) -> dict[
             pass
 
     return {"ok": True, "agentId": agent_id, "profiles": PROFILE_OPTIONS, "groups": groups}
+
+
+# =============================================================================
+# Module 4: Missing Gateway RPC methods (TS BASE_METHODS parity)
+# =============================================================================
+
+# ── Session Subscription ──────────────────────────────────────────────────────
+
+@register_handler("sessions.subscribe")
+async def handle_sessions_subscribe(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Subscribe connection to all session events (sessions.changed + session.message).
+
+    Mirrors TS sessions.subscribe in BASE_METHODS.
+    """
+    gateway = getattr(connection, "gateway", None)
+    if gateway and hasattr(gateway, "_session_event_subscribers"):
+        conn_id = getattr(connection, "conn_id", None)
+        if conn_id:
+            gateway._session_event_subscribers.add(conn_id)
+    return {"ok": True}
+
+
+@register_handler("sessions.unsubscribe")
+async def handle_sessions_unsubscribe(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Unsubscribe connection from session events."""
+    gateway = getattr(connection, "gateway", None)
+    if gateway and hasattr(gateway, "_session_event_subscribers"):
+        conn_id = getattr(connection, "conn_id", None)
+        if conn_id:
+            gateway._session_event_subscribers.remove(conn_id)
+    return {"ok": True}
+
+
+@register_handler("sessions.messages.subscribe")
+async def handle_sessions_messages_subscribe(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Subscribe connection to messages for a specific session.
+
+    Mirrors TS sessions.messages.subscribe in BASE_METHODS.
+    params: { sessionKey: str }
+    """
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    if not session_key:
+        return {"ok": False, "error": "sessionKey required"}
+    gateway = getattr(connection, "gateway", None)
+    if gateway and hasattr(gateway, "_session_message_subscribers"):
+        conn_id = getattr(connection, "conn_id", None)
+        if conn_id:
+            gateway._session_message_subscribers.subscribe(conn_id, session_key)
+    return {"ok": True}
+
+
+@register_handler("sessions.messages.unsubscribe")
+async def handle_sessions_messages_unsubscribe(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Unsubscribe connection from messages for a specific session."""
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    gateway = getattr(connection, "gateway", None)
+    if gateway and hasattr(gateway, "_session_message_subscribers"):
+        conn_id = getattr(connection, "conn_id", None)
+        if conn_id and session_key:
+            gateway._session_message_subscribers.unsubscribe(conn_id, session_key)
+    return {"ok": True}
+
+
+# ── Session Compaction ────────────────────────────────────────────────────────
+
+@register_handler("sessions.compaction.list")
+async def handle_sessions_compaction_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """List compaction checkpoints for a session."""
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    try:
+        from openclaw.agents.compaction.store import list_compaction_checkpoints
+        checkpoints = await list_compaction_checkpoints(session_key)
+        return {"ok": True, "checkpoints": checkpoints}
+    except Exception as exc:
+        return {"ok": True, "checkpoints": [], "_note": str(exc)}
+
+
+@register_handler("sessions.compaction.get")
+async def handle_sessions_compaction_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Get a specific compaction checkpoint."""
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    checkpoint_id = params.get("checkpointId") or params.get("checkpoint_id", "")
+    try:
+        from openclaw.agents.compaction.store import get_compaction_checkpoint
+        checkpoint = await get_compaction_checkpoint(session_key, checkpoint_id)
+        return {"ok": True, "checkpoint": checkpoint}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("sessions.compaction.branch")
+async def handle_sessions_compaction_branch(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Branch from a compaction checkpoint."""
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    checkpoint_id = params.get("checkpointId") or params.get("checkpoint_id", "")
+    try:
+        from openclaw.agents.compaction.store import branch_compaction_checkpoint
+        new_session_key = await branch_compaction_checkpoint(session_key, checkpoint_id)
+        return {"ok": True, "sessionKey": new_session_key}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("sessions.compaction.restore")
+async def handle_sessions_compaction_restore(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Restore session to a compaction checkpoint."""
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    checkpoint_id = params.get("checkpointId") or params.get("checkpoint_id", "")
+    try:
+        from openclaw.agents.compaction.store import restore_compaction_checkpoint
+        await restore_compaction_checkpoint(session_key, checkpoint_id)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ── Models Auth Status ────────────────────────────────────────────────────────
+
+@register_handler("models.authStatus")
+async def handle_models_auth_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Return auth status for each configured provider.
+
+    Mirrors TS models.authStatus in BASE_METHODS.
+    """
+    statuses: list[dict[str, Any]] = []
+    import os
+    provider_env_keys = [
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openai", "OPENAI_API_KEY"),
+        ("google", "GOOGLE_API_KEY"),
+        ("moonshot", "MOONSHOT_API_KEY"),
+        ("github-copilot", "GITHUB_COPILOT_TOKEN"),
+        ("bedrock", "AWS_ACCESS_KEY_ID"),
+        ("ollama", "OLLAMA_HOST"),
+        ("azure-openai", "AZURE_OPENAI_API_KEY"),
+    ]
+    for provider_id, env_key in provider_env_keys:
+        val = os.environ.get(env_key, "")
+        statuses.append({
+            "provider": provider_id,
+            "authenticated": bool(val),
+            "envKey": env_key,
+        })
+    return {"ok": True, "statuses": statuses}
+
+
+# ── Tools Effective ───────────────────────────────────────────────────────────
+
+@register_handler("tools.effective")
+async def handle_tools_effective(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Return the effective tool list for a session after policy filtering.
+
+    Mirrors TS tools.effective in BASE_METHODS.
+    """
+    session_key = params.get("sessionKey") or params.get("session_key")
+    try:
+        if _tool_registry:
+            tools = _tool_registry.list_tools() if hasattr(_tool_registry, "list_tools") else list(_tool_registry)
+        else:
+            tools = []
+        return {
+            "ok": True,
+            "tools": [
+                {
+                    "name": getattr(t, "name", str(t)),
+                    "description": getattr(t, "description", ""),
+                }
+                for t in tools
+            ],
+            "sessionKey": session_key,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+
+@register_handler("gateway.identity.get")
+async def handle_gateway_identity_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Return gateway identity (node id, version, features).
+
+    Mirrors TS gateway.identity.get in BASE_METHODS.
+    """
+    import platform
+    gateway = getattr(connection, "gateway", None)
+    node_id = None
+    if gateway and hasattr(gateway, "node_registry"):
+        node_id = getattr(gateway.node_registry, "node_id", None)
+
+    return {
+        "ok": True,
+        "identity": {
+            "nodeId": node_id or "gateway",
+            "platform": platform.system().lower(),
+            "python": platform.python_version(),
+            "features": ["sessions", "tools", "memory", "plugins", "tts"],
+        },
+    }
+
+
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+
+@register_handler("diagnostics.stability")
+async def handle_diagnostics_stability(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Return diagnostic stability snapshot (mirrors TS diagnostics.stability)."""
+    from openclaw.diagnostics.stability import (
+        get_diagnostic_stability_snapshot,
+        normalize_diagnostic_stability_query,
+    )
+
+    try:
+        query = normalize_diagnostic_stability_query(params if isinstance(params, dict) else {})
+        snapshot = get_diagnostic_stability_snapshot(query)
+        return {"ok": True, **snapshot}
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": {"code": "INVALID_REQUEST", "message": str(exc)},
+        }
+
+
+# ── Exec Approval ─────────────────────────────────────────────────────────────
+
+@register_handler("exec.approval.get")
+async def handle_exec_approval_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Get a specific exec approval request."""
+    approval_id = params.get("approvalId") or params.get("approval_id", "")
+    gateway = getattr(connection, "gateway", None)
+    mgr = getattr(gateway, "approval_manager", None) if gateway else None
+    if mgr and approval_id:
+        approval = mgr.get(approval_id)
+        return {"ok": True, "approval": approval}
+    return {"ok": True, "approval": None}
+
+
+@register_handler("exec.approval.list")
+async def handle_exec_approval_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """List pending exec approval requests."""
+    gateway = getattr(connection, "gateway", None)
+    mgr = getattr(gateway, "approval_manager", None) if gateway else None
+    if mgr and hasattr(mgr, "list_pending"):
+        items = mgr.list_pending()
+        return {"ok": True, "approvals": items}
+    return {"ok": True, "approvals": []}
+
+
+@register_handler("exec.approval.request")
+async def handle_exec_approval_request(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Submit an exec approval request."""
+    gateway = getattr(connection, "gateway", None)
+    mgr = getattr(gateway, "approval_manager", None) if gateway else None
+    if mgr and hasattr(mgr, "request_approval"):
+        result = await mgr.request_approval(params)
+        return {"ok": True, **result}
+    return {"ok": False, "error": "approval_manager not available"}
+
+
+@register_handler("exec.approval.resolve")
+async def handle_exec_approval_resolve(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Resolve (approve/deny) an exec approval request."""
+    approval_id = params.get("approvalId") or params.get("approval_id", "")
+    decision = params.get("decision", "deny")
+    gateway = getattr(connection, "gateway", None)
+    mgr = getattr(gateway, "approval_manager", None) if gateway else None
+    if mgr and approval_id:
+        try:
+            await mgr.resolve(approval_id, decision)
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    return {"ok": False, "error": "approval not found"}
+
+
+# ── Plugin Approval ───────────────────────────────────────────────────────────
+
+@register_handler("plugin.approval.list")
+async def handle_plugin_approval_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """List pending plugin approval requests."""
+    return {"ok": True, "approvals": []}
+
+
+@register_handler("plugin.approval.request")
+async def handle_plugin_approval_request(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Submit a plugin approval request."""
+    return {"ok": True, "approvalId": None, "_note": "plugin approvals not yet implemented"}
+
+
+@register_handler("plugin.approval.waitDecision")
+async def handle_plugin_approval_wait(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Wait for a plugin approval decision."""
+    return {"ok": True, "decision": "allow", "_note": "stub"}
+
+
+@register_handler("plugin.approval.resolve")
+async def handle_plugin_approval_resolve(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a plugin approval request."""
+    return {"ok": True}
+
+
+# ── Doctor Memory (Dreaming) ──────────────────────────────────────────────────
+
+def _resolve_doctor_memory_context(params: dict[str, Any]) -> tuple[Any, str, str]:
+    from openclaw.agents.agent_scope import resolve_agent_workspace_dir, resolve_default_agent_id
+
+    cfg = _get_current_config()
+    agent_id = params.get("agentId") or resolve_default_agent_id(cfg)
+    workspace_dir = str(resolve_agent_workspace_dir(cfg, agent_id))
+    return cfg, agent_id, workspace_dir
+
+
+@register_handler("doctor.memory.dreamDiary")
+async def handle_doctor_dream_diary(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Get the dream diary (mirrors TS doctor.memory.dreamDiary)."""
+    try:
+        from openclaw.memory.dreaming import read_dream_diary
+
+        _, agent_id, workspace_dir = _resolve_doctor_memory_context(params)
+        diary = await read_dream_diary(workspace_dir)
+        return {"ok": True, "agentId": agent_id, **diary}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("doctor.memory.backfillDreamDiary")
+async def handle_doctor_backfill_dream_diary(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Backfill dream diary entries."""
+    try:
+        from openclaw.memory.dreaming import backfill_dream_diary
+
+        _, agent_id, _workspace_dir = _resolve_doctor_memory_context(params)
+        result = await backfill_dream_diary(agent_id, params)
+        return {"ok": True, "agentId": agent_id, **result}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("doctor.memory.resetDreamDiary")
+async def handle_doctor_reset_dream_diary(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Reset backfill dream diary entries."""
+    try:
+        from openclaw.memory.dreaming import reset_dream_diary
+
+        _, agent_id, _workspace_dir = _resolve_doctor_memory_context(params)
+        result = await reset_dream_diary(agent_id)
+        return {"ok": True, "agentId": agent_id, **result}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("doctor.memory.resetGroundedShortTerm")
+async def handle_doctor_reset_grounded_short_term(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Reset grounded short-term memory candidates."""
+    try:
+        from openclaw.memory.dreaming import remove_grounded_short_term_candidates
+
+        _, agent_id, workspace_dir = _resolve_doctor_memory_context(params)
+        removed = await remove_grounded_short_term_candidates(workspace_dir)
+        return {
+            "ok": True,
+            "agentId": agent_id,
+            "action": "resetGroundedShortTerm",
+            "removedShortTermEntries": removed.get("removed", 0),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("doctor.memory.repairDreamingArtifacts")
+async def handle_doctor_repair_dreaming_artifacts(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Repair dreaming artifacts."""
+    try:
+        from openclaw.memory.dreaming import repair_dreaming_artifacts
+
+        _, agent_id, workspace_dir = _resolve_doctor_memory_context(params)
+        repair = await repair_dreaming_artifacts(workspace_dir)
+        return {"ok": True, "agentId": agent_id, "action": "repairDreamingArtifacts", **repair}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("doctor.memory.dedupeDreamDiary")
+async def handle_doctor_dedupe_dream_diary(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Deduplicate dream diary entries."""
+    try:
+        from openclaw.memory.dreaming import dedupe_dream_diary_entries, read_dream_diary
+
+        _, agent_id, workspace_dir = _resolve_doctor_memory_context(params)
+        dedupe = await dedupe_dream_diary_entries(workspace_dir)
+        diary = await read_dream_diary(workspace_dir)
+        return {
+            "ok": True,
+            "agentId": agent_id,
+            "action": "dedupeDreamDiary",
+            "path": diary.get("path"),
+            "found": diary.get("found"),
+            "removedEntries": dedupe.get("removed", 0),
+            "dedupedEntries": dedupe.get("removed", 0),
+            "keptEntries": dedupe.get("kept", 0),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ── TTS ───────────────────────────────────────────────────────────────────────
+
+@register_handler("tts.personas")
+async def handle_tts_personas(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    from openclaw.gateway.voice_gateway import handle_tts_personas as _impl
+
+    return await _impl(connection, params)
+
+
+@register_handler("tts.setPersona")
+async def handle_tts_set_persona(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    from openclaw.gateway.voice_gateway import handle_tts_set_persona as _impl
+
+    return await _impl(connection, params)
+
+
+# ── Config Schema Lookup ──────────────────────────────────────────────────────
+
+@register_handler("config.schema.lookup")
+async def handle_config_schema_lookup(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Lookup config schema by path.
+
+    Mirrors TS config.schema.lookup in BASE_METHODS.
+    """
+    path = params.get("path", "")
+    try:
+        from openclaw.config.schema import get_schema_for_path
+        schema = get_schema_for_path(path)
+        return {"ok": True, "schema": schema, "path": path}
+    except Exception:
+        return {"ok": True, "schema": None, "path": path}
+
+
+# ── Skills ────────────────────────────────────────────────────────────────────
+
+@register_handler("skills.search")
+async def handle_skills_search(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Search ClawHub skills — mirrors TS skills.search handler."""
+    from openclaw.agents.skills_clawhub import search_skills_from_clawhub
+
+    try:
+        results = await search_skills_from_clawhub(
+            query=params.get("query"),
+            limit=params.get("limit"),
+        )
+        return {"results": results}
+    except Exception as exc:
+        logger.error("skills.search error: %s", exc, exc_info=True)
+        raise
+
+
+@register_handler("skills.detail")
+async def handle_skills_detail(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Fetch ClawHub skill detail — mirrors TS skills.detail handler."""
+    from openclaw.infra.clawhub import fetch_claw_hub_skill_detail
+
+    slug = params.get("slug", "")
+    if not isinstance(slug, str) or not slug.strip():
+        raise ValueError("slug is required")
+
+    try:
+        return await fetch_claw_hub_skill_detail(slug=slug.strip())
+    except Exception as exc:
+        logger.error("skills.detail error: %s", exc, exc_info=True)
+        raise
+
+
+# ── Voice Wake ────────────────────────────────────────────────────────────────
+
+@register_handler("voicewake.routing.get")
+async def handle_voicewake_routing_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    from openclaw.gateway.voice_gateway import handle_voicewake_routing_get as _impl
+
+    return await _impl(connection, params)
+
+
+@register_handler("voicewake.routing.set")
+async def handle_voicewake_routing_set(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    from openclaw.gateway.voice_gateway import handle_voicewake_routing_set as _impl
+
+    return await _impl(connection, params)
+
+
+# ── Node Pending Queue ────────────────────────────────────────────────────────
+
+def _validate_node_pending_drain_params(params: dict[str, Any]) -> dict[str, Any] | None:
+    max_items = params.get("maxItems")
+    if max_items is None:
+        return params
+    if not isinstance(max_items, int) or max_items < 1 or max_items > 10:
+        return None
+    return params
+
+
+def _validate_node_pending_enqueue_params(params: dict[str, Any]) -> dict[str, Any] | None:
+    from openclaw.gateway.node_pending_work import NODE_PENDING_WORK_PRIORITIES, NODE_PENDING_WORK_TYPES
+
+    node_id = params.get("nodeId")
+    work_type = params.get("type")
+    if not isinstance(node_id, str) or not node_id.strip():
+        return None
+    if work_type not in NODE_PENDING_WORK_TYPES:
+        return None
+    priority = params.get("priority")
+    if priority is not None and priority not in NODE_PENDING_WORK_PRIORITIES:
+        return None
+    expires_in_ms = params.get("expiresInMs")
+    if expires_in_ms is not None and (
+        not isinstance(expires_in_ms, int) or expires_in_ms < 1_000 or expires_in_ms > 86_400_000
+    ):
+        return None
+    return params
+
+
+def _validate_node_pending_ack_params(params: dict[str, Any]) -> dict[str, Any] | None:
+    ids = params.get("ids")
+    if not isinstance(ids, list) or not ids:
+        return None
+    if not all(isinstance(value, str) and value.strip() for value in ids):
+        return None
+    return params
+
+
+@register_handler("node.pending.drain")
+async def handle_node_pending_drain(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Drain durable pending work for the connected node."""
+    from openclaw.gateway.error_codes import InvalidRequestError
+    from openclaw.gateway.node_pending_work import drain_node_pending_work
+
+    if _validate_node_pending_drain_params(params) is None:
+        raise InvalidRequestError("invalid node.pending.drain params")
+
+    node_id = _resolve_node_caller_id(connection)
+    if not node_id:
+        raise InvalidRequestError("node.pending.drain requires a connected device identity")
+
+    drained = drain_node_pending_work(
+        node_id,
+        max_items=params.get("maxItems"),
+        include_default_status=True,
+    )
+    return {
+        "nodeId": node_id,
+        "revision": drained.revision,
+        "items": drained.items,
+        "hasMore": drained.hasMore,
+    }
+
+
+@register_handler("node.pending.enqueue")
+async def handle_node_pending_enqueue(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Enqueue durable pending work for an offline/disconnected node."""
+    from openclaw.gateway.error_codes import InvalidRequestError
+    from openclaw.gateway.node_pending_work import enqueue_node_pending_work
+
+    validated = _validate_node_pending_enqueue_params(params)
+    if validated is None:
+        raise InvalidRequestError("invalid node.pending.enqueue params")
+
+    node_id = str(validated["nodeId"]).strip()
+    queued = enqueue_node_pending_work(
+        node_id=node_id,
+        type=validated["type"],
+        priority=validated.get("priority"),
+        expires_in_ms=validated.get("expiresInMs"),
+    )
+
+    wake_triggered = False
+    if validated.get("wake", True) is not False and not queued["deduped"]:
+        registry = _node_registry
+        gateway = getattr(connection, "gateway", None)
+        if registry is None and gateway is not None:
+            registry = getattr(gateway, "node_registry", None)
+        if registry is None or registry.get_node(node_id) is None:
+            wake_triggered = False
+
+    return {
+        "nodeId": node_id,
+        "revision": queued["revision"],
+        "queued": queued["item"],
+        "wakeTriggered": wake_triggered,
+    }
+
+
+@register_handler("node.pending.pull")
+async def handle_node_pending_pull(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Pull queued foreground invoke actions for the connected node."""
+    from openclaw.gateway.error_codes import InvalidRequestError
+    from openclaw.gateway.node_pending_actions import (
+        pending_action_to_dict,
+        resolve_allowed_pending_node_actions,
+    )
+
+    node_id = _resolve_node_caller_id(connection)
+    if not node_id:
+        raise InvalidRequestError("nodeId required")
+
+    declared_commands: list[str] = []
+    client_info = getattr(connection, "client_info", None)
+    if isinstance(client_info, dict):
+        commands = client_info.get("commands")
+        if isinstance(commands, list):
+            declared_commands = [str(c) for c in commands if c]
+    gateway = getattr(connection, "gateway", None)
+    registry = _node_registry
+    if registry is None and gateway is not None:
+        registry = getattr(gateway, "node_registry", None)
+    if registry is not None:
+        session = registry.get_node(node_id)
+        if session is not None:
+            metadata_commands = getattr(session, "metadata", {}).get("commands") if hasattr(session, "metadata") else None
+            if isinstance(metadata_commands, list):
+                declared_commands = [str(c) for c in metadata_commands if c]
+
+    pending = resolve_allowed_pending_node_actions(
+        node_id=node_id,
+        declared_commands=declared_commands,
+    )
+    return {
+        "nodeId": node_id,
+        "actions": [pending_action_to_dict(entry) for entry in pending],
+    }
+
+
+@register_handler("node.pending.ack")
+async def handle_node_pending_ack(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Acknowledge pulled foreground invoke actions."""
+    from openclaw.gateway.error_codes import InvalidRequestError
+    from openclaw.gateway.node_pending_actions import ack_pending_node_actions
+
+    if _validate_node_pending_ack_params(params) is None:
+        raise InvalidRequestError("invalid node.pending.ack params")
+
+    node_id = _resolve_node_caller_id(connection)
+    if not node_id:
+        raise InvalidRequestError("nodeId required")
+
+    ack_ids = list(dict.fromkeys(str(value).strip() for value in params.get("ids", []) if str(value).strip()))
+    remaining = ack_pending_node_actions(node_id, ack_ids)
+    return {
+        "nodeId": node_id,
+        "ackedIds": ack_ids,
+        "remainingCount": len(remaining),
+    }
+
+
+# ── Message Action ────────────────────────────────────────────────────────────
+
+@register_handler("message.action")
+async def handle_message_action(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Perform an action on a message (react, edit, delete, etc.)."""
+    action = params.get("action", "")
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    message_id = params.get("messageId") or params.get("message_id", "")
+    try:
+        if _session_manager and hasattr(_session_manager, "apply_message_action"):
+            result = await _session_manager.apply_message_action(session_key, message_id, action, params)
+            return {"ok": True, **result}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "_note": "action noted"}
+
+
+# ── Commands List ─────────────────────────────────────────────────────────────
+
+@register_handler("commands.list")
+async def handle_commands_list(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """List all registered plugin commands."""
+    try:
+        if _channel_registry and hasattr(_channel_registry, "plugin_registry"):
+            cmds = [
+                {
+                    "name": r.command.name,
+                    "description": getattr(r.command, "description", ""),
+                    "pluginId": r.plugin_id,
+                }
+                for r in _channel_registry.plugin_registry.commands
+            ]
+            return {"ok": True, "commands": cmds}
+    except Exception:
+        pass
+    return {"ok": True, "commands": []}
+
+
+# ── Sessions Create (if not already registered) ───────────────────────────────
+
+@register_handler("sessions.abort")
+async def handle_sessions_abort(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Abort a session run.
+
+    Mirrors TS sessions.abort in BASE_METHODS.
+    """
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    try:
+        if _agent_runtime and hasattr(_agent_runtime, "abort_session"):
+            await _agent_runtime.abort_session(session_key)
+        elif _agent_runtime and hasattr(_agent_runtime, "_abort_events"):
+            event = _agent_runtime._abort_events.get(session_key)
+            if event:
+                event.set()
+        return {"ok": True, "sessionKey": session_key}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ── channels.start ────────────────────────────────────────────────────────────
+
+@register_handler("channels.start")
+async def handle_channels_start(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Start a channel session (mirrors TS channels.start in BASE_METHODS)."""
+    channel = params.get("channel", "")
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    try:
+        if _channel_registry and hasattr(_channel_registry, "start_channel"):
+            result = await _channel_registry.start_channel(channel, session_key, params)
+            return {"ok": True, **result}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "channel": channel, "sessionKey": session_key}
+
+
+# ── sessions.create ────────────────────────────────────────────────────────────
+
+@register_handler("sessions.create")
+async def handle_sessions_create(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Create a new session (mirrors TS sessions.create in BASE_METHODS)."""
+    agent_id = params.get("agentId") or params.get("agent_id", "")
+    try:
+        if _session_manager and hasattr(_session_manager, "create_session"):
+            entry = await _session_manager.create_session(agent_id, params)
+            return {"ok": True, "sessionKey": getattr(entry, "session_key", None)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "agentId": agent_id}
+
+
+# ── sessions.send ──────────────────────────────────────────────────────────────
+
+@register_handler("sessions.send")
+async def handle_sessions_send(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Send a message to a session (mirrors TS sessions.send in BASE_METHODS)."""
+    session_key = params.get("sessionKey") or params.get("session_key", "")
+    message = params.get("message") or params.get("text", "")
+    try:
+        if _agent_runtime and hasattr(_agent_runtime, "send_message"):
+            result = await _agent_runtime.send_message(session_key, message, params)
+            return {"ok": True, **result}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "sessionKey": session_key}
+
+
+# ── talk.realtime.session ──────────────────────────────────────────────────────
+
+@register_handler("talk.realtime.session")
+async def handle_talk_realtime_session(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    from openclaw.gateway.voice_gateway import handle_talk_realtime_session as _impl
+
+    return await _impl(connection, params)
+
+
+# ── talk.speak ─────────────────────────────────────────────────────────────────
+
+@register_handler("talk.speak")
+async def handle_talk_speak(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    from openclaw.gateway.voice_gateway import handle_talk_speak as _impl
+
+    return await _impl(connection, params)
+
+
+# ---------------------------------------------------------------------------
+# Push notification handlers — mirrors TS push.ts
+# ---------------------------------------------------------------------------
+
+@register_handler("push.test")
+async def handle_push_test(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Send a test push notification to a node.
+    Mirrors TS push.test in push.ts (APNs / relay path).
+    """
+    try:
+        from openclaw.infra.push import send_test_push_notification
+        node_id = str(params.get("nodeId") or "").strip()
+        if not node_id:
+            raise ValueError("nodeId required")
+        title = str(params.get("title") or "OpenClaw").strip() or "OpenClaw"
+        body = str(params.get("body") or f"Push test for node {node_id}").strip()
+        result = await send_test_push_notification(node_id=node_id, title=title, body=body)
+        return {"ok": True, **result}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("push.web.vapidPublicKey")
+async def handle_push_web_vapid_public_key(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Return the VAPID public key for web push subscriptions.
+    Mirrors TS push.web.vapidPublicKey.
+    """
+    try:
+        from openclaw.infra.push import get_vapid_public_key
+        key = get_vapid_public_key()
+        if not key:
+            return {"ok": False, "error": "VAPID not configured"}
+        return {"ok": True, "vapidPublicKey": key}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("push.web.subscribe")
+async def handle_push_web_subscribe(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Register a web push subscription.
+    Mirrors TS push.web.subscribe.
+    """
+    try:
+        from openclaw.infra.push import register_web_push_subscription
+        endpoint = str(params.get("endpoint") or "").strip()
+        if not endpoint:
+            raise ValueError("endpoint required")
+        keys = params.get("keys") or {}
+        await register_web_push_subscription(endpoint=endpoint, keys=keys, params=params)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("push.web.unsubscribe")
+async def handle_push_web_unsubscribe(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Remove a web push subscription.
+    Mirrors TS push.web.unsubscribe.
+    """
+    try:
+        from openclaw.infra.push import unregister_web_push_subscription
+        endpoint = str(params.get("endpoint") or "").strip()
+        if not endpoint:
+            raise ValueError("endpoint required")
+        await unregister_web_push_subscription(endpoint=endpoint)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@register_handler("push.web.test")
+async def handle_push_web_test(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Send a test web push notification.
+    Mirrors TS push.web.test.
+    """
+    try:
+        from openclaw.infra.push import send_web_push_broadcast
+        title = str(params.get("title") or "OpenClaw").strip() or "OpenClaw"
+        body = str(params.get("body") or "Web push test notification").strip()
+        await send_web_push_broadcast(title=title, body=body)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Agent wait-dedupe — waiter notification system
+# Mirrors TS agent-wait-dedupe.ts (AGENT_WAITERS_BY_RUN_ID map + notifyWaiters)
+# ---------------------------------------------------------------------------
+
+# Module-level registry: run_id -> set of asyncio.Event objects
+_AGENT_WAITERS_BY_RUN_ID: dict[str, set[asyncio.Event]] = {}
+
+
+def _add_agent_waiter(run_id: str) -> asyncio.Event:
+    """Register an asyncio.Event waiter for run_id.  Returns the event."""
+    normalized = (run_id or "").strip()
+    evt = asyncio.Event()
+    if not normalized:
+        return evt
+    existing = _AGENT_WAITERS_BY_RUN_ID.get(normalized)
+    if existing is None:
+        _AGENT_WAITERS_BY_RUN_ID[normalized] = {evt}
+    else:
+        existing.add(evt)
+    return evt
+
+
+def _remove_agent_waiter(run_id: str, evt: asyncio.Event) -> None:
+    normalized = (run_id or "").strip()
+    waiters = _AGENT_WAITERS_BY_RUN_ID.get(normalized)
+    if not waiters:
+        return
+    waiters.discard(evt)
+    if not waiters:
+        _AGENT_WAITERS_BY_RUN_ID.pop(normalized, None)
+
+
+def notify_agent_waiters(run_id: str) -> None:
+    """Notify all waiters for a run_id that the run has reached terminal status.
+    Call this from agent run completion paths.
+    Mirrors TS notifyWaiters() in agent-wait-dedupe.ts.
+    """
+    normalized = (run_id or "").strip()
+    if not normalized:
+        return
+    waiters = _AGENT_WAITERS_BY_RUN_ID.get(normalized)
+    if not waiters:
+        return
+    for evt in list(waiters):
+        evt.set()
 
 
 logger.info(f"Registered {len(_handlers)} gateway handlers")

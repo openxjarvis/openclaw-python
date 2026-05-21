@@ -33,7 +33,9 @@ _OPENAI_MODEL_APIS: frozenset[str] = frozenset(
 _OPENAI_PROVIDERS: frozenset[str] = frozenset(["openai", "openai-codex"])
 
 _GOOGLE_MODEL_APIS: frozenset[str] = frozenset(
-    ["google-ai-studio", "google-vertex", "google-genai", "gemini", "gemini-vertex"]
+    # Canonical value is "google-generative-ai" (aligned with TS MODEL_APIS).
+    # Legacy strings kept for backwards compatibility with existing sessions.
+    ["google-generative-ai", "google-ai-studio", "google-vertex", "google-genai", "gemini", "gemini-vertex"]
 )
 
 

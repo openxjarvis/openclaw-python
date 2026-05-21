@@ -40,17 +40,17 @@ def resolve_sandbox_scope_key(scope: str, session_key: str) -> str:
 
     - scope="shared"  → "shared"  (one dir for all sessions)
     - scope="session" → session_key (one dir per session)
-    - scope="agent"   → "agent:{agent_id}" derived from session_key
+    - scope="agent"   → "agent:{agent_id}" derived via resolveAgentIdFromSessionKey
     """
+    from openclaw.routing.session_key import resolve_agent_id_from_session_key
+
     trimmed = session_key.strip() or "main"
     if scope == "shared":
         return "shared"
     if scope == "session":
         return trimmed
-    # scope == "agent" — derive agent id from session key
-    # agent id is the part before the last "--" separator, or fall back to "main"
-    parts = trimmed.rsplit("--", 1)
-    agent_id = parts[0] if len(parts) > 1 else "main"
+    # scope == "agent" — mirrors TS: resolveAgentIdFromSessionKey → "agent:<agentId>"
+    agent_id = resolve_agent_id_from_session_key(trimmed)
     return f"agent:{agent_id}"
 
 

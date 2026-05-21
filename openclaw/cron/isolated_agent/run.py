@@ -174,6 +174,29 @@ async def run_cron_isolated_agent_turn(
     effective_session_key = session_key or f"cron:{getattr(job, 'id', '?')}"
 
     # ------------------------------------------------------------------
+    # Model override parsing — mirrors TS cron/isolated-agent/run.ts
+    # Allows per-job model override via job.model or job.payload.model
+    # ------------------------------------------------------------------
+    job_model_override: str | None = None
+    try:
+        _raw_model = getattr(job, "model", None)
+        if isinstance(_raw_model, str) and _raw_model:
+            job_model_override = _raw_model
+        else:
+            _payload = getattr(job, "payload", None)
+            _payload_model = getattr(_payload, "model", None) if _payload is not None else None
+            if isinstance(_payload_model, str) and _payload_model:
+                job_model_override = _payload_model
+        if job_model_override:
+            logger.debug(
+                "cron: model override '%s' for job %r",
+                job_model_override,
+                getattr(job, "id", "?"),
+            )
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
     # SECURITY: Wrap external hook content before agent turn
     # Mirrors TS security block in runCronIsolatedAgentTurn (lines 372-407)
     # ------------------------------------------------------------------
@@ -226,7 +249,11 @@ async def run_cron_isolated_agent_turn(
     # Execute agent turn via gateway callback
     # ------------------------------------------------------------------
     try:
-        result = await run_agent_fn(job=job, message=message)
+        result = await run_agent_fn(
+            job=job,
+            message=message,
+            **({"model": job_model_override} if job_model_override else {}),
+        )
     except Exception as err:
         logger.error(
             "cron: isolated agent run failed for job %r: %s",
@@ -509,7 +536,7 @@ async def run_cron_isolated_agent_turn(
         summary = result.get("summary")
         output_text = result.get("output_text") or result.get("outputText")
 
-    return _build_result(
+    final_result = _build_result(
         status=status,
         summary=summary if payloads else result.get("summary"),
         output_text=output_text if payloads else (result.get("output_text") or result.get("outputText")),
@@ -521,6 +548,27 @@ async def run_cron_isolated_agent_turn(
         usage=usage,
         error=error,
     )
+
+    # Last delivery sentinel — write a marker so the next cron run can detect
+    # the previous delivery outcome (mirrors TS lastDeliverySentinel in run.ts).
+    if delivered and effective_session_key:
+        try:
+            import time as _time
+            from openclaw.config.paths import resolve_state_dir
+            import json as _json
+            sentinel_path = resolve_state_dir() / "cron" / "last_delivery" / f"{effective_session_key}.json"
+            sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+            sentinel_path.write_text(_json.dumps({
+                "delivered_at": int(_time.time()),
+                "session_key": effective_session_key,
+                "job_id": getattr(job, "id", None),
+                "status": status,
+                "model": model,
+            }))
+        except Exception:
+            pass
+
+    return final_result
 
 
 def _build_result(

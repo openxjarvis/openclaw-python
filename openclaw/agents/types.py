@@ -232,7 +232,7 @@ class AgentToolResult(BaseModel, Generic[TDetails]):
     - details: For UI/logging, not sent to LLM
     """
     content: list[Content]
-    details: TDetails
+    details: TDetails | None = None
 
     @property
     def success(self) -> bool:

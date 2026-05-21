@@ -119,12 +119,28 @@ def load_workspace_skill_entries(
     workspace_skills_dir = workspace_dir / "skills"
 
     # Source 1: extra dirs (from config) + plugin skill dirs
+    # C8: Wire resolve_plugin_skill_dirs — mirrors TS resolvePluginSkillDirs() merged in
+    # loadSkillEntries() in agents/skills/workspace.ts.
     extra_entries: list[SkillEntry] = []
     if config:
         for extra_dir in get_extra_skill_dirs(config):
             extra_entries.extend(
                 load_skill_entries_from_dir(extra_dir, source="openclaw-extra", **load_kw)
             )
+    # Plugin skill dirs (from installed plugins — mirrors TS resolvePluginSkillDirs)
+    try:
+        from openclaw.skills.loader import resolve_plugin_skill_dirs as _resolve_plugin_dirs
+        _cfg_for_plugins = config if isinstance(config, dict) else (
+            config.model_dump() if hasattr(config, "model_dump") else {}
+        )
+        for _plugin_dir in _resolve_plugin_dirs(_cfg_for_plugins, str(workspace_dir)):
+            _p = Path(_plugin_dir)
+            if _p.exists():
+                extra_entries.extend(
+                    load_skill_entries_from_dir(_p, source="openclaw-plugin", **load_kw)
+                )
+    except Exception as _plugin_exc:
+        logger.debug("Plugin skill dirs (non-fatal): %s", _plugin_exc)
 
     # Source 2: bundled
     bundled_entries: list[SkillEntry] = []
@@ -578,6 +594,15 @@ async def sync_skills_to_workspace(
 
     entries = load_workspace_skill_entries(source_dir, config)
 
+    # M15: Serialize syncs to the same target dir — mirrors TS serializeByKey(`syncSkills:${targetDir}`)
+    _lock_key = str(target_dir)
+    if not hasattr(sync_skills_to_workspace, "_locks"):
+        sync_skills_to_workspace._locks = {}  # type: ignore[attr-defined]
+    _lock = sync_skills_to_workspace._locks.get(_lock_key)  # type: ignore[attr-defined]
+    if _lock is None:
+        _lock = asyncio.Lock()
+        sync_skills_to_workspace._locks[_lock_key] = _lock  # type: ignore[attr-defined]
+
     loop = asyncio.get_event_loop()
 
     def _do_sync() -> None:
@@ -610,7 +635,8 @@ async def sync_skills_to_workspace(
             except Exception as exc:
                 logger.warning("Failed to copy skill %s to sandbox: %s", entry.skill.name, exc)
 
-    await loop.run_in_executor(None, _do_sync)
+    async with _lock:
+        await loop.run_in_executor(None, _do_sync)
     logger.debug(
         "syncSkillsToWorkspace: synced %d skills from %s → %s",
         len(entries),
