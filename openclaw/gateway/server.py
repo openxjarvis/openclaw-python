@@ -107,11 +107,29 @@ class GatewayConnection:
         self.canvas_capability: str | None = None
         self.canvas_capability_expires_at_ms: int | None = None
 
+    def _ws_is_open(self) -> bool:
+        """Return True if the WebSocket is still open and writable."""
+        try:
+            from aiohttp.web_ws import WebSocketResponse
+            ws = self.websocket
+            # aiohttp WebSocketResponse exposes .closed property
+            if hasattr(ws, "closed") and ws.closed:
+                return False
+        except Exception:
+            pass
+        return True
+
     async def send_response(
         self, request_id: str | int, payload: Any = None, error: ErrorShape | None = None
     ) -> None:
-        """Send response frame (Gateway protocol format)"""
-        # Use Gateway protocol ResponseFrame format
+        """Send response frame (Gateway protocol format).
+
+        Silently drops the write if the WebSocket has already closed — this is
+        expected behaviour for long-polling requests (e.g. agent.wait) that
+        complete after the client disconnects.
+        """
+        if not self._ws_is_open():
+            return
         response_frame = ResponseFrame(
             type="res",
             id=request_id,
@@ -119,14 +137,35 @@ class GatewayConnection:
             payload=payload,
             error=error
         )
-        # aiohttp: send_str instead of send
-        await self.websocket.send_str(response_frame.model_dump_json())
+        try:
+            await self.websocket.send_str(response_frame.model_dump_json())
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as _send_err:
+            # aiohttp raises ClientConnectionResetError (subclass of OSError) when
+            # the transport is closing; treat any write failure on a closing socket
+            # as a no-op rather than an error worth logging.
+            _msg = str(_send_err).lower()
+            if "closing" in _msg or "closed" in _msg or "reset" in _msg or "transport" in _msg:
+                pass
+            else:
+                raise
 
     async def send_event(self, event: str, payload: Any = None) -> None:
-        """Send event frame"""
+        """Send event frame."""
+        if not self._ws_is_open():
+            return
         event_frame = EventFrame(event=event, payload=payload)
-        # aiohttp: send_str instead of send
-        await self.websocket.send_str(event_frame.model_dump_json())
+        try:
+            await self.websocket.send_str(event_frame.model_dump_json())
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as _send_err:
+            _msg = str(_send_err).lower()
+            if "closing" in _msg or "closed" in _msg or "reset" in _msg or "transport" in _msg:
+                pass
+            else:
+                raise
 
     async def handle_message(self, message: str) -> None:
         """Handle incoming message"""
@@ -152,8 +191,14 @@ class GatewayConnection:
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON: {e}")
+        except (ConnectionResetError, BrokenPipeError):
+            pass
         except Exception as e:
-            logger.error(f"Error handling message: {e}", exc_info=True)
+            _emsg = str(e).lower()
+            if "closing" in _emsg or "reset" in _emsg or "transport" in _emsg:
+                logger.debug("Client disconnected during message handling (transport closed)")
+            else:
+                logger.error(f"Error handling message: {e}", exc_info=True)
 
     async def handle_request(self, request: RequestFrame) -> None:
         """Handle request frame with authorization"""
@@ -233,11 +278,19 @@ class GatewayConnection:
                     details=e.details or None,
                 ),
             )
+        except (ConnectionResetError, BrokenPipeError):
+            # Client disconnected while we were processing — normal for long-poll methods
+            pass
         except Exception as e:
-            logger.error(f"Error handling request {request.method}: {e}", exc_info=True)
-            await self.send_response(
-                request.id, error=ErrorShape(code="INTERNAL_ERROR", message=str(e))
-            )
+            _emsg = str(e).lower()
+            if "closing" in _emsg or "reset" in _emsg or "transport" in _emsg:
+                # Client disconnected mid-request (e.g. agent.wait timed out after client left)
+                logger.debug("Client disconnected during %s (transport closed)", request.method)
+            else:
+                logger.error(f"Error handling request {request.method}: {e}", exc_info=True)
+                await self.send_response(
+                    request.id, error=ErrorShape(code="INTERNAL_ERROR", message=str(e))
+                )
 
     async def handle_connect(self, request: RequestFrame) -> None:
         """Handle connection handshake with authentication"""

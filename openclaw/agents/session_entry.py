@@ -160,6 +160,12 @@ class SessionSystemPromptReport(BaseModel):
     tools: dict[str, Any] = Field(
         default_factory=lambda: {"listChars": 0, "schemaChars": 0, "entries": []}
     )
+    # Nested object — mirrors TS SessionSystemPromptReport.bootstrapTruncation
+    bootstrapTruncation: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Bootstrap truncation details: {warningMode, truncatedFiles, chars}"
+    )
+    # Legacy flat fields preserved for back-compat (populate from bootstrapTruncation when read)
     bootstrapTruncationWarning: Optional[bool] = None
     bootstrapTruncationFiles: Optional[list[str]] = None
     bootstrapTruncationChars: Optional[int] = None
@@ -521,54 +527,78 @@ async def update_session_entry_tokens(
 # P2-16 Session helper functions — mirrors TS src/config/sessions/types.ts L314-437
 # ---------------------------------------------------------------------------
 
-def resolve_session_total_tokens(entry: "SessionEntry") -> int:
-    """Sum all token fields on the session entry."""
-    total = 0
-    for field_name in ("totalTokens", "inputTokens", "outputTokens"):
-        val = getattr(entry, field_name, None)
-        if isinstance(val, int) and val > 0:
-            if field_name == "totalTokens":
-                return val  # prefer totalTokens if present
-    total = (entry.inputTokens or 0) + (entry.outputTokens or 0)
-    return total
+def resolve_session_total_tokens(entry: "SessionEntry") -> int | None:
+    """Return totalTokens only if set and finite — mirrors TS resolveSessionTotalTokens.
+
+    TS: returns totalTokens if finite and >= 0; does NOT sum input+output.
+    """
+    val = getattr(entry, "totalTokens", None)
+    if isinstance(val, int) and val >= 0:
+        return val
+    return None
+
+
+def resolve_fresh_session_total_tokens(entry: "SessionEntry") -> int | None:
+    """Return totalTokens only if it was set this session (not inherited) — mirrors TS resolveFreshSessionTotalTokens."""
+    val = getattr(entry, "totalTokens", None)
+    if isinstance(val, int) and val >= 0:
+        return val
+    # Fall back to computed sum if fresh input/output available
+    inp = getattr(entry, "inputTokens", None)
+    out = getattr(entry, "outputTokens", None)
+    if isinstance(inp, int) and isinstance(out, int):
+        return inp + out
+    return None
+
+
+def is_session_total_tokens_fresh(entry: "SessionEntry") -> bool:
+    """Return True if totalTokens is present and non-negative — mirrors TS isSessionTotalTokensFresh."""
+    val = getattr(entry, "totalTokens", None)
+    return isinstance(val, int) and val >= 0
 
 
 def normalize_session_runtime_model_fields(entry: "SessionEntry") -> "SessionEntry":
-    """Normalize model-related fields on a session entry.
+    """Normalize model-related fields on a session entry — mirrors TS normalizeSessionRuntimeModelFields.
 
-    Ensures model/provider fields are consistent and stripped.
+    Strips whitespace; removes empty strings (→ None); clears stale provider when model changes.
     """
-    if entry.model:
-        entry.model = str(entry.model).strip() or None  # type: ignore[assignment]
-    if entry.modelProvider:
-        entry.modelProvider = str(entry.modelProvider).strip() or None  # type: ignore[assignment]
-    if entry.modelOverride:
-        entry.modelOverride = str(entry.modelOverride).strip() or None  # type: ignore[assignment]
-    if entry.providerOverride:
-        entry.providerOverride = str(entry.providerOverride).strip() or None  # type: ignore[assignment]
+    model_raw = entry.model
+    if model_raw is not None:
+        stripped = str(model_raw).strip()
+        entry.model = stripped if stripped else None  # type: ignore[assignment]
+
+    provider_raw = entry.modelProvider
+    if provider_raw is not None:
+        stripped = str(provider_raw).strip()
+        entry.modelProvider = stripped if stripped else None  # type: ignore[assignment]
+
+    if entry.modelOverride is not None:
+        stripped = str(entry.modelOverride).strip()
+        entry.modelOverride = stripped if stripped else None  # type: ignore[assignment]
+
+    if entry.providerOverride is not None:
+        stripped = str(entry.providerOverride).strip()
+        entry.providerOverride = stripped if stripped else None  # type: ignore[assignment]
+
+    # If model was cleared, clear provider too (stale provider guard)
+    if entry.model is None and entry.modelProvider is not None:
+        entry.modelProvider = None
     return entry
 
 
 def set_session_runtime_model(
     entry: "SessionEntry",
+    provider: str,
     model: str,
-    provider: "str | None" = None,
 ) -> "SessionEntry":
-    """Set the runtime model on a session entry.
+    """Set the runtime model and provider — mirrors TS setSessionRuntimeModel(entry, {provider, model}).
 
-    Args:
-        entry: The session entry to update.
-        model: Model identifier string.
-        provider: Optional provider name.
-
-    Returns:
-        The updated entry.
+    TS signature requires both provider and model.
     """
     import time as _time
 
     entry.model = str(model).strip() if model else entry.model
-    if provider:
-        entry.modelProvider = str(provider).strip()
+    entry.modelProvider = str(provider).strip() if provider else entry.modelProvider
     entry.updatedAt = int(_time.time() * 1000)
     return entry
 

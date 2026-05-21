@@ -631,7 +631,22 @@ class CliBackendConfig(BaseModel):
     
     serialize: Optional[bool] = Field(default=None)
     """Serialize runs for this CLI"""
-    
+
+    jsonl_dialect: Optional[str] = Field(default=None, alias="jsonlDialect")
+    """JSONL dialect for streaming output parsing (e.g. 'claude-code')"""
+
+    live_session: Optional[bool] = Field(default=None, alias="liveSession")
+    """Keep the CLI process alive across turns (persistent session)"""
+
+    image_path_scope: Optional[Literal["workspace", "global"]] = Field(default=None, alias="imagePathScope")
+    """Scope for resolving relative image paths ('workspace' or 'global')"""
+
+    system_prompt_file_arg: Optional[str] = Field(default=None, alias="systemPromptFileArg")
+    """Flag used to pass system prompt as a file path"""
+
+    system_prompt_file_config_arg: Optional[str] = Field(default=None, alias="systemPromptFileConfigArg")
+    """Flag used to pass system prompt config file"""
+
     reliability: Optional[CliReliabilityConfig] = Field(default=None)
     """Runtime reliability tuning for this backend's process lifecycle"""
 

@@ -1,4 +1,4 @@
-"""Plugin approval management — mirrors ExecApprovalManager but for plugins."""
+"""Plugin approval management — mirrors TypeScript plugin-approval.ts contract."""
 from __future__ import annotations
 
 import asyncio
@@ -12,16 +12,23 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_ID_PREFIX = "plugin:"
 DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS = 120_000
-VALID_PLUGIN_DECISIONS = frozenset({"allow", "deny", "allow-always"})
+# Aligned with TS: allow-once / allow-always / deny  (matches exec.approval decisions)
+VALID_PLUGIN_DECISIONS = frozenset({"allow-once", "allow-always", "deny"})
+MAX_PLUGIN_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000  # 10 minutes cap
 
 
 @dataclass
 class PluginApprovalRecord:
-    """A pending plugin approval request."""
+    """A pending plugin approval request — mirrors TS PluginApprovalRequest."""
 
     id: str
-    plugin_id: str
-    action: str
+    # TS fields: title, description, severity, toolName (from plugin-approval.ts:57-95)
+    title: str = ""
+    description: str = ""
+    severity: str = "medium"          # low | medium | high
+    tool_name: Optional[str] = None
+    plugin_id: Optional[str] = None   # legacy / back-compat
+    action: Optional[str] = None      # legacy / back-compat
     context: Dict[str, Any] = field(default_factory=dict)
     requested_at: float = field(default_factory=time.time)
     status: str = "pending"
@@ -30,7 +37,7 @@ class PluginApprovalRecord:
 
 
 class PluginApprovalsManager:
-    """Plugin approval management service — mirrors ExecApprovalManager contract."""
+    """Plugin approval management service — mirrors TS PluginApprovalManager."""
 
     def __init__(self) -> None:
         self._pending: Dict[str, PluginApprovalRecord] = {}
@@ -41,17 +48,25 @@ class PluginApprovalsManager:
         return PLUGIN_ID_PREFIX + str(uuid.uuid4())
 
     def list_pending_records(self) -> List[Dict[str, Any]]:
-        """Return list of pending plugin approval records."""
+        """Return list of pending plugin approval records — mirrors TS plugin-approval.ts:31-41."""
         out: List[Dict[str, Any]] = []
         for rec in self._pending.values():
+            request: Dict[str, Any] = {
+                "title": rec.title,
+                "description": rec.description,
+                "severity": rec.severity,
+            }
+            if rec.tool_name is not None:
+                request["toolName"] = rec.tool_name
+            if rec.plugin_id is not None:
+                request["pluginId"] = rec.plugin_id
+            if rec.action is not None:
+                request["action"] = rec.action
+            request.update(rec.context)
             out.append(
                 {
                     "id": rec.id,
-                    "request": {
-                        "pluginId": rec.plugin_id,
-                        "action": rec.action,
-                        **{k: v for k, v in rec.context.items()},
-                    },
+                    "request": request,
                     "createdAtMs": int(rec.requested_at * 1000),
                     "expiresAtMs": rec.expires_at_ms,
                 }
@@ -59,23 +74,65 @@ class PluginApprovalsManager:
         return out
 
     def request_approval_from_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Create a plugin approval request (sync — returns immediately if twoPhase)."""
-        plugin_id = str(params.get("pluginId") or params.get("plugin_id") or "").strip()
-        action = str(params.get("action") or "").strip()
-        timeout_ms = int(params.get("timeoutMs") or DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS)
+        """Create a plugin approval request — mirrors TS plugin-approval.ts:57-95.
+
+        TS params: title (required), description, severity, toolName, timeoutMs, twoPhase.
+        Legacy params: pluginId, action (kept for back-compat).
+        """
+        title = str(params.get("title") or "").strip()
+        if not title:
+            # Back-compat: derive title from pluginId+action
+            plugin_id = str(params.get("pluginId") or params.get("plugin_id") or "").strip()
+            action = str(params.get("action") or "").strip()
+            title = f"{plugin_id}: {action}" if plugin_id or action else "Plugin approval required"
+
+        description = str(params.get("description") or "").strip()
+        severity = str(params.get("severity") or "medium")
+        if severity not in ("low", "medium", "high"):
+            severity = "medium"
+        tool_name = params.get("toolName") or params.get("tool_name") or None
+        plugin_id = params.get("pluginId") or params.get("plugin_id") or None
+        action = params.get("action") or None
+
+        raw_timeout = int(params.get("timeoutMs") or DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS)
+        timeout_ms = min(raw_timeout, MAX_PLUGIN_APPROVAL_TIMEOUT_MS)
         two_phase = params.get("twoPhase") is True
 
         approval_id = self._generate_id()
         now_ms = int(time.time() * 1000)
         rec = PluginApprovalRecord(
             id=approval_id,
-            plugin_id=plugin_id,
-            action=action,
-            context={k: params[k] for k in params if k not in ("pluginId", "action", "timeoutMs", "twoPhase")},
+            title=title,
+            description=description,
+            severity=severity,
+            tool_name=str(tool_name) if tool_name else None,
+            plugin_id=str(plugin_id) if plugin_id else None,
+            action=str(action) if action else None,
+            context={
+                k: params[k]
+                for k in params
+                if k not in (
+                    "title", "description", "severity", "toolName", "tool_name",
+                    "pluginId", "plugin_id", "action", "timeoutMs", "twoPhase",
+                )
+            },
             expires_at_ms=now_ms + max(1000, timeout_ms),
         )
         self._pending[approval_id] = rec
         self._waiters[approval_id] = asyncio.Event()
+
+        # Broadcast with full request fields — mirrors TS plugin.approval.requested event
+        request_payload: Dict[str, Any] = {
+            "title": rec.title,
+            "description": rec.description,
+            "severity": rec.severity,
+        }
+        if rec.tool_name:
+            request_payload["toolName"] = rec.tool_name
+        if rec.plugin_id:
+            request_payload["pluginId"] = rec.plugin_id
+        if rec.action:
+            request_payload["action"] = rec.action
 
         try:
             from openclaw.gateway.events import broadcast as _broadcast
@@ -83,8 +140,7 @@ class PluginApprovalsManager:
                 "plugin.approval.requested",
                 {
                     "id": approval_id,
-                    "pluginId": plugin_id,
-                    "action": action,
+                    "request": request_payload,
                     "createdAtMs": now_ms,
                     "expiresAtMs": rec.expires_at_ms,
                 },
@@ -93,7 +149,13 @@ class PluginApprovalsManager:
             pass
 
         if two_phase:
-            return {"status": "accepted", "id": approval_id}
+            # twoPhase: return early without blocking (mirrors TS)
+            return {
+                "status": "accepted",
+                "id": approval_id,
+                "createdAtMs": now_ms,
+                "expiresAtMs": rec.expires_at_ms,
+            }
         return {"id": approval_id, "status": "pending"}
 
     async def await_decision(
@@ -122,7 +184,7 @@ class PluginApprovalsManager:
         return self._decisions.get(approval_id)
 
     def resolve_sync(self, approval_id: str, decision: str) -> Dict[str, Any]:
-        """Apply a decision synchronously."""
+        """Apply a decision synchronously — returns {ok: true} on success (mirrors TS)."""
         if decision not in VALID_PLUGIN_DECISIONS:
             raise ValueError(f"invalid decision: {decision!r}; must be one of {sorted(VALID_PLUGIN_DECISIONS)}")
 
@@ -140,7 +202,7 @@ class PluginApprovalsManager:
             event.set()
 
         self._broadcast_resolved(approval_id, decision)
-        return {"id": approval_id, "decision": decision}
+        return {"ok": True}
 
     def _expire(self, approval_id: str) -> None:
         rec = self._pending.pop(approval_id, None)

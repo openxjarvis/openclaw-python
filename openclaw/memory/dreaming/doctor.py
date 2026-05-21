@@ -654,7 +654,7 @@ async def load_dreaming_store_stats(
     return stats
 
 
-def resolve_all_managed_dreaming_cron_statuses(workspace_dir: str) -> dict[str, bool]:
+async def resolve_all_managed_dreaming_cron_statuses(workspace_dir: str) -> dict[str, bool]:
     """Check cron service for managed dreaming jobs per phase.
 
     Returns dict of {light: bool, deep: bool, rem: bool}.
@@ -665,7 +665,15 @@ def resolve_all_managed_dreaming_cron_statuses(workspace_dir: str) -> dict[str, 
         svc = get_cron_service()
         if svc is None:
             return result
-        jobs = svc.list_jobs() if hasattr(svc, "list_jobs") else []
+        if hasattr(svc, "list_jobs") and callable(svc.list_jobs):
+            import inspect
+            raw = svc.list_jobs()
+            if inspect.isawaitable(raw):
+                jobs = await raw
+            else:
+                jobs = raw
+        else:
+            jobs = []
         for job in jobs:
             job_id = str(getattr(job, "id", "") or (job.get("id", "") if isinstance(job, dict) else ""))
             payload = getattr(job, "payload", None) or (job.get("payload", {}) if isinstance(job, dict) else {})
@@ -684,7 +692,7 @@ def resolve_all_managed_dreaming_cron_statuses(workspace_dir: str) -> dict[str, 
     return result
 
 
-def build_dreaming_status_payload(cfg: Any, store_stats: dict[str, Any]) -> dict[str, Any]:
+async def build_dreaming_status_payload(cfg: Any, store_stats: dict[str, Any]) -> dict[str, Any]:
     """Build dreaming section for doctor.memory.status."""
     from .config import resolve_dreaming_config
 
@@ -693,7 +701,7 @@ def build_dreaming_status_payload(cfg: Any, store_stats: dict[str, Any]) -> dict
 
     # Attempt to resolve real managed cron statuses
     workspace_dir = store_stats.get("workspaceDir", "")
-    managed_cron = resolve_all_managed_dreaming_cron_statuses(str(workspace_dir))
+    managed_cron = await resolve_all_managed_dreaming_cron_statuses(str(workspace_dir))
 
     base = {
         "enabled": resolved.enabled,

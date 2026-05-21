@@ -89,16 +89,34 @@ class ExecApprovalManager:
             return None
         return self._record_to_get_payload(req)
 
+    def _resolve_allowed_decisions(self, req: ApprovalRequest) -> List[str]:
+        """Derive allowed decisions from request context/policy — mirrors resolveExecApprovalRequestAllowedDecisions."""
+        security = req.context.get("security") or {}
+        if isinstance(security, str):
+            try:
+                import json
+                security = json.loads(security)
+            except Exception:
+                security = {}
+        # If policy disables persistent allow-always, omit it
+        allow_always_allowed = security.get("allowAlways", True)
+        decisions: List[str] = ["allow-once"]
+        if allow_always_allowed:
+            decisions.append("allow-always")
+        decisions.append("deny")
+        return decisions
+
     def _record_to_get_payload(self, req: ApprovalRequest) -> Dict[str, Any]:
         return {
             "id": req.id,
             "commandText": req.command,
             "commandPreview": req.command[:200] if req.command else "",
-            "allowedDecisions": ["allow-once", "allow-always", "deny"],
+            "allowedDecisions": self._resolve_allowed_decisions(req),
             "host": req.context.get("host"),
             "nodeId": req.context.get("nodeId"),
             "agentId": req.context.get("agentId"),
             "expiresAtMs": req.expires_at_ms,
+            "createdAtMs": int(req.requested_at * 1000),
         }
 
     def list_pending_records(self) -> List[Dict[str, Any]]:
@@ -198,13 +216,32 @@ class ExecApprovalManager:
 
         record = self._create_record(command, context, explicit_id, timeout_ms)
 
+        created_at_ms = int(record.requested_at * 1000)
+        expires_at_ms = record.expires_at_ms
+
         if two_phase:
-            return {"status": "accepted", "id": record.id}
+            # twoPhase: return immediately without blocking — mirrors TS exec-approval.ts
+            return {
+                "status": "accepted",
+                "id": record.id,
+                "createdAtMs": created_at_ms,
+                "expiresAtMs": expires_at_ms,
+            }
 
         decision = await self.await_decision(record.id, timeout_ms)
         if decision is None:
-            return {"id": record.id, "decision": None, "status": "expired"}
-        return {"id": record.id, "decision": decision, "status": "resolved"}
+            return {
+                "id": record.id,
+                "decision": None,
+                "createdAtMs": created_at_ms,
+                "expiresAtMs": expires_at_ms,
+            }
+        return {
+            "id": record.id,
+            "decision": decision,
+            "createdAtMs": created_at_ms,
+            "expiresAtMs": expires_at_ms,
+        }
 
     async def await_decision(
         self,
@@ -255,7 +292,7 @@ class ExecApprovalManager:
 
         self._trigger_callbacks(req, approved)
         self._broadcast_resolved(resolved_id, decision)
-        return {"id": resolved_id, "decision": decision}
+        return {"ok": True}
 
     async def resolve(self, approval_id: str, decision: str) -> None:
         """Async resolve wrapper."""

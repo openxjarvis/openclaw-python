@@ -320,6 +320,37 @@ def _infer_mime_type(output_format: str | None, file_extension: str | None) -> s
     return None
 
 
+def _resolve_talk_speed(params: dict[str, Any]) -> float | None:
+    """Resolve effective speed from speed or rateWpm — mirrors TS resolveTalkSpeed.
+
+    speed: direct multiplier (0.25–4.0).
+    rateWpm: words-per-minute (valid 50–500); 180 wpm ≈ 1.0x speed.
+    rateWpm validation: raises InvalidRequestError if outside 50–500.
+    """
+    speed_raw = params.get("speed")
+    rate_wpm_raw = params.get("rateWpm")
+
+    if rate_wpm_raw is not None:
+        try:
+            rate_wpm = float(rate_wpm_raw)
+        except (TypeError, ValueError) as e:
+            raise InvalidRequestError(f"rateWpm must be a number: {rate_wpm_raw!r}") from e
+        if rate_wpm < 50 or rate_wpm > 500:
+            raise InvalidRequestError(f"rateWpm must be between 50 and 500, got {rate_wpm}")
+        # 180 wpm ≈ average speaking pace = 1.0x speed
+        return round(rate_wpm / 180.0, 3)
+
+    if speed_raw is not None:
+        try:
+            speed = float(speed_raw)
+        except (TypeError, ValueError) as e:
+            raise InvalidRequestError(f"speed must be a number: {speed_raw!r}") from e
+        # Clamp to valid range
+        return max(0.25, min(4.0, speed))
+
+    return None
+
+
 async def handle_talk_speak(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     text = _normalize_optional_string(params.get("text"))
     if not text:
@@ -340,10 +371,29 @@ async def handle_talk_speak(connection: Any, params: dict[str, Any]) -> dict[str
             f'talk.speak unavailable: speech provider "{provider}" does not support Talk mode',
             details={"reason": "talk_provider_unsupported", "fallbackEligible": True},
         )
+
+    # Resolve speed override (mirrors TS resolveTalkSpeed / buildTalkSpeakOverrides)
+    speed = _resolve_talk_speed(params)
+
+    # Resolve voiceId / voiceAlias override (mirrors TS talk.ts:73-91,243-246)
+    voice_id_raw = params.get("voiceId") or params.get("voice")
+    voice_aliases: dict[str, str] = {}
+    try:
+        tts_section = (cfg.get("messages") or {}).get("tts") or {}
+        provider_cfg = (tts_section.get("providers") or {}).get(provider) or {}
+        voice_aliases = provider_cfg.get("voiceAliases") or {}
+    except Exception:
+        pass
+    voice_id = voice_aliases.get(str(voice_id_raw), str(voice_id_raw)) if voice_id_raw else None
+
     talk_cfg = dict(cfg)
     messages = dict(talk_cfg.get("messages") or {})
     base_tts = dict(messages.get("tts") or {})
-    provider_config = resolved.get("config") if isinstance(resolved.get("config"), dict) else {}
+    provider_config = dict(resolved.get("config") if isinstance(resolved.get("config"), dict) else {})
+    if speed is not None:
+        provider_config["speed"] = speed
+    if voice_id:
+        provider_config["voice"] = voice_id
     providers = dict(base_tts.get("providers") or {})
     providers[provider] = provider_config
     base_tts.update({"auto": "always", "provider": provider, "providers": providers})

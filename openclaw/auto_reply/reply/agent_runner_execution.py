@@ -509,69 +509,66 @@ async def run_agent_turn_with_fallback(
     else:
         logger.info(f"[{session_id[:8]}] [TEST] No reasoning coordinator in context")
     
-    # ✅ FIX: Create BlockReplyPipeline when block_send_fn is provided
-    # Mirrors TS createBlockReplyPipeline in agent-runner.ts lines 157-174
+    # Create BlockReplyPipeline when block_send_fn is provided.
+    # Mirrors TS createBlockReplyPipeline in agent-runner.ts.
     block_reply_pipeline = None
     if block_send_fn:
         try:
             from openclaw.auto_reply.reply.block_streaming import (
-                BlockStreamingPipeline,
-                resolve_block_streaming_config,
+                resolve_effective_block_streaming_config,
             )
-            from openclaw.auto_reply.reply.block_reply_pipeline import BlockReplyPipeline as _BlockReplyPipeline  # noqa: F401
-            
-            # ✅ NEW: Get disable_block_streaming flag from context metadata
-            # Mirrors TS bot-message-dispatch.ts L305-313 disableBlockStreaming decision
-            # This flag is set by channel.py based on stream mode configuration:
-            # - draft优先: can_stream_answer_draft=true → disable_block_streaming=true
-            # - reasoning强制: reasoning=on → disable_block_streaming=false
+            from openclaw.auto_reply.reply.block_reply_pipeline import (
+                BlockReplyPipeline,
+                BlockStreamingCoalesceConfig,
+            )
+            from openclaw.auto_reply.reply.get_reply import ReplyPayload as _RP
+
             disable_block_streaming = ctx_metadata.get("_disable_block_streaming")
-            
+            channel_name = ctx_metadata.get("_channel") or "telegram"
+
             logger.info(
-                f"[{session_id[:8]}] [TEST] Block streaming config: "
+                f"[{session_id[:8]}] Block streaming config: "
                 f"disable_flag={disable_block_streaming}, "
                 f"reasoning_level={ctx_metadata.get('_reasoning_level')}, "
-                f"can_draft_answer={ctx_metadata.get('_can_stream_answer_draft')}"
+                f"can_draft_answer={ctx_metadata.get('_can_stream_answer_draft')}, "
+                f"channel={channel_name}"
             )
-            
-            # Resolve block streaming config (defaults: min=800, max=1200, idle=1000ms)
-            # Provider is typically "telegram" or "discord" from channel context
-            stream_config = resolve_block_streaming_config(
-                cfg=cfg,
-                channel="telegram",  # TODO: Pass actual provider from context if available
-                account_id=None,
-                disable_block_streaming=disable_block_streaming,
+
+            # Use resolve_effective_block_streaming_config (mirrors TS) to get final settings
+            eff_cfg = resolve_effective_block_streaming_config(
+                config=cfg.model_dump() if hasattr(cfg, "model_dump") else (cfg or {}),
             )
-            
-            logger.debug(
-                f"[{session_id[:8]}] Block streaming config: "
-                f"enabled={stream_config.enabled}, "
-                f"disable_flag={disable_block_streaming}, "
-                f"reasoning_level={ctx_metadata.get('_reasoning_level', 'off')}, "
-                f"can_draft_answer={ctx_metadata.get('_can_stream_answer_draft', False)}"
-            )
-            
-            # Create pipeline with coalescer
-            # Coalescer will automatically:
-            # - Flush when accumulated >= maxChars (1200)
-            # - Flush after idleMs (1000ms) of no new text
-            # - Flush on force (tool start, turn end)
-            block_reply_pipeline = BlockStreamingPipeline(
-                cfg=stream_config,
-                on_block=block_send_fn,
-            )
-            coalesce_cfg = (
-                stream_config.coalesce_config or
-                stream_config.chunk_config
+
+            # Wrap text-based block_send_fn into the ReplyPayload callback BlockReplyPipeline expects
+            _bsf = block_send_fn
+
+            async def _on_block_reply(payload: _RP, ctx: dict | None = None) -> None:
+                if payload.text and not disable_block_streaming:
+                    result = _bsf(payload.text)
+                    if asyncio.iscoroutine(result):
+                        await result
+
+            coalescing = None
+            if not disable_block_streaming:
+                coalescing = BlockStreamingCoalesceConfig(
+                    min_chars=eff_cfg.get("minChunkChars", 800),
+                    max_chars=eff_cfg.get("maxChunkChars", 1200),
+                    idle_ms=eff_cfg.get("coalesceIdleMs", 1000),
+                    joiner=eff_cfg.get("joiner", "\n"),
+                )
+
+            block_reply_pipeline = BlockReplyPipeline(
+                on_block_reply=_on_block_reply,
+                coalescing=coalescing,
             )
             logger.debug(
-                f"[{session_id[:8]}] BlockStreamingPipeline created: "
-                f"min={getattr(coalesce_cfg, 'min_chars', 800)}, "
-                f"max={getattr(coalesce_cfg, 'max_chars', 1200)}, "
-                f"idle={getattr(coalesce_cfg, 'idle_ms', 1000)}ms"
+                f"[{session_id[:8]}] BlockReplyPipeline created: "
+                f"min={getattr(coalescing, 'min_chars', 0)}, "
+                f"max={getattr(coalescing, 'max_chars', 0)}, "
+                f"idle={getattr(coalescing, 'idle_ms', 0)}ms"
             )
         except Exception as e:
-            logger.warning(f"Failed to create BlockStreamingPipeline: {e}", exc_info=True)
+            logger.warning(f"Failed to create BlockReplyPipeline: {e}", exc_info=True)
             block_reply_pipeline = None
     has_error = False
     auto_compaction_completed = False

@@ -142,7 +142,7 @@ class SkillCommandDispatch:
     """
     kind: str = "tool"  # Currently only "tool"
     tool_name: str = ""
-    arg_mode: str = "parsed"  # "raw" | "parsed"
+    arg_mode: str = "raw"  # "raw" | "parsed" — TS default is "raw"
 
 
 @dataclass

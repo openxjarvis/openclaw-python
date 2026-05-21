@@ -210,14 +210,15 @@ def resolve_cron_delivery_plan(job: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 SCHEDULE_TIMESTAMP_PAST_GRACE_MS = 60_000        # allow up to 60s in the past
-SCHEDULE_TIMESTAMP_FUTURE_CAP_YEARS = 100        # reject if > 100 years from now (prevents absurd values)
+SCHEDULE_TIMESTAMP_FUTURE_CAP_YEARS = 10         # reject if > 10 years from now (mirrors TS validate-timestamp.ts)
 
 
 def validate_schedule_timestamp(schedule: Any, now_ms: int | None = None) -> str | None:
     """Validate an 'at' schedule's timestamp.
 
     Returns an error message string, or None if valid.
-    Changes vs original: 1-minute past grace, 10-year future cap.
+    Returns None if valid, error string otherwise.
+    Mirrors TS validate-timestamp.ts: 60s past grace, 10-year future cap.
     """
     from .types import AtSchedule
     if isinstance(schedule, dict):

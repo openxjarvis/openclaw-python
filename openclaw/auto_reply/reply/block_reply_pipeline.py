@@ -298,6 +298,23 @@ class BlockReplyPipeline:
     def enqueue(self, payload: ReplyPayload) -> None:
         """Enqueue a payload for delivery."""
         asyncio.create_task(self._enqueue_async(payload))
+
+    async def push(self, text: str) -> None:
+        """Push a text chunk — convenience wrapper used by agent_runner_execution.
+
+        Mirrors TS BlockReplyPipeline.sendBlock(text) behavior.
+        """
+        if text and not self._aborted:
+            await self._enqueue_async(ReplyPayload(text=text))
+
+    async def finish(self) -> None:
+        """Flush coalesced content and buffered payloads — call at end of turn.
+
+        Mirrors TS blockReplyPipeline.flush() / finalize() at turn end.
+        """
+        if self._coalescer:
+            await self._coalescer.flush(force=True)
+        await self._flush_buffered()
     
     async def _enqueue_async(self, payload: ReplyPayload) -> None:
         """Internal async enqueue implementation."""

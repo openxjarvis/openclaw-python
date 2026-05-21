@@ -64,6 +64,51 @@ _CONFLICT_MAX_RETRY_TIME = 5 * 60
 
 
 # ---------------------------------------------------------------------------
+# Audio conversion helpers (OGG Vorbis → MP3 for Telegram compatibility)
+# ---------------------------------------------------------------------------
+
+def _is_ogg_vorbis(path: "Path") -> bool:  # type: ignore[name-defined]
+    """Return True if file is OGG Vorbis (not OGG Opus).
+
+    Telegram send_audio can't play OGG Vorbis — it only properly handles MP3/M4A.
+    OGG Opus should be sent via send_voice instead.
+    """
+    try:
+        import pathlib
+        p = pathlib.Path(path)
+        with p.open("rb") as f:
+            header = f.read(64)
+        # OGG pages start with "OggS"; Vorbis identification packet starts with \x01vorbis
+        return b"OggS" in header[:4] and b"\x01vorbis" in header
+    except Exception:
+        return False
+
+
+async def _convert_ogg_to_mp3_async(src: "Path", dst: "Path") -> "Path | None":  # type: ignore[name-defined]
+    """Convert OGG Vorbis file to MP3 using ffmpeg (non-blocking).
+
+    Returns dst path on success, None on failure.
+    """
+    import asyncio as _asyncio
+    import pathlib
+
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(src),
+            "-codec:a", "libmp3lame", "-q:a", "2",  # VBR quality 2 ≈ 190 kbps
+            str(dst),
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.DEVNULL,
+        )
+        await _asyncio.wait_for(proc.wait(), timeout=120)
+        if proc.returncode == 0 and pathlib.Path(dst).exists():
+            return pathlib.Path(dst)
+    except Exception as e:
+        logger.warning("ffmpeg OGG→MP3 conversion failed: %s", e)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Network error classification — mirrors TS isRecoverableTelegramNetworkError
 # ---------------------------------------------------------------------------
 
@@ -1408,12 +1453,71 @@ class TelegramChannel(ChannelPlugin):
                         **_common,
                     )
             elif media_type == "audio":
-                msg = await self._app.bot.send_audio(
-                    audio=media_source,
-                    caption=html_caption,
-                    parse_mode="HTML" if html_caption else None,
-                    **_common,
-                )
+                # Telegram send_audio only properly handles MP3 / M4A.
+                # OGG Vorbis files are accepted but Telegram's player can't play them —
+                # they arrive as "corrupt" or "empty" on the client side.
+                # Convert OGG Vorbis → MP3 using ffmpeg before uploading.
+                _audio_source = media_source
+                _tmp_mp3: Path | None = None
+                _converted_handle = None
+                try:
+                    _src_path: Path | None = None
+                    if is_local_file and isinstance(media_url, str):
+                        _src_path = Path(media_url).expanduser()
+                    elif is_local_file and isinstance(media_source, object) and hasattr(media_source, "name"):
+                        _src_path = Path(media_source.name)
+
+                    if _src_path and _src_path.suffix.lower() == ".ogg" and _is_ogg_vorbis(_src_path):
+                        _mp3_path = _src_path.with_suffix(".mp3")
+                        converted = await _convert_ogg_to_mp3_async(_src_path, _mp3_path)
+                        if converted and converted.exists() and converted.stat().st_size > 0:
+                            logger.info("Converted OGG Vorbis → MP3 for Telegram: %s → %s (%.1f MB)",
+                                        _src_path.name, converted.name, converted.stat().st_size / (1024 * 1024))
+                            # Close original file handle; open converted
+                            if hasattr(_audio_source, "close"):
+                                _audio_source.close()
+                            _converted_handle = open(converted, "rb")  # noqa: WPS515
+                            _audio_source = _converted_handle
+                            _tmp_mp3 = converted
+                            # Recalculate write timeout for new file size
+                            _common = dict(_common)
+                            _common["write_timeout"] = max(_BASE_WRITE_TIMEOUT, converted.stat().st_size / (1024 * 1024))
+                        else:
+                            logger.warning("OGG→MP3 conversion failed for %s, sending as document", _src_path.name)
+                            media_type = "document"
+                except Exception as _conv_err:
+                    logger.warning("OGG conversion error (non-fatal): %s — sending as document", _conv_err)
+                    media_type = "document"
+
+                try:
+                    if media_type == "audio":
+                        msg = await self._app.bot.send_audio(
+                            audio=_audio_source,
+                            caption=html_caption,
+                            parse_mode="HTML" if html_caption else None,
+                            **_common,
+                        )
+                    else:
+                        # Fallback: send as document when conversion failed
+                        if hasattr(media_source, "seek"):
+                            try:
+                                media_source.seek(0)
+                            except Exception:
+                                pass
+                        msg = await self._app.bot.send_document(
+                            document=media_source,
+                            caption=html_caption,
+                            parse_mode="HTML" if html_caption else None,
+                            **_common,
+                        )
+                finally:
+                    if _converted_handle:
+                        _converted_handle.close()
+                    if _tmp_mp3 and _tmp_mp3.exists():
+                        try:
+                            _tmp_mp3.unlink()
+                        except Exception:
+                            pass
             else:
                 # Default: send as document (covers pptx, pdf, zip, etc.)
                 msg = await self._app.bot.send_document(

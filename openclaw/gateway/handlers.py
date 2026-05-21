@@ -2537,6 +2537,39 @@ async def handle_update_run(connection: Any, params: dict[str, Any]) -> dict[str
     return {"updateAvailable": False, "currentVersion": "1.0.0"}
 
 
+@register_handler("nativeHook.invoke")
+async def handle_native_hook_invoke(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Relay a native hook invocation — mirrors TS native-hook-relay.ts.
+
+    Scope: operator.admin (privileged hook for system-level callbacks).
+    The hook payload is forwarded to any registered native hook handlers.
+    Returns {ok: true, relayed: bool}.
+    """
+    hook_name = str(params.get("hook") or params.get("name") or "").strip()
+    if not hook_name:
+        return {"ok": False, "error": "hook name is required"}
+
+    hook_params = params.get("params") or params.get("data") or {}
+
+    try:
+        from openclaw.infra.native_hook_relay import invoke_native_hook
+        result = invoke_native_hook(hook_name, hook_params)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return {"ok": True, "relayed": True, **(result or {})}
+    except ImportError:
+        # Module may not exist — relay to event bus as fallback
+        try:
+            from openclaw.gateway.events import broadcast as _broadcast
+            _broadcast(f"nativeHook.{hook_name}", {"hook": hook_name, "params": hook_params})
+            return {"ok": True, "relayed": True}
+        except Exception:
+            pass
+        return {"ok": True, "relayed": False}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 @register_handler("usage.status")
 async def handle_usage_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Get usage status — mirrors TS usage.status."""
@@ -2935,10 +2968,19 @@ async def handle_exec_approval_wait_decision(connection: Any, params: dict[str, 
 
     timeout_ms = int(params.get("timeoutMs") or 120_000)
     mgr = _resolve_gateway_approval_manager(connection)
+
+    # Look up timestamps before waiting (record may be removed after decision)
+    req = mgr.pending_approvals.get(str(approval_id))
+    created_at_ms = int(req.requested_at * 1000) if req else None
+    expires_at_ms = req.expires_at_ms if req else None
+
     decision = await mgr.await_decision(str(approval_id), timeout_ms)
-    if decision is None:
-        return {"id": approval_id, "decision": None, "status": "expired"}
-    return {"id": approval_id, "decision": decision}
+    result: dict[str, Any] = {"id": approval_id, "decision": decision}
+    if created_at_ms is not None:
+        result["createdAtMs"] = created_at_ms
+    if expires_at_ms is not None:
+        result["expiresAtMs"] = expires_at_ms
+    return result
 
 
 @register_handler("device.pair.remove")
@@ -4073,7 +4115,7 @@ async def handle_doctor_memory_status(connection: Any, params: dict[str, Any]) -
             "embedding": {
                 "ok": embedding.ok,
             },
-            "dreaming": build_dreaming_status_payload(cfg, store_stats),
+            "dreaming": await build_dreaming_status_payload(cfg, store_stats),
         }
         if embedding.error:
             payload["embedding"]["error"] = embedding.error
@@ -4479,16 +4521,49 @@ async def handle_models_auth_status(connection: Any, params: dict[str, Any]) -> 
 
 @register_handler("tools.effective")
 async def handle_tools_effective(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Return the effective tool list for a session after policy filtering.
+    """Return effective tool inventory — mirrors TS tools-effective.ts EffectiveToolInventoryResult.
 
-    Mirrors TS tools.effective in BASE_METHODS.
+    Returns {agentId, profile, groups[], notices?} instead of flat {tools:[]}.
     """
     session_key = params.get("sessionKey") or params.get("session_key")
+    agent_id = params.get("agentId") or "main"
     try:
         from openclaw.agents.tools.registry import resolve_effective_tool_inventory
         cfg = _get_current_config() or None
-        tools = resolve_effective_tool_inventory(session_key=session_key, config=cfg)
-        return {"tools": tools, "sessionKey": session_key}
+        flat_tools = resolve_effective_tool_inventory(session_key=session_key, config=cfg)
+
+        # Group tools by source/namespace into EffectiveToolGroup shape
+        # Mirrors TS EffectiveToolInventoryResult: {agentId, profile, groups[], notices?}
+        groups: list[dict[str, Any]] = []
+        default_tools: list[dict[str, Any]] = []
+        plugin_tools: dict[str, list[dict[str, Any]]] = {}
+
+        for t in flat_tools:
+            name = t.get("name", "")
+            # Classify: plugin tools start with "plugin:" or contain namespace separator
+            if ":" in name and not name.startswith("exec") and not name.startswith("read"):
+                ns = name.split(":")[0]
+                plugin_tools.setdefault(ns, []).append(t)
+            else:
+                default_tools.append(t)
+
+        if default_tools:
+            groups.append({
+                "name": "default",
+                "label": "Built-in Tools",
+                "tools": default_tools,
+            })
+        for ns, ns_tools in plugin_tools.items():
+            groups.append({
+                "name": ns,
+                "tools": ns_tools,
+            })
+
+        return {
+            "agentId": agent_id,
+            "profile": "default",
+            "groups": groups,
+        }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -4602,6 +4677,12 @@ async def handle_exec_approval_resolve(connection: Any, params: dict[str, Any]) 
     if decision not in valid_decisions:
         return {"error": {"code": "INVALID_REQUEST", "message": f"decision must be one of: {', '.join(sorted(valid_decisions))}"}}
     mgr = _resolve_gateway_approval_manager(connection)
+    # Validate decision against per-request allowedDecisions — mirrors TS exec-approval.ts:360-368
+    req = mgr.pending_approvals.get(str(approval_id))
+    if req is not None:
+        allowed = mgr._resolve_allowed_decisions(req)
+        if decision not in allowed:
+            return {"error": {"code": "INVALID_REQUEST", "message": f"decision '{decision}' is not allowed for this request"}}
     try:
         return mgr.resolve_sync(str(approval_id), decision)
     except ValueError as exc:
@@ -4644,20 +4725,31 @@ async def handle_plugin_approval_wait(connection: Any, params: dict[str, Any]) -
         return {"error": {"code": "INVALID_REQUEST", "message": "id is required"}}
     timeout_ms = int(params.get("timeoutMs") or 120_000)
     mgr = get_plugin_approvals_manager()
+
+    # Capture timestamps before waiting
+    rec = mgr._pending.get(str(approval_id))
+    created_at_ms = int(rec.requested_at * 1000) if rec else None
+    expires_at_ms = rec.expires_at_ms if rec else None
+
     decision = await mgr.await_decision(str(approval_id), timeout_ms)
-    if decision is None:
-        return {"id": approval_id, "decision": None, "status": "expired"}
-    return {"id": approval_id, "decision": decision}
+    result: dict[str, Any] = {"id": approval_id, "decision": decision}
+    if created_at_ms is not None:
+        result["createdAtMs"] = created_at_ms
+    if expires_at_ms is not None:
+        result["expiresAtMs"] = expires_at_ms
+    return result
 
 
 @register_handler("plugin.approval.resolve")
 async def handle_plugin_approval_resolve(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a plugin approval request."""
-    from openclaw.infra.plugin_approvals_manager import get_plugin_approvals_manager
+    """Resolve a plugin approval request — mirrors TS plugin-approval.ts:165-167."""
+    from openclaw.infra.plugin_approvals_manager import get_plugin_approvals_manager, VALID_PLUGIN_DECISIONS
     approval_id = params.get("id") or params.get("approvalId") or ""
     decision = params.get("decision", "deny")
     if not approval_id:
         return {"error": {"code": "INVALID_REQUEST", "message": "id is required"}}
+    if decision not in VALID_PLUGIN_DECISIONS:
+        return {"error": {"code": "INVALID_REQUEST", "message": f"decision must be one of: {', '.join(sorted(VALID_PLUGIN_DECISIONS))}"}}
     mgr = get_plugin_approvals_manager()
     try:
         return mgr.resolve_sync(str(approval_id), decision)
@@ -5065,54 +5157,131 @@ async def handle_commands_list(connection: Any, params: dict[str, Any]) -> dict[
 
 @register_handler("sessions.get")
 async def handle_sessions_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get a session entry by sessionKey — mirrors TS sessions.get."""
-    session_key = params.get("sessionKey") or params.get("session_key") or ""
-    if not session_key:
-        return {"error": {"code": "INVALID_REQUEST", "message": "sessionKey is required"}}
+    """Return transcript messages for a session — mirrors TS sessions.get.
+
+    TS sessions.ts returns {messages: Message[]} from transcript (limit default 200).
+    """
+    key = params.get("key") or params.get("sessionKey") or params.get("session_key") or ""
+    if not key:
+        return {"ok": False, "error": "key is required"}
+
+    limit = int(params.get("limit") or 200)
+
     try:
-        if _session_manager and hasattr(_session_manager, "get_session"):
-            entry = await _session_manager.get_session(session_key)
-            if entry is None:
-                return {"error": {"code": "NOT_FOUND", "message": f"session not found: {session_key}"}}
-            if hasattr(entry, "model_dump"):
-                return entry.model_dump()
-            if hasattr(entry, "__dict__"):
-                return vars(entry)
-            return dict(entry)
-        elif _session_manager and hasattr(_session_manager, "store"):
-            store = _session_manager.store
-            entry = store.get(session_key) if hasattr(store, "get") else None
-            if entry is None:
-                return {"error": {"code": "NOT_FOUND", "message": f"session not found: {session_key}"}}
-            if hasattr(entry, "model_dump"):
-                return entry.model_dump()
-            if hasattr(entry, "__dict__"):
-                return vars(entry)
-            return dict(entry)
+        session_obj = None
+        if _session_manager:
+            # get_session accepts session_key or session_id (sync on SessionManager)
+            if hasattr(_session_manager, "get_session"):
+                try:
+                    session_obj = _session_manager.get_session(key)
+                except Exception:
+                    pass
+            if session_obj is None and hasattr(_session_manager, "get_or_create_session_by_key"):
+                try:
+                    session_obj = _session_manager.get_or_create_session_by_key(key)
+                except Exception:
+                    pass
+
+        if session_obj is None:
+            # Missing session → return empty messages (mirrors TS)
+            return {"messages": []}
+
+        # Ensure messages are loaded from disk
+        if hasattr(session_obj, "_load_from_disk") and not getattr(session_obj, "_loaded", False):
+            try:
+                session_obj._load_from_disk()
+            except Exception:
+                pass
+
+        raw_messages_attr = getattr(session_obj, "messages", None)
+        try:
+            raw_messages: list[Any] = list(raw_messages_attr) if raw_messages_attr else []
+        except Exception:
+            raw_messages = []
+        tail = raw_messages[-limit:] if limit and len(raw_messages) > limit else raw_messages
+
+        serialized: list[dict[str, Any]] = []
+        for m in tail:
+            if hasattr(m, "model_dump"):
+                serialized.append(m.model_dump(exclude_none=True))
+            elif isinstance(m, dict):
+                serialized.append(m)
+            else:
+                serialized.append(vars(m))
+
+        return {"messages": serialized}
     except Exception as exc:
+        logger.exception("sessions.get error for key=%s", key)
         return {"ok": False, "error": str(exc)}
-    return {"error": {"code": "NOT_FOUND", "message": f"session not found: {session_key}"}}
 
 
 @register_handler("sessions.steer")
 async def handle_sessions_steer(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Inject a message into a running agent session — mirrors TS sessions.steer."""
-    session_key = params.get("sessionKey") or params.get("session_key") or ""
-    message = params.get("message") or ""
+    """Inject/steer a session — mirrors TS sessions.steer (interruptIfActive + chat.send path).
+
+    TS sessions.ts:489-525 — steer is send with interruptIfActive:true.
+    Returns {ok, queued, interruptedActiveRun}.
+    """
+    session_key = params.get("sessionKey") or params.get("key") or params.get("session_key") or ""
+    message = params.get("message") or params.get("text") or ""
+    interrupt_if_active = params.get("interruptIfActive", True)  # default true for steer
+
     if not session_key:
         return {"ok": False, "error": "sessionKey is required"}
     if not message:
         return {"ok": False, "error": "message is required"}
+
+    interrupted_active_run = False
+
     try:
+        # Step 1: Interrupt any active run if requested (mirrors TS interruptSessionRunIfActive)
+        if interrupt_if_active and _agent_runtime:
+            abort_fn = (
+                getattr(_agent_runtime, "abort_session", None)
+                or getattr(_agent_runtime, "interrupt_session", None)
+            )
+            if abort_fn:
+                try:
+                    result = abort_fn(session_key)
+                    if asyncio.iscoroutine(result):
+                        await result
+                    interrupted_active_run = True
+                except Exception:
+                    pass
+            # Also try abort via _abort_events directly
+            elif hasattr(_agent_runtime, "_abort_events"):
+                event = _agent_runtime._abort_events.get(session_key)
+                if event:
+                    event.set()
+                    interrupted_active_run = True
+
+        # Step 2: Queue/send the new message via steer/send path
+        queued = False
         if _agent_runtime and hasattr(_agent_runtime, "steer_session"):
-            await _agent_runtime.steer_session(session_key, message)
-            return {"ok": True, "queued": True}
-        if _session_manager and hasattr(_session_manager, "steer"):
-            await _session_manager.steer(session_key, message)
-            return {"ok": True, "queued": True}
+            result = _agent_runtime.steer_session(session_key, message)
+            if asyncio.iscoroutine(result):
+                await result
+            queued = True
+        elif _agent_runtime and hasattr(_agent_runtime, "send_message"):
+            result = _agent_runtime.send_message(session_key, message)
+            if asyncio.iscoroutine(result):
+                await result
+            queued = True
+        elif _session_manager and hasattr(_session_manager, "steer"):
+            result = _session_manager.steer(session_key, message)
+            if asyncio.iscoroutine(result):
+                await result
+            queued = True
+        else:
+            # Fallback: inject via queue_embedded_pi_message if available
+            if _agent_runtime and hasattr(_agent_runtime, "queue_embedded_pi_message"):
+                _agent_runtime.queue_embedded_pi_message(session_key, message)
+                queued = True
+
+        return {"ok": True, "queued": queued, "interruptedActiveRun": interrupted_active_run}
     except Exception as exc:
+        logger.exception("sessions.steer error for key=%s", session_key)
         return {"ok": False, "error": str(exc)}
-    return {"ok": True, "queued": False}
 
 
 # ── Sessions Create (if not already registered) ───────────────────────────────
