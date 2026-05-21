@@ -988,15 +988,17 @@ def _resolve_media_url(media_url: str, workspace_dir: str | None, agent_id: str 
         cfg = load_config()
         local_roots = get_agent_scoped_media_local_roots(cfg, agent_id)
         
+        from pathlib import Path as _Path
         for root in local_roots:
+            root_path = _Path(root)
             # Try full relative path first (e.g. "presentations/file.pptx")
-            candidate = root / p
+            candidate = root_path / p
             if candidate.exists():
                 logger.info("cron: resolved relative path '%s' -> %s", media_url, candidate)
                 return str(candidate)
             
             # Fall back to filename-only search (mirrors TS local-roots fallback)
-            candidate = root / p.name
+            candidate = root_path / p.name
             if candidate.exists():
                 logger.info("cron: resolved filename '%s' -> %s (filename-only fallback)", media_url, candidate)
                 return str(candidate)
