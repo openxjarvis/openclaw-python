@@ -108,7 +108,7 @@ async def _route_reply_to_channel(
 ) -> bool:
     """Send a payload to a different channel (cross-provider routing)."""
     try:
-        from openclaw.gateway.route_reply import route_reply
+        from openclaw.auto_reply.reply.route_reply import route_reply
         result = await route_reply(
             payload=payload,
             channel=channel,

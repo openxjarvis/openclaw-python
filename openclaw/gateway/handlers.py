@@ -2877,6 +2877,99 @@ async def handle_send(connection: Any, params: dict[str, Any]) -> dict[str, Any]
     return await handle_channels_send(connection, mapped)
 
 
+@register_handler("poll")
+async def handle_poll(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Send a poll message to a channel.
+
+    Mirrors TS: src/gateway/server-methods/send.ts `poll` handler.
+
+    Required params:
+        to (str): Recipient / chat ID.
+        question (str): Poll question text.
+        options (list[str]): Poll answer options (2–10 items).
+        idempotencyKey (str): Caller-supplied key for deduplication.
+
+    Optional params:
+        channel (str): Channel ID override (defaults to configured channel).
+        accountId (str): Account to send from.
+        threadId (str): Thread / topic ID.
+        maxSelections (int): Max selectable options (default 1).
+        durationSeconds (int): Poll duration in seconds (channel-dependent).
+        durationHours (int): Poll duration in hours (channel-dependent).
+        silent (bool): Send without notification.
+        isAnonymous (bool): Hide voter identities (channel-dependent).
+
+    Returns:
+        {ok, runId, channel} delivery payload.
+    """
+    to = (params.get("to") or "").strip()
+    question = params.get("question") or ""
+    options = params.get("options") or []
+    idem = params.get("idempotencyKey") or params.get("idem") or ""
+
+    if not to:
+        return {"ok": False, "error": "to is required"}
+    if not question:
+        return {"ok": False, "error": "question is required"}
+    if not isinstance(options, list) or len(options) < 2:
+        return {"ok": False, "error": "options must be a list with at least 2 items"}
+    if not idem:
+        return {"ok": False, "error": "idempotencyKey is required"}
+
+    channel_id = (params.get("channel") or "").strip() or None
+    account_id = (params.get("accountId") or "").strip() or None
+    thread_id = (params.get("threadId") or "").strip() or None
+
+    try:
+        gateway = getattr(connection, "gateway", None)
+        manager = getattr(gateway, "channel_manager", None) if gateway else None
+        if manager is None:
+            return {"ok": False, "error": "channel manager not available"}
+
+        resolved_channel = channel_id or getattr(manager, "get_default_channel_id", lambda: None)()
+        if not resolved_channel:
+            # Fall back to the first running channel
+            running = list(manager.list_running()) if hasattr(manager, "list_running") else []
+            resolved_channel = running[0] if running else None
+        if not resolved_channel:
+            return {"ok": False, "error": "no channel configured"}
+
+        channel = manager.get_channel(resolved_channel) if hasattr(manager, "get_channel") else None
+        if channel is None:
+            return {"ok": False, "error": f"unsupported poll channel: {resolved_channel}"}
+
+        send_poll = getattr(channel, "send_poll", None)
+        if send_poll is None:
+            return {"ok": False, "error": f"unsupported poll channel: {resolved_channel}"}
+
+        duration_seconds = params.get("durationSeconds")
+        is_anonymous = params.get("isAnonymous")
+        if duration_seconds is not None and not getattr(channel, "supports_poll_duration_seconds", False):
+            return {"ok": False, "error": f"durationSeconds is not supported for {resolved_channel} polls"}
+        if is_anonymous is not None and not getattr(channel, "supports_anonymous_polls", False):
+            return {"ok": False, "error": f"isAnonymous is not supported for {resolved_channel} polls"}
+
+        poll_data = {
+            "question": question,
+            "options": options,
+            "maxSelections": params.get("maxSelections"),
+            "durationSeconds": duration_seconds,
+            "durationHours": params.get("durationHours"),
+        }
+        result = await send_poll(
+            to=to,
+            poll=poll_data,
+            account_id=account_id,
+            thread_id=thread_id,
+            silent=params.get("silent"),
+            is_anonymous=is_anonymous,
+        )
+        return {"ok": True, "runId": idem, "channel": resolved_channel, "result": result}
+    except Exception as exc:
+        logger.error("poll handler error: %s", exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+
+
 @register_handler("skills.bins")
 async def handle_skills_bins(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """List known skill bins - mirrors TS skills.bins handler"""
@@ -4892,6 +4985,46 @@ async def handle_config_schema_lookup(connection: Any, params: dict[str, Any]) -
         return {"ok": True, "schema": schema, "path": path}
     except Exception:
         return {"ok": True, "schema": None, "path": path}
+
+
+@register_handler("config.openFile")
+async def handle_config_open_file(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Open the config file in the system default editor.
+
+    Mirrors TS: src/gateway/server-methods/config.ts `config.openFile` handler.
+    Uses `open` on macOS, `xdg-open` on Linux, and `start` on Windows.
+
+    Returns:
+        {ok: bool, path: str} — ok=False if the open command fails (path is
+        always included so callers can fall back to manual editing).
+    """
+    import subprocess
+    import sys as _sys
+    from openclaw.config.paths import resolve_config_path
+
+    try:
+        config_path = str(resolve_config_path())
+    except Exception:
+        config_path = ""
+
+    if not config_path:
+        return {"ok": False, "path": config_path, "error": "config path unavailable"}
+
+    try:
+        platform = _sys.platform
+        if platform == "darwin":
+            cmd = ["open", config_path]
+        elif platform == "win32":
+            cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                   f"Start-Process -LiteralPath '{config_path}'"]
+        else:
+            cmd = ["xdg-open", config_path]
+
+        subprocess.Popen(cmd, close_fds=True)
+        return {"ok": True, "path": config_path}
+    except Exception as exc:
+        logger.warning("config.openFile failed path=%s: %s", config_path, exc)
+        return {"ok": False, "path": config_path, "error": "failed to open config file"}
 
 
 # ── Skills ────────────────────────────────────────────────────────────────────

@@ -157,6 +157,13 @@ class GatewayBootstrap:
         """
         results = {"steps_completed": 0, "errors": []}
 
+        # Record gateway start time for uptime tracking (mirrors TS process.uptime()).
+        try:
+            from openclaw.gateway.uptime import record_start_time
+            record_start_time()
+        except Exception:
+            pass
+
         # Pre-Step 0: Acquire gateway PID lock (mirrors TS acquireGatewayLock).
         # This MUST happen before any channels start polling to ensure only one
         # gateway instance is ever running.  Without this, two instances can both

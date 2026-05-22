@@ -239,7 +239,7 @@ class VoiceManager:
                 tmp_path = f.name
             try:
                 # Import transcription pipeline from pi-ai / openclaw
-                from openclaw.voice import transcribe_audio_file
+                from openclaw.plugins.runtime.runtime_stt import transcribe_audio_file
                 transcript = await transcribe_audio_file(tmp_path)
                 return transcript.strip() if transcript else None
             except ImportError:
