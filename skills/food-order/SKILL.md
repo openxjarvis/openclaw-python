@@ -1,33 +1,73 @@
 ---
 name: food-order
-description: "Order food from delivery services via web browsing and fetch tools. Use when user asks to order food, find food delivery options, or browse restaurant menus."
+description: "Help users find restaurants, browse menus, and prepare food delivery orders via web search and fetch. Use when user asks to order food, find food delivery options, browse restaurant menus, or compare delivery services."
 metadata: { "openclaw": { "emoji": "🍔", "requires": {} } }
 ---
 
 # Food Ordering
 
-Order food from delivery services
+Help users find restaurants, browse menus, and prepare food delivery orders using web search and fetch tools.
 
-## Available Tools
+## Workflow
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+1. **Gather preferences**: Ask for location, cuisine type, dietary restrictions, budget, and preferred delivery service (DoorDash, Uber Eats, Grubhub, etc.) if not specified.
+2. **Search restaurants**: Use `web_search` to find options matching the user's criteria.
+3. **Browse menus**: Use `web_fetch` on restaurant pages or delivery platform listings to get menu items and prices.
+4. **Present options**: Show restaurant name, rating, delivery time, fee, and relevant menu items.
+5. **Confirm order**: Summarize the user's selections with items, prices, and estimated total before they place the order themselves.
 
-## Usage Examples
+## Search Patterns
 
-User: "Help me with food ordering"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+Combine delivery platform + location + cuisine for targeted results:
 
-## Configuration
+```
+"DoorDash pizza delivery near 94105"
+"Uber Eats Thai food downtown Seattle"
+"Grubhub vegan restaurants open now Chicago"
+"best rated Chinese delivery [neighborhood]"
+```
 
-Check documentation for specific setup requirements.
+For menu browsing:
 
-## Notes
+```
+"[restaurant name] menu [city]"
+"[restaurant name] doordash menu"
+```
 
-This skill requires integration with Food Ordering service/application.
+## Presenting Options
+
+Format restaurant results clearly:
+
+```
+**Sakura Sushi** ⭐ 4.6 (820 reviews)
+🚗 25-35 min · $2.99 delivery fee
+💰 $$ | 🍣 Japanese, Sushi
+
+Popular items:
+- Dragon Roll — $14.99
+- Salmon Bento Box — $16.99
+- Miso Soup — $3.99
+```
+
+## Order Summary Format
+
+Before the user places an order, present a clear summary:
+
+```
+📋 Order Summary — Sakura Sushi (via DoorDash)
+- 1x Dragon Roll: $14.99
+- 2x Miso Soup: $7.98
+- Subtotal: $22.97
+- Delivery fee: $2.99
+- Estimated tax: ~$2.07
+- Estimated total: ~$28.03
+- ETA: 25-35 min
+```
+
+## Tips
+
+- Always confirm the delivery address — results vary significantly by location.
+- Note minimum order amounts and delivery fees, which differ across platforms.
+- Mention promo codes or deals when visible on the platform page.
+- Flag allergen info when the user has dietary restrictions and the restaurant lists ingredients.
+- If a restaurant is on multiple platforms, compare delivery fees and ETAs.

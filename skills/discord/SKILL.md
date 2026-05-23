@@ -1,8 +1,8 @@
 ---
 name: discord
-description: "Discord ops via the message tool (channel=discord)."
+description: "Send, read, edit, delete, and search Discord messages, react to messages, create threads, manage polls and pins via the message tool (channel=discord). Use when user asks to interact with Discord channels, DMs, or guilds."
 metadata: { "openclaw": { "emoji": "🎮", "requires": { "config": ["channels.discord.token"] } } }
-allowed-tools: ["message"]
+allowed-tools: "message"
 ---
 
 # Discord (Via `message`)
